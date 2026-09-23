@@ -7,7 +7,8 @@ import pytest
 
 from risex_spread_shadow.hood_handoff.offline_observer import ObserverLimits
 from risex_spread_shadow.hood_handoff.stream_measurement import (
-    StreamIdentity, StreamProjection, collect_once,
+    MAX_DECOMPRESSED_FRAME_BYTES, MAX_SESSION_BYTES, MAX_SESSION_FRAMES,
+    MAX_SESSION_SECONDS, StreamIdentity, StreamProjection, collect_once,
 )
 
 
@@ -173,13 +174,23 @@ def test_connection_sends_only_three_read_subscriptions_and_saves_projections(mo
         return {27331: "PRIVATE_TOKEN_1", 27337: "PRIVATE_TOKEN_2"}
 
     monkeypatch.setattr("risex_spread_shadow.hood_handoff.stream_measurement._auth_tokens", fake_tokens)
-    monkeypatch.setattr("websockets.asyncio.client.connect", lambda *_, **__: Socket())
+    socket_options = {}
+
+    def connect(*_, **options):
+        socket_options.update(options)
+        return Socket()
+
+    monkeypatch.setattr("websockets.asyncio.client.connect", connect)
     output = tmp_path / "events.jsonl"
     result = asyncio.run(collect_once(identity, output, object(),
-                                      limits=ObserverLimits(max_seconds=5, max_frames=2)))
+                                      limits=ObserverLimits(max_seconds=5, max_frames=2,
+                                                            max_bytes=MAX_SESSION_BYTES,
+                                                            max_frame_bytes=MAX_DECOMPRESSED_FRAME_BYTES)))
     assert result["stopped_reason"] == "frame_count_limit"
     assert [x["channel"] for x in sent] == ["order_book/1", "account_all_orders/27331", "account_all_orders/27337"]
     assert all(x["type"] == "subscribe" for x in sent)
+    assert socket_options["max_size"] == MAX_DECOMPRESSED_FRAME_BYTES
+    assert socket_options["max_queue"] == 1
     assert "auth" not in sent[0]
     saved = output.read_text()
     assert "PRIVATE_TOKEN" not in saved and "PRIVATE_SIGNATURE" not in saved
@@ -187,11 +198,59 @@ def test_connection_sends_only_three_read_subscriptions_and_saves_projections(mo
     assert output.stat().st_mode & 0o777 == 0o600
 
 
-def test_collection_gate_rejects_expanded_limits_before_socket(monkeypatch, tmp_path):
+@pytest.mark.parametrize("limits", [
+    ObserverLimits(max_seconds=MAX_SESSION_SECONDS + 1, max_frames=MAX_SESSION_FRAMES,
+                   max_bytes=MAX_SESSION_BYTES),
+    ObserverLimits(max_seconds=MAX_SESSION_SECONDS, max_frames=MAX_SESSION_FRAMES + 1,
+                   max_bytes=MAX_SESSION_BYTES),
+    ObserverLimits(max_seconds=MAX_SESSION_SECONDS, max_frames=MAX_SESSION_FRAMES,
+                   max_bytes=MAX_SESSION_BYTES + 1),
+    ObserverLimits(max_seconds=MAX_SESSION_SECONDS, max_frames=MAX_SESSION_FRAMES,
+                   max_bytes=MAX_SESSION_BYTES,
+                   max_frame_bytes=MAX_DECOMPRESSED_FRAME_BYTES + 1),
+])
+def test_collection_gate_rejects_expanded_limits_before_socket(tmp_path, limits):
     identity = StreamIdentity.from_config(config())
     with pytest.raises(ValueError):
         asyncio.run(collect_once(identity, tmp_path / "events.jsonl", object(),
-                                 limits=ObserverLimits(max_frames=15001)))
+                                 limits=limits))
+
+
+def test_larger_snapshot_is_projected_without_retaining_raw_payload(monkeypatch, tmp_path):
+    raw = encoded({"type": "subscribed/order_book", "channel": "order_book:1",
+                   "order_book": {"nonce": 17, "asks": []},
+                   "private_padding": "PRIVATE_SIGNATURE_NEVER_SAVE" * 4000})
+    assert 65536 < len(raw) < MAX_DECOMPRESSED_FRAME_BYTES
+
+    class Socket:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_):
+            return None
+
+        async def send(self, _value):
+            return None
+
+        async def recv(self):
+            return raw
+
+    async def fake_tokens(*_):
+        return {27331: "PRIVATE_TOKEN_1", 27337: "PRIVATE_TOKEN_2"}
+
+    monkeypatch.setattr("risex_spread_shadow.hood_handoff.stream_measurement._auth_tokens", fake_tokens)
+    monkeypatch.setattr("websockets.asyncio.client.connect", lambda *_, **__: Socket())
+    output = tmp_path / "events.jsonl"
+    result = asyncio.run(collect_once(StreamIdentity.from_config(config()), output,
+                                      object(), limits=ObserverLimits(max_seconds=1, max_frames=1,
+                                                                    max_bytes=MAX_SESSION_BYTES,
+                                                                    max_frame_bytes=MAX_DECOMPRESSED_FRAME_BYTES)))
+    assert result["stopped_reason"] == "frame_count_limit"
+    assert result["book_snapshot"] is True
+    assert result["bytes"] == len(raw)
+    saved = output.read_text()
+    assert [json.loads(line)["kind"] for line in saved.splitlines()] == ["book_snapshot"]
+    assert "PRIVATE_SIGNATURE" not in saved + repr(result)
 
 
 def test_transport_close_records_only_safe_code_not_reason(monkeypatch, tmp_path):
@@ -218,7 +277,8 @@ def test_transport_close_records_only_safe_code_not_reason(monkeypatch, tmp_path
     monkeypatch.setattr("websockets.asyncio.client.connect", lambda *_, **__: Socket())
     output = tmp_path / "events.jsonl"
     result = asyncio.run(collect_once(StreamIdentity.from_config(config()), output,
-                                      object(), limits=ObserverLimits(max_seconds=1)))
+                                      object(), limits=ObserverLimits(max_seconds=1, max_frames=2,
+                                                                    max_bytes=MAX_SESSION_BYTES)))
     assert result["transport_error_class"] == "connection_closed"
     assert result["transport_close_code"] == 1009
     assert result["transport_sent_close_code"] is None
@@ -249,7 +309,8 @@ def test_local_oversize_close_code_is_recorded_without_reason(monkeypatch, tmp_p
     monkeypatch.setattr("websockets.asyncio.client.connect", lambda *_, **__: Socket())
     output = tmp_path / "events.jsonl"
     result = asyncio.run(collect_once(StreamIdentity.from_config(config()), output,
-                                      object(), limits=ObserverLimits(max_seconds=1)))
+                                      object(), limits=ObserverLimits(max_seconds=1, max_frames=2,
+                                                                    max_bytes=MAX_SESSION_BYTES)))
     assert result["transport_close_code"] is None
     assert result["transport_sent_close_code"] == 1009
     assert "PRIVATE_SIGNATURE" not in repr(result) + output.read_text()

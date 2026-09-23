@@ -17,6 +17,14 @@ from .offline_observer import ObserverLimits, TERMINAL
 
 
 WS_URL = "wss://api.rh.lighter.xyz/stream?readonly=true"
+MAX_SESSION_SECONDS = 30
+MAX_SESSION_FRAMES = 500
+MAX_SESSION_BYTES = 16 * 1024 * 1024
+MAX_DECOMPRESSED_FRAME_BYTES = 8 * 1024 * 1024
+SESSION_LIMITS = ObserverLimits(max_seconds=MAX_SESSION_SECONDS,
+                                max_frames=MAX_SESSION_FRAMES,
+                                max_bytes=MAX_SESSION_BYTES,
+                                max_frame_bytes=MAX_DECOMPRESSED_FRAME_BYTES)
 CONFIG_FIELDS = frozenset({"market_id", "market_symbol", "source_account_index",
                            "receiver_account_index", "api_key_index", "environment",
                            "api_base_url", "chain_id"})
@@ -288,13 +296,14 @@ async def _auth_tokens(identity: StreamIdentity, provider: KeychainSecretProvide
 
 
 async def collect_once(identity: StreamIdentity, output: Path, provider: KeychainSecretProvider,
-                       *, limits: ObserverLimits = ObserverLimits()) -> dict[str, object]:
+                       *, limits: ObserverLimits = SESSION_LIMITS) -> dict[str, object]:
     """One connection; no automatic retry/reconnect or trading message type."""
     from websockets.asyncio.client import connect
     from websockets.exceptions import ConnectionClosed, InvalidStatus, PayloadTooBig
 
-    if (limits.max_seconds > 600 or limits.max_frames > 15000
-            or limits.max_bytes > 20 * 1024 * 1024 or limits.max_frame_bytes > 65536):
+    if (limits.max_seconds > MAX_SESSION_SECONDS or limits.max_frames > MAX_SESSION_FRAMES
+            or limits.max_bytes > MAX_SESSION_BYTES
+            or limits.max_frame_bytes > MAX_DECOMPRESSED_FRAME_BYTES):
         raise ValueError("collection exceeds the owner gate")
     if output.exists() or output.is_symlink():
         raise FileExistsError("measurement output already exists")
@@ -306,7 +315,7 @@ async def collect_once(identity: StreamIdentity, output: Path, provider: Keychai
     with open(output, "x", encoding="utf-8", opener=lambda path, flags: os.open(path, flags, 0o600)) as sink:
         try:
             async with connect(WS_URL, max_size=limits.max_frame_bytes,
-                               max_queue=16, ping_interval=30, open_timeout=10,
+                               max_queue=1, ping_interval=30, open_timeout=10,
                                close_timeout=3) as socket:
                 subscriptions = [f"order_book/{identity.market_id}"]
                 subscriptions += [f"account_all_orders/{account}" for account in identity.accounts]
@@ -369,13 +378,14 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="One bounded read-only Robinhood BTC stream session")
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--max-seconds", type=float, default=570)
-    parser.add_argument("--max-frames", type=int, default=15000)
-    parser.add_argument("--max-bytes", type=int, default=20 * 1024 * 1024)
+    parser.add_argument("--max-seconds", type=float, default=MAX_SESSION_SECONDS)
+    parser.add_argument("--max-frames", type=int, default=MAX_SESSION_FRAMES)
+    parser.add_argument("--max-bytes", type=int, default=MAX_SESSION_BYTES)
+    parser.add_argument("--max-frame-bytes", type=int, default=MAX_DECOMPRESSED_FRAME_BYTES)
     args = parser.parse_args()
     try:
         limits = ObserverLimits(max_seconds=args.max_seconds, max_frames=args.max_frames,
-                                max_bytes=args.max_bytes)
+                                max_bytes=args.max_bytes, max_frame_bytes=args.max_frame_bytes)
         if args.config.is_symlink() or not args.config.is_file():
             raise ValueError("protected config unavailable")
         value = json.loads(args.config.read_text())
