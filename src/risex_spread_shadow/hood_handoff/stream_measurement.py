@@ -87,6 +87,7 @@ class StreamProjection:
     server_error_controls: int = 0
     transport_error_class: str | None = None
     transport_close_code: int | None = None
+    transport_sent_close_code: int | None = None
     stopped_reason: str | None = None
     last_orders: dict[tuple[int, int], tuple[str, str, str, str]] = field(default_factory=dict)
 
@@ -257,6 +258,7 @@ class StreamProjection:
                 "server_error_controls": self.server_error_controls,
                 "transport_error_class": self.transport_error_class,
                 "transport_close_code": self.transport_close_code,
+                "transport_sent_close_code": self.transport_sent_close_code,
                 "stopped_reason": self.stopped_reason}
 
 
@@ -340,6 +342,9 @@ async def collect_once(identity: StreamIdentity, output: Path, provider: Keychai
                 code = getattr(getattr(exc, "rcvd", None), "code", None)
                 if isinstance(code, int) and not isinstance(code, bool):
                     observer.transport_close_code = code
+                sent_code = getattr(getattr(exc, "sent", None), "code", None)
+                if isinstance(sent_code, int) and not isinstance(sent_code, bool):
+                    observer.transport_sent_close_code = sent_code
             elif isinstance(exc, InvalidStatus):
                 observer.transport_error_class = "handshake_status"
                 code = getattr(getattr(exc, "response", None), "status_code", None)
