@@ -93,6 +93,8 @@ class StreamProjection:
     order_conflicts: int = 0
     connected_controls: int = 0
     server_error_controls: int = 0
+    private_subscription_controls: int = 0
+    private_snapshot_accounts: set[int] = field(default_factory=set)
     transport_error_class: str | None = None
     transport_close_code: int | None = None
     transport_sent_close_code: int | None = None
@@ -105,6 +107,7 @@ class StreamProjection:
         self.book_nonce = None
         self.book_snapshot = False
         self.last_orders.clear()
+        self.private_snapshot_accounts.clear()
 
     def feed(self, raw: bytes, received_at: float) -> list[dict[str, object]]:
         if self.stopped_reason is not None:
@@ -197,6 +200,8 @@ class StreamProjection:
     def _orders(self, frame: dict, kind: str, account: int, at: float) -> list[dict[str, object]]:
         if kind not in {"subscribed/account_all_orders", "update/account_all_orders"}:
             return []
+        if kind == "subscribed/account_all_orders":
+            self.private_subscription_controls += 1
         orders = frame.get("orders")
         if not isinstance(orders, dict):
             self.malformed += 1
@@ -206,6 +211,7 @@ class StreamProjection:
             self.malformed += 1
             return []
         output = []
+        malformed_before, conflicts_before = self.malformed, self.order_conflicts
         for item in selected:
             if not isinstance(item, dict):
                 self.malformed += 1
@@ -251,6 +257,13 @@ class StreamProjection:
                 if _integer(item.get(name)):
                     projection[f"venue_{name}_raw"] = item[name]
             output.append(projection)
+        if (kind == "subscribed/account_all_orders"
+                and self.malformed == malformed_before
+                and self.order_conflicts == conflicts_before):
+            self.private_snapshot_accounts.add(account)
+            output.insert(0, {"kind": "private_orders_snapshot", "epoch": self.epoch,
+                              "account_index": account, "received_at": at,
+                              "stream_complete": False})
         return output
 
     def summary(self) -> dict[str, object]:
@@ -264,6 +277,8 @@ class StreamProjection:
                 "order_conflicts": self.order_conflicts,
                 "connected_controls": self.connected_controls,
                 "server_error_controls": self.server_error_controls,
+                "private_subscription_controls": self.private_subscription_controls,
+                "private_snapshot_accounts": sorted(self.private_snapshot_accounts),
                 "transport_error_class": self.transport_error_class,
                 "transport_close_code": self.transport_close_code,
                 "transport_sent_close_code": self.transport_sent_close_code,

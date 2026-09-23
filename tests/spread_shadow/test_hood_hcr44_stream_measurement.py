@@ -152,6 +152,32 @@ def test_connection_and_server_error_controls_save_no_payload():
     assert "PRIVATE_TOKEN" not in repr(observer.summary())
 
 
+def test_private_subscription_snapshot_is_account_scoped_and_not_history_proof():
+    observer = StreamProjection(StreamIdentity.from_config(config()))
+    raw = encoded({"type": "subscribed/account_all_orders",
+                   "channel": "account_all_orders:27331", "orders": {},
+                   "auth": "PRIVATE_TOKEN_NEVER_SAVE"})
+    event = observer.feed(raw, 1)[0]
+    assert event == {"kind": "private_orders_snapshot", "epoch": 0,
+                     "account_index": 27331, "received_at": 1,
+                     "stream_complete": False}
+    assert observer.summary()["private_snapshot_accounts"] == [27331]
+    assert observer.summary()["private_subscription_controls"] == 1
+    observer.reconnect()
+    assert observer.summary()["private_snapshot_accounts"] == []
+    assert "PRIVATE_TOKEN" not in repr(event) + repr(observer.summary())
+
+
+def test_private_subscription_invalid_payload_cannot_claim_snapshot():
+    observer = StreamProjection(StreamIdentity.from_config(config()))
+    raw = encoded({"type": "subscribed/account_all_orders",
+                   "channel": "account_all_orders:27337", "orders": {"1": "bad"}})
+    assert observer.feed(raw, 1) == []
+    assert observer.summary()["private_subscription_controls"] == 1
+    assert observer.summary()["private_snapshot_accounts"] == []
+    assert observer.malformed == 1
+
+
 def test_connection_sends_only_three_read_subscriptions_and_saves_projections(monkeypatch, tmp_path):
     identity = StreamIdentity.from_config(config())
     frames = [book("subscribed/order_book", 10), private("filled", filled="0.0002", remaining="0")]
