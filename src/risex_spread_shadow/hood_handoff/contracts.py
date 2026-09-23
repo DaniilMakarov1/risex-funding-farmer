@@ -289,6 +289,8 @@ class MarketMetadata:
     margin_evidence: str = ""
     market_type: str = "perp"
     venue: str = ""
+    minimum_initial_margin_fraction: int | None = None
+    market_margin_mode: int | None = None
 
     def __post_init__(self) -> None:
         _int(self.market_id, "market_id", minimum=0)
@@ -304,6 +306,10 @@ class MarketMetadata:
             _nonnegative(self.receiver_fee_rate, "receiver_fee_rate")
         _timestamp(self.observed_at, "observed_at")
         _text(self.margin_evidence, "margin_evidence")
+        if self.minimum_initial_margin_fraction is not None:
+            _int(self.minimum_initial_margin_fraction, "minimum_initial_margin_fraction", minimum=1)
+        if self.market_margin_mode is not None:
+            _int(self.market_margin_mode, "market_margin_mode", minimum=0)
         market_type = _text(self.market_type, "market_type").lower()
         if market_type != "perp":
             raise ContractError("market_type must be perp")
@@ -354,6 +360,14 @@ class MarketMetadata:
                 ""
                 if value.get("venue") in (None, "")
                 else _text(value.get("venue"), "venue").lower()
+            ),
+            minimum_initial_margin_fraction=(
+                None if value.get("minimum_initial_margin_fraction") is None
+                else _int(value["minimum_initial_margin_fraction"], "minimum_initial_margin_fraction", minimum=1)
+            ),
+            market_margin_mode=(
+                None if value.get("market_margin_mode") is None
+                else _int(value["market_margin_mode"], "market_margin_mode", minimum=0)
             ),
         )
 
@@ -1368,8 +1382,9 @@ class HandoffConfig:
                 raise PreflightBlocked(f"{label} has active HOOD orders")
             if snapshot.margin_available is None or snapshot.margin_required is None:
                 raise PreflightBlocked(f"{label} margin evidence is missing")
-            if snapshot.margin_required > snapshot.margin_available:
-                raise PreflightBlocked(f"{label} margin is insufficient")
+            # Current cross margin is already reserved. Only an independently
+            # evidenced incremental requirement may be compared with free
+            # available balance for a new opening.
             incremental_margin_missing = (
                 snapshot.incremental_margin_required is None
                 or not snapshot.incremental_margin_evidence
@@ -1382,6 +1397,7 @@ class HandoffConfig:
                 raise PreflightBlocked(f"{label} incremental planned-operation margin evidence is missing")
             if (
                 not incremental_margin_missing
+                and self.operation_mode is not OperationMode.PAIRED_CLOSING
                 and snapshot.incremental_margin_required > snapshot.margin_available
             ):
                 raise PreflightBlocked(f"{label} incremental planned-operation margin is insufficient")

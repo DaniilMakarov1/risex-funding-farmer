@@ -61,7 +61,7 @@ from .series import OrderBookSnapshot
 
 
 MIN_HOLD_SECONDS = 20
-MAX_HOLD_SECONDS = 300
+MAX_HOLD_SECONDS = 180
 MAX_PREPARATION_ATTEMPTS = 3
 CYCLE_JOURNAL_NAME = "cycle.jsonl"
 OPENING_JOURNAL_NAME = "opening.jsonl"
@@ -472,13 +472,45 @@ def _available_balance(snapshot: AccountSnapshot, label: str) -> Decimal:
     return _decimal(value, f"{label}.available_balance")
 
 
+def _observed_leverage_fraction(snapshot: AccountSnapshot, label: str) -> int:
+    evidence = snapshot.margin_evidence
+    if (evidence is None or evidence.selected_position_present is not True
+            or evidence.selected_margin_mode != 0
+            or evidence.selected_initial_margin_fraction is None
+            or any(field in {"margin_mode", "initial_margin_fraction"} for field in evidence.invalid_fields)):
+        raise PreflightBlocked(f"{label} cross-margin leverage setting is unproved")
+    # The account endpoint renders the signed integer fraction as a percent
+    # string with two decimal places: 4166 -> "41.66". Never round a readback.
+    raw = Decimal(evidence.selected_initial_margin_fraction) * 100
+    if raw != raw.to_integral_value() or not 1 <= raw <= 10000:
+        raise PreflightBlocked(f"{label} leverage fraction has unsupported precision")
+    return int(raw)
+
+
+def minimal_sufficient_leverage_fraction(
+    available_balance: Decimal, notional: Decimal, market_minimum_fraction: int,
+) -> int:
+    """Largest integer IMF (lowest leverage) that fits the free-balance model.
+
+    The venue remains authoritative about fees, risk and final order admission.
+    """
+    balance = _positive(available_balance, "available_balance")
+    amount = _positive(notional, "notional")
+    minimum = _int(market_minimum_fraction, "market_minimum_fraction", minimum=1)
+    floor = max(2500, minimum)  # 4x maximum; 10000 is 1x.
+    fraction = min(10000, int((balance * 10000 / amount).to_integral_value(rounding=ROUND_FLOOR)))
+    if fraction < floor:
+        raise PreflightBlocked("selected quantity needs more than supported 4x leverage or available margin")
+    return fraction
+
+
 def compute_quantity_bounds(
     metadata: MarketMetadata,
     source: AccountSnapshot,
     receiver: AccountSnapshot,
     opening_price: Decimal,
 ) -> RandomQuantityBounds:
-    """Compute legal integer quantity ticks without leverage or float math."""
+    """Compute legal integer ticks within the owner's fourfold free-balance cap."""
 
     price = _positive(opening_price, "opening_price")
     price_int = decimal_to_integer(price, metadata.price_decimals, "opening_price")
@@ -492,14 +524,16 @@ def compute_quantity_bounds(
     lower_quote = int(
         (metadata.minimum_quote_amount / price / step).to_integral_value(rounding=ROUND_CEILING)
     )
+    minimum_fraction = max(2500, metadata.minimum_initial_margin_fraction or 2500)
     upper = int(
-        (min(source_balance, receiver_balance) / price / step).to_integral_value(rounding=ROUND_FLOOR)
+        (min(source_balance, receiver_balance) * 10000 / minimum_fraction / price / step)
+        .to_integral_value(rounding=ROUND_FLOOR)
     )
     lower = max(lower_base, lower_quote)
     if lower <= 0:
         raise PreflightBlocked("venue minimums produce no positive size tick")
     if upper < lower:
-        raise PreflightBlocked("smaller available balance cannot fund the venue minimum quantity")
+        raise PreflightBlocked("available balance and allowed leverage cannot fund the venue minimum quantity")
     return RandomQuantityBounds(
         opening_price=price,
         size_step=step,
@@ -541,7 +575,7 @@ def select_random_quantity(
         else _int(hold_seconds, "hold_seconds", minimum=MIN_HOLD_SECONDS)
     )
     if hold > MAX_HOLD_SECONDS:
-        raise ContractError("hold_seconds must not exceed 300")
+        raise ContractError("hold_seconds must not exceed 180")
     return tick * bounds.size_step, tick, hold
 
 
@@ -814,6 +848,8 @@ def _metadata_payload(metadata: MarketMetadata) -> dict[str, Any]:
         "minimum_quote_amount": format(metadata.minimum_quote_amount, "f"),
         "observed_at": metadata.observed_at,
         "margin_evidence": metadata.margin_evidence,
+        "minimum_initial_margin_fraction": metadata.minimum_initial_margin_fraction,
+        "market_margin_mode": metadata.market_margin_mode,
     }
 
 
@@ -1223,8 +1259,10 @@ def _validate_account(
         raise PreflightBlocked(f"{label} has active cycle-market orders")
     if snapshot.margin_available is None or snapshot.margin_required is None:
         raise PreflightBlocked(f"{label} margin evidence is missing")
-    if snapshot.margin_required > snapshot.margin_available:
-        raise PreflightBlocked(f"{label} current margin is insufficient")
+    # cross_initial_margin_requirement describes margin already committed to
+    # existing positions. available_balance is the remaining free collateral;
+    # comparing the former with the latter would reject reduce-only closure
+    # precisely when a position uses more than half of an account's equity.
     if expected_position is not None and snapshot.signed_position != expected_position:
         raise PreflightBlocked(f"{label} position changed before the dependent cycle phase")
 
@@ -1886,6 +1924,7 @@ class RandomCycleEngine:
         self._stage = "PREFLIGHT"
         self._identity_barrier: str | None = None
         self._selection: RandomCycleSelection | None = None
+        self._leverage_fractions: dict[int, int] = {}
         self._last_account_observations: dict[int, AccountSnapshot] = {}
         self._pending_nonces: dict[int, Any] = {}
         self._nonce_deadline: float | None = None
@@ -1953,6 +1992,7 @@ class RandomCycleEngine:
         self._stage = "PREFLIGHT"
         self._identity_barrier = None
         self._selection = None
+        self._leverage_fractions: dict[int, int] = {}
         self._last_account_observations = {}
         if not config.operator_execution_opt_in or not config.operator_plan_reviewed:
             return RandomCycleResult(
@@ -2129,6 +2169,10 @@ class RandomCycleEngine:
         )
         self._selection = selection
         journal.append("SELECTION_PROVED", {"selection": selection.as_dict(), "metadata": _metadata_payload(metadata), "book_observed_at": book.observed_at})
+
+        source, receiver = await self._configure_leverage(
+            config, journal, metadata, selection, source, receiver,
+        )
 
         pair_budget = _PairAttemptBudget()
         initial_metadata = metadata
@@ -2388,6 +2432,88 @@ class RandomCycleEngine:
     def _last_observed_at(self, account_index: int) -> float | None:
         snapshot = self._last_account_observations.get(account_index)
         return None if snapshot is None else snapshot.observed_at
+
+    async def _configure_leverage(
+        self, config: RandomCycleConfig, journal: DurableJournal,
+        metadata: MarketMetadata, selection: RandomCycleSelection,
+        source: AccountSnapshot, receiver: AccountSnapshot,
+    ) -> tuple[AccountSnapshot, AccountSnapshot]:
+        setter = getattr(self.client, "update_leverage_fraction", None)
+        if not callable(setter):
+            # Legacy synthetic clients have no venue margin surface. A client
+            # supplying real margin evidence must support exact configuration.
+            if source.margin_evidence is not None or receiver.margin_evidence is not None:
+                raise PreflightBlocked("leverage setting capability is missing")
+            return source, receiver
+        if (metadata.minimum_initial_margin_fraction is None
+                or metadata.market_margin_mode != 0):
+            raise PreflightBlocked("fresh Robinhood cross-margin leverage limits are unproved")
+        if source.signed_position != 0 or receiver.signed_position != 0:
+            raise PreflightBlocked("leverage can only be configured before a flat cycle")
+        notional = selection.quantity * selection.opening_source_price
+        original = {source.account_index: source, receiver.account_index: receiver}
+        targets = {
+            account.account_index: minimal_sufficient_leverage_fraction(
+                _available_balance(account, label), notional,
+                metadata.minimum_initial_margin_fraction,
+            )
+            for label, account in (("source", source), ("receiver", receiver))
+        }
+        current = {index: _observed_leverage_fraction(account, "source" if index == source.account_index else "receiver")
+                   for index, account in original.items()}
+        journal.append("LEVERAGE_PLAN", {
+            "quantity": format(selection.quantity, "f"), "price": format(selection.opening_source_price, "f"),
+            "notional": format(notional, "f"), "target_fraction_bps": targets,
+            "observed_fraction_bps": current,
+        })
+        for index in (source.account_index, receiver.account_index):
+            if current[index] == targets[index]:
+                continue
+            self._stage = "LEVERAGE"
+            journal.append("LEVERAGE_UPDATE_INTENT", {
+                "account_index": index, "market_id": config.market_id,
+                "fraction_bps": targets[index], "margin_mode": 0,
+            })
+            receipt = await self._bounded(
+                setter(index, config.market_id, targets[index], 0),
+                config, "leverage setting",
+            )
+            if not isinstance(receipt, MutationReceipt):
+                raise PreflightBlocked(f"account {index} leverage setting response is undecidable")
+            if not receipt.accepted:
+                journal.append("LEVERAGE_UPDATE_REJECTED", {
+                    "account_index": index, "market_id": config.market_id,
+                    "fraction_bps": targets[index],
+                    "reason": receipt.error,
+                })
+                self._stage = "PREFLIGHT"
+                raise PreflightBlocked(f"account {index} leverage setting was rejected")
+            # Acceptance is not effective state. Read both accounts again and
+            # stop without another setting transaction on missing/mismatched proof.
+            effective = None
+            observed = None
+            for attempt in range(min(3, config.max_poll_count)):
+                source, receiver = await self._accounts(config)
+                for account in (source, receiver):
+                    before = original[account.account_index]
+                    if account.source_identity != before.source_identity or account.signed_position != 0:
+                        raise PreflightBlocked("account identity or position changed during leverage setting")
+                observed = source if index == source.account_index else receiver
+                effective = _observed_leverage_fraction(observed, "source" if index == source.account_index else "receiver")
+                if effective == targets[index]:
+                    break
+                if attempt + 1 < min(3, config.max_poll_count):
+                    await self.clock.sleep(config.poll_interval_seconds)
+            if effective != targets[index] or observed is None:
+                raise PreflightBlocked(f"account {index} leverage setting is not effective or readback is stale")
+            journal.append("LEVERAGE_UPDATE_CONFIRMED", {
+                "account_index": index, "market_id": config.market_id,
+                "fraction_bps": effective, "observed_at": observed.observed_at,
+            })
+            current[index] = effective
+        self._leverage_fractions = targets
+        self._stage = "PREFLIGHT"
+        return source, receiver
 
     async def _accounts(self, config: RandomCycleConfig, now: float | None = None) -> tuple[AccountSnapshot, AccountSnapshot]:
         source, receiver = await self._parallel_accounts(config)
@@ -2714,6 +2840,13 @@ class RandomCycleEngine:
         expected_receiver_position = 0 if initial_receiver is None else initial_receiver.signed_position
         if source.signed_position != expected_source_position or receiver.signed_position != expected_receiver_position:
             raise PreflightBlocked("account position changed before opening mutation")
+        for account, label in ((source, "source"), (receiver, "receiver")):
+            fraction = self._leverage_fractions.get(account.account_index)
+            if fraction is not None:
+                if _observed_leverage_fraction(account, label) != fraction:
+                    raise PreflightBlocked(f"{label} leverage changed before opening mutation")
+                if selection.quantity * proposal.source_limit_price * fraction > _available_balance(account, label) * 10000:
+                    raise PreflightBlocked(f"{label} selected quantity exceeds fresh free-balance margin model")
         refreshed_bounds = compute_quantity_bounds(metadata, source, receiver, proposal.source_limit_price)
         if refreshed_bounds.size_step != selection.bounds.size_step:
             raise PreflightBlocked("opening size grid changed before mutation")

@@ -138,6 +138,7 @@ def prior_intents(operator, config):
     empty current book alone does not resolve a transmitted but invisible order.
     """
     intents = {}
+    unresolved_leverage = []
     files = []
     indices = {config.source_account_index, config.receiver_account_index}
     for slot in sorted(Path(operator).iterdir()):
@@ -156,9 +157,27 @@ def prior_intents(operator, config):
                     digest.update(chunk)
             files.append({'path': str(path), 'sha256': digest.hexdigest()})
             local = {}
+            local_leverage = {}
             for row in journal_rows(path):
                 event, payload = row['event'], row['payload']
-                if event in INTENTS:
+                if event == 'LEVERAGE_UPDATE_INTENT':
+                    index = payload.get('account_index')
+                    fraction = payload.get('fraction_bps')
+                    if (index not in indices or payload.get('market_id') != config.market_id
+                            or payload.get('margin_mode') != 0 or type(fraction) is not int
+                            or not 2500 <= fraction <= 10000 or index in local_leverage):
+                        raise PreflightBlocked('historical leverage setting intent is invalid')
+                    item = {'account_index': index, 'fraction_bps': fraction, 'resolved': False}
+                    local_leverage[index] = item
+                    unresolved_leverage.append(item)
+                elif event in {'LEVERAGE_UPDATE_CONFIRMED', 'LEVERAGE_UPDATE_REJECTED'}:
+                    index = payload.get('account_index')
+                    item = local_leverage.get(index)
+                    if (item is None or item['resolved'] or payload.get('market_id') != config.market_id
+                            or payload.get('fraction_bps') != item['fraction_bps']):
+                        raise PreflightBlocked('historical leverage setting result conflicts with intent')
+                    item['resolved'] = True
+                elif event in INTENTS:
                     plan = OrderPlan(**payload['plan'])
                     if plan.account_index not in indices or plan.market_id != config.market_id:
                         raise PreflightBlocked('historical intent account/market differs')
@@ -189,13 +208,15 @@ def prior_intents(operator, config):
                                 raise PreflightBlocked('historical terminal order conflicts with intent')
                             if terminal_matches(order, item) and order.observed_at >= item['at']:
                                 item.update(resolved=True, order=order)
-    return list(intents.values()), files
+    return list(intents.values()), files, sum(not item['resolved'] for item in unresolved_leverage)
 
 
-async def resolve_prior(config, client, operator, *, clock=None):
+async def resolve_prior(config, client, operator, *, clock=None, require_leverage_resolved=True):
     """Resolve outstanding creations before admitting a new operation."""
     engine = RandomCycleEngine(client, clock=clock)
-    intents, files = await asyncio.to_thread(prior_intents, operator, config)
+    intents, files, unknown_leverage = await asyncio.to_thread(prior_intents, operator, config)
+    if unknown_leverage and require_leverage_resolved:
+        raise PreflightBlocked('previous leverage setting is unresolved; new /run needs manual reconciliation')
     unresolved = [item for item in intents if not item['resolved']]
     if len(unresolved) > config.max_poll_count:
         raise PreflightBlocked('too many unresolved historical intents for a bounded check')
@@ -214,13 +235,15 @@ async def resolve_prior(config, client, operator, *, clock=None):
                             'client_order_index': order.client_order_index, 'status': order.status,
                             'observed_at': order.observed_at})
     await asyncio.wait_for(resolve(), timeout=config.reconcile_timeout_seconds)
-    return {'previous_intents': len(intents), 'resolved_now': checked, 'inputs': files}
+    return {'previous_intents': len(intents), 'unresolved_leverage_settings': unknown_leverage,
+            'resolved_now': checked, 'inputs': files}
 
 
 async def inspect_current(config, client, operator, *, require_flat, clock=None, journal=None):
     """Called under the operator lock; read only, with causal accounts last."""
     engine = RandomCycleEngine(client, clock=clock)
-    prior = await resolve_prior(config, client, operator, clock=engine.clock)
+    prior = await resolve_prior(config, client, operator, clock=engine.clock,
+                                require_leverage_resolved=require_flat)
     source, receiver = await engine._recovery_accounts(config, journal)
     if require_flat and (source.signed_position != 0 or receiver.signed_position != 0):
         raise PreflightBlocked('positions remain; use /close before /run')

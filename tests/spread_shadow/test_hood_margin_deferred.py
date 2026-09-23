@@ -125,7 +125,7 @@ async def test_deferred_margin_allows_only_missing_local_estimate_and_binds_poli
 
 
 @pytest.mark.asyncio
-async def test_deferral_keeps_current_margin_and_position_gates(tmp_path):
+async def test_deferred_open_does_not_compare_reserved_margin_with_free_balance_and_keeps_position_gate(tmp_path):
     insufficient = MissingIncrementalPairedClient(source_margin=Decimal("0.5"))
     result = await run_handoff(
         paired_config(
@@ -135,8 +135,8 @@ async def test_deferral_keeps_current_margin_and_position_gates(tmp_path):
         insufficient,
         clock=Clock(),
     )
-    assert result.outcome is Outcome.FAILED_PREFLIGHT_BLOCKED
-    assert insufficient.submissions == []
+    assert result.outcome is Outcome.SUCCESS
+    assert len(insufficient.submissions) == 2
 
     nonflat = MissingIncrementalPairedClient()
     nonflat.source_position = Decimal("0.01")

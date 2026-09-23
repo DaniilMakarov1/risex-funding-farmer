@@ -21,6 +21,7 @@ import time
 from typing import Any, Callable, Mapping, Protocol
 
 from .contracts import (
+    AccountMarginEvidence,
     AccountSnapshot,
     ContractError,
     HandoffConfig,
@@ -629,12 +630,16 @@ class LighterSdkClient:
             "size_decimals": "supported_size_decimals",
             "minimum_base_amount": "min_base_amount",
             "minimum_quote_amount": "min_quote_amount",
+            "minimum_initial_margin_fraction": "min_initial_margin_fraction",
         }
         for target, source in observed_aliases.items():
             if source in observed:
                 if target in evidence and str(evidence[target]) != str(observed[source]):
                     raise ContractError(f"market evidence conflicts with orderBookDetails {source}")
                 evidence[target] = observed[source]
+        market_config = observed.get("market_config")
+        if isinstance(market_config, Mapping):
+            evidence["market_margin_mode"] = market_config.get("market_margin_mode")
         return MarketMetadata.from_mapping(evidence)
 
     async def resolve_market(self, symbol: str) -> MarketMetadata:
@@ -690,6 +695,11 @@ class LighterSdkClient:
                 if target in evidence and str(evidence[target]) != str(observed[source]):
                     raise ContractError(f"market evidence conflicts with orderBookDetails {source}")
                 evidence[target] = observed[source]
+        if "min_initial_margin_fraction" in observed:
+            evidence["minimum_initial_margin_fraction"] = observed["min_initial_margin_fraction"]
+        market_config = observed.get("market_config")
+        if isinstance(market_config, Mapping):
+            evidence["market_margin_mode"] = market_config.get("market_margin_mode")
         return MarketMetadata.from_mapping(evidence)
 
     async def resolve_perpetual_market(self, symbol: str) -> MarketMetadata:
@@ -776,8 +786,10 @@ class LighterSdkClient:
         if not isinstance(positions, (list, tuple)):
             raise ContractError("Lighter account positions field is malformed")
         position: Mapping[str, Any] | None = None
+        position_rows: list[Mapping[str, Any]] = []
         for candidate in positions:
             candidate_map = _model_dict(candidate)
+            position_rows.append(candidate_map)
             if "market_id" not in candidate_map:
                 raise ContractError("Lighter account position lacks market identity")
             try:
@@ -797,6 +809,7 @@ class LighterSdkClient:
                 if position is not None:
                     raise ContractError("Lighter account response has duplicate selected-market positions")
                 position = candidate_map
+        selected_position = position
         position = position or {"position": "0", "sign": 1}
         available = account.get("available_balance")
         margin_required = account.get("cross_initial_margin_requirement")
@@ -825,6 +838,17 @@ class LighterSdkClient:
         if incremental_margin is None or not incremental_evidence:
             # Do not treat current cross margin as the requirement of adding Q.
             incremental_margin = None
+        margin_evidence = AccountMarginEvidence.from_response(
+            account_index=account_index,
+            market_id=market_id,
+            source_identity=account_identity.strip(),
+            observed_at=account_observed_at,
+            selected_position=selected_position,
+            account=account,
+            position_rows=position_rows,
+            source="lighter-sdk.account response",
+            sdk_version=REQUIRED_LIGHTER_SDK_VERSION,
+        )
         return AccountSnapshot.from_mapping(
             {
                 "account_index": account_index,
@@ -842,6 +866,7 @@ class LighterSdkClient:
                 "source_identity": account_identity.strip(),
                 "incremental_margin_required": incremental_margin,
                 "incremental_margin_evidence": incremental_evidence,
+                "margin_evidence": margin_evidence,
             }
         )
 
@@ -1396,6 +1421,48 @@ class LighterSdkClient:
         except Exception as exc:
             return MutationReceipt(False, None, None, sanitize_exception(exc))
         return await self.submit_prepared_order(plan, prepared)
+
+    async def update_leverage_fraction(
+        self, account_index: int, market_id: int, fraction: int, margin_mode: int = 0,
+    ) -> MutationReceipt:
+        """Send one exact cross-margin setting transaction; never retry a send."""
+        key_index = self.config.api_key_index
+        if (key_index is None or account_index not in {self.source_account_index, self.receiver_account_index}
+                or market_id != self.config.market_id or margin_mode != 0
+                or isinstance(fraction, bool) or not isinstance(fraction, int)
+                or not 2500 <= fraction <= 10000):
+            raise ContractError("leverage setting identity, mode or 1x..4x fraction is invalid")
+        deadline = time.monotonic() + min(self.config.request_timeout_seconds, self.config.freshness_seconds)
+        async with self._preparation_lock_for(account_index, key_index):
+            signer = self._signer(account_index)
+            nonce = await self._next_nonce(signer, key_index, deadline=deadline)
+            self._assert_nonce_available(account_index, key_index, nonce)
+            signer_type = type(signer)
+            result = await self._bounded(
+                _await(signer.sign_update_leverage(
+                    market_index=market_id, fraction=fraction, margin_mode=margin_mode,
+                    skip_nonce=getattr(signer_type, "SKIP_NONCE_OFF", 0),
+                    nonce=nonce, api_key_index=key_index,
+                )), deadline, "leverage signing",
+            )
+            if not isinstance(result, tuple) or len(result) != 4:
+                raise ContractError("leverage signer returned an unsupported shape")
+            tx_type, tx_info, tx_hash, error = result
+            if error:
+                return MutationReceipt(False, None, _safe_text(tx_hash), "leverage signing rejected")
+            if time.monotonic() >= deadline:
+                raise TimeoutError("leverage signing crossed its mutation deadline")
+            # Once the nonce is consumed, a transport failure is ambiguous.
+            self._block_nonce(account_index, key_index, nonce)
+        response = await self._bounded(self._send_signed_tx(tx_type, tx_info), deadline, "leverage dispatch")
+        code = _response_code(response)
+        if code is None or code >= 500:
+            raise RuntimeError("malformed or undecidable leverage sendTx response")
+        return MutationReceipt(
+            accepted=code == 200, order_id=None,
+            tx_hash=_safe_text(tx_hash) or _safe_text(_model_dict(response).get("tx_hash")),
+            error=None if code == 200 else f"send_tx response code {code}", response_code=code,
+        )
 
     async def cancel_order(self, account_index: int, market_id: int, order_id: str) -> MutationReceipt:
         deadline = self._pending_mutation_deadline

@@ -35,6 +35,7 @@ class FakeSigner:
         self.kwargs = kwargs
         self.sign_calls = []
         self.cancel_calls = []
+        self.leverage_calls = []
         self.nonce_manager = FakeNonceManager()
 
     async def sign_create_order(self, **kwargs):
@@ -44,6 +45,10 @@ class FakeSigner:
     async def sign_cancel_order(self, **kwargs):
         self.cancel_calls.append(kwargs)
         return (15, "signed-cancel-info", "0xcancel", None)
+
+    async def sign_update_leverage(self, **kwargs):
+        self.leverage_calls.append(kwargs)
+        return (16, "signed-leverage-info", "0xleverage", None)
 
     async def create_auth_token_with_expiry(self, **kwargs):
         return "fixture-token", None
@@ -889,3 +894,29 @@ def test_incomplete_integrator_or_role_evidence_never_assumes_free_trade(fields)
     assert _trade_fee_evidence({'is_maker_ask':True, **fields}, is_ask=True, distinct_accounts=True)['fee'] is None
     assert _trade_fee_evidence({'is_maker_ask':True, 'maker_fee':0, 'integrator_maker_fee':0},
                                is_ask=True, distinct_accounts=False)['fee'] is None
+
+
+@pytest.mark.asyncio
+async def test_leverage_fraction_is_signed_exactly_once_and_ambiguous_send_is_not_replayed():
+    signer = FakeSigner(account_index=11)
+    client = _constant_nonce_client(prefix="leverage-exact", signer=signer, http_factory=AmbiguousConstantHttp)
+    client._lighter = lambda: FakeModule
+    with pytest.raises(TimeoutError):
+        await client.update_leverage_fraction(11, 7, 4166, 0)
+    assert len(signer.leverage_calls) == 1
+    assert signer.leverage_calls[0]["fraction"] == 4166
+    assert signer.leverage_calls[0]["margin_mode"] == 0
+    assert len(client._http.calls) == 1
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_leverage_fraction_rejects_outside_owner_range_before_signing():
+    signer = FakeSigner(account_index=11)
+    client = _constant_nonce_client(prefix="leverage-limit", signer=signer)
+    client._lighter = lambda: FakeModule
+    with pytest.raises(ContractError, match="1x..4x"):
+        await client.update_leverage_fraction(11, 7, 2499, 0)
+    assert not signer.leverage_calls
+    assert not client._http.calls
+    await client.aclose()

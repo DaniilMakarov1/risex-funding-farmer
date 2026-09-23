@@ -1119,8 +1119,6 @@ async def run_readiness(
             if snapshot.margin_required is None:
                 missing.append("cross_initial_margin_requirement")
             _check(checks, f"{prefix}_margin", "UNKNOWN", "MARGIN_EVIDENCE_REQUIRED", f"{role} current margin fields are incomplete; incremental opening margin is UNKNOWN", missing_fields=missing)
-        elif snapshot.margin_required > snapshot.margin_available:
-            _check(checks, f"{prefix}_margin", "BLOCKED", "CURRENT_MARGIN_INSUFFICIENT", f"{role} current cross margin requirement exceeds available balance", margin_available=format(snapshot.margin_available, "f"), margin_required=format(snapshot.margin_required, "f"))
         elif snapshot.incremental_margin_required is None or not snapshot.incremental_margin_evidence:
             _check(checks, f"{prefix}_margin", "UNKNOWN", "MARGIN_EVIDENCE_REQUIRED", f"{role} incremental opening margin proof is unavailable; current balance alone is insufficient", margin_available=format(snapshot.margin_available, "f"), current_margin_required=format(snapshot.margin_required, "f"), missing_fields=["incremental_margin_required", "incremental_margin_evidence"])
         elif snapshot.incremental_margin_required > snapshot.margin_available:

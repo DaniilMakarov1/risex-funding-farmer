@@ -372,6 +372,7 @@ class HandoffEngine:
         self._visibility_source_baseline: AccountSnapshot | None = None
         self._visibility_receiver_baseline: AccountSnapshot | None = None
         self._visibility_requires_incremental_margin = False
+        self._visibility_checks_incremental_margin = True
         self._preflight_context: HandoffPreflightContext | None = None
         self._source_dispatch_monotonic: float | None = None
 
@@ -481,7 +482,6 @@ class HandoffEngine:
         if (
             snapshot.margin_available is None
             or snapshot.margin_required is None
-            or snapshot.margin_required > snapshot.margin_available
         ):
             return False
         if self._visibility_requires_incremental_margin and (
@@ -490,7 +490,8 @@ class HandoffEngine:
         ):
             return False
         if (
-            snapshot.incremental_margin_required is not None
+            self._visibility_checks_incremental_margin
+            and snapshot.incremental_margin_required is not None
             and snapshot.incremental_margin_evidence
             and snapshot.incremental_margin_required > snapshot.margin_available
         ):
@@ -780,6 +781,7 @@ class HandoffEngine:
             config.operation_mode is not OperationMode.PAIRED_CLOSING
             and not config.defer_incremental_margin_calculation
         )
+        self._visibility_checks_incremental_margin = config.operation_mode is not OperationMode.PAIRED_CLOSING
         if journal.has_unresolved_mutation():
             return await self._resume_reconciliation(config, journal)
         if journal.has_completed_mutation():
@@ -1196,7 +1198,6 @@ class HandoffEngine:
                 if (
                     source_recheck.margin_available is None
                     or source_recheck.margin_required is None
-                    or source_recheck.margin_required > source_recheck.margin_available
                     or (
                         requires_incremental_margin
                         and (
@@ -1205,7 +1206,8 @@ class HandoffEngine:
                         )
                     )
                     or (
-                        source_recheck.incremental_margin_required is not None
+                        config.operation_mode is not OperationMode.PAIRED_CLOSING
+                        and source_recheck.incremental_margin_required is not None
                         and source_recheck.incremental_margin_evidence
                         and source_recheck.incremental_margin_required > source_recheck.margin_available
                     )
@@ -1261,7 +1263,6 @@ class HandoffEngine:
                 if (
                     receiver_recheck.margin_available is None
                     or receiver_recheck.margin_required is None
-                    or receiver_recheck.margin_required > receiver_recheck.margin_available
                     or (
                         requires_incremental_margin
                         and (
@@ -1270,7 +1271,8 @@ class HandoffEngine:
                         )
                     )
                     or (
-                        receiver_recheck.incremental_margin_required is not None
+                        config.operation_mode is not OperationMode.PAIRED_CLOSING
+                        and receiver_recheck.incremental_margin_required is not None
                         and receiver_recheck.incremental_margin_evidence
                         and receiver_recheck.incremental_margin_required > receiver_recheck.margin_available
                     )

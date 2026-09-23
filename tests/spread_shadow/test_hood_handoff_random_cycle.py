@@ -1313,16 +1313,16 @@ def test_quantity_bounds_use_independent_integer_ceil_floor_and_documented_balan
     receiver = account(22, Decimal("0"), available_balance=Decimal("251.01"))
     bounds = compute_quantity_bounds(metadata(), source, receiver, Decimal("100.1"))
     assert bounds.lower_tick == 10
-    assert bounds.upper_tick == 100
+    assert bounds.upper_tick == 400
     assert bounds.lower_quantity == Decimal("0.10")
-    assert bounds.upper_quantity == Decimal("1.00")
+    assert bounds.upper_quantity == Decimal("4.00")
 
     with pytest.raises(PreflightBlocked, match="available_balance evidence is missing"):
         compute_quantity_bounds(metadata(), account(11, Decimal("0"), available_balance=None), receiver, Decimal("100.1"))
 
 
-def test_quantity_bounds_do_not_turn_missing_or_undersized_balance_into_leverage():
-    source = account(11, Decimal("0"), available_balance=Decimal("9.99"))
+def test_quantity_bounds_reject_below_fourfold_minimum():
+    source = account(11, Decimal("0"), available_balance=Decimal("2.49"))
     receiver = account(22, Decimal("0"), available_balance=Decimal("1000"))
     with pytest.raises(PreflightBlocked, match="cannot fund"):
         compute_quantity_bounds(metadata(), source, receiver, Decimal("100.1"))
@@ -4076,7 +4076,7 @@ async def test_quote_move_is_accepted_with_same_draw_and_fresh_opening_plan(tmp_
     assert result.selection is not None
     assert result.selection.quantity == Decimal("0.25")
     assert result.selection.hold_seconds == 20
-    assert rng.bounds == [(10, 999), (20, 300)]
+    assert rng.bounds == [(10, 3996), (20, 180)]
     assert client.submissions[0].price == Decimal("101.1")
     rows = [json.loads(line) for line in (tmp_path / "repriced" / "cycle.jsonl").read_text().splitlines()]
     updates = [row["payload"] for row in rows if row["event"] == "OPENING_PRICE_UPDATED"]
@@ -4107,7 +4107,7 @@ async def test_stale_preparation_is_retried_without_redrawing_selection(tmp_path
         rng=rng,
     )
     assert result.outcome is Outcome.SUCCESS
-    assert rng.bounds == [(10, 999), (20, 300)]
+    assert rng.bounds == [(10, 3996), (20, 180)]
     assert clock.sleeps == [0.001, 20]
     rows = [json.loads(line) for line in (tmp_path / "retry-once" / "cycle.jsonl").read_text().splitlines()]
     assert [row["payload"]["attempt"] for row in rows if row["event"] == "PREPARATION_ATTEMPT"] == [1, 2]
@@ -4149,7 +4149,7 @@ async def test_preparation_succeeds_on_attempt_three_without_redrawing(tmp_path)
         rng=rng,
     )
     assert result.outcome is Outcome.SUCCESS
-    assert rng.bounds == [(10, 999), (20, 300)]
+    assert rng.bounds == [(10, 3996), (20, 180)]
     assert clock.sleeps == [0.001, 0.001, 20]
     rows = [json.loads(line) for line in (tmp_path / "retry-third" / "cycle.jsonl").read_text().splitlines()]
     assert [row["payload"]["attempt"] for row in rows if row["event"] == "PREPARATION_ATTEMPT"] == [1, 2, 3]
