@@ -1,3 +1,7 @@
+# Owner-directed AGENTS text update — completed
+
+On 2026-09-23 the owner requested committing the revised Russian translation of `AGENTS.md` after removing its entire "Safety and secrets" section. This explicit instruction authorizes the language exception for `AGENTS.md` and the removal of that section; the remaining four governing files retain their existing English-language convention. This documentation change does not authorize any new trading, account, credential, runtime, or strategy action. Preserve concurrent work and stage only `AGENTS.md` and this authority record.
+
 # HCR-42 controller restart — owner authorization
 
 ## Current finite operation
