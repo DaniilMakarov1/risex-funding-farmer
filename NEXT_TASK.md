@@ -1,4 +1,14 @@
-# HCR-42 — Margin headroom diagnosis and measured receiver admission
+# HCR-42 v2 — Correct original-budget observation provenance
+
+## Current finite correction assignment
+
+On 2026-09-23 independent auditor task `01a0c9cd-c8bc-75b0-92b3-04b75270a65e` returned HCR-42 candidate `40ce669a0e9694d1102fac6c9ae030421081aa7e` for one reproduced P2 diagnostic provenance defect. Chief task `01a0cc6e-175d-7582-a7ad-74a9601e2ca1` is the sole correction owner on new branch `codex/spread-v1-hcr42-provenance-v2`, worktree `/Users/daniilmakarov/.codex/worktrees/risex-hcr42-provenance-v2`, created from accepted main `e84ccc93b0542d605970ea7815d514be69025c63` with the reviewed v1 commits explicitly cherry-picked. Preserve the original candidate branch, packet and auditor review immutably. Auditor remains the independent acceptance/integration owner. Work alone without subagents.
+
+The numeric opening budget is captured before leverage setting, but the current diagnostic labels it with later post-setting account timestamps; retry selection metadata/book timestamps similarly advance while deltas still use the original plan. Correct only this provenance: retain exact original account/metadata/book observation times and identities together with the initial numeric budget, tie every initial-to-fresh delta to that immutable baseline, and distinguish setting confirmation or previous attempt observations if shown. Add actual-flow adverse regressions for post-setting balance/time change, retry mark/book change, both roles, successful/refused validation and missing data. Preserve reserve arithmetic, inactive numeric policy, transport and all safety gates. Run relevant integration tests and one final clean isolated Python 3.11 / lighter-sdk 1.1.2 full suite after source edits; self-review the full diff and return a separate owner-only v2 packet and clean committed READY_FOR_REVIEW or a precise blocker to auditor task `01a0c9cd-c8bc-75b0-92b3-04b75270a65e` via send_message_to_thread.
+
+No real or protected account reads, orders/cancellations, leverage writes, `/run`, `/close`, runtime activation/restart, main merge/push or new policy choice is authorized. Historical journals and predecessor packets remain immutable.
+
+## Historical HCR-42 v1 assignment — returned for correction
 
 ## Current finite assignment — owner authorization
 

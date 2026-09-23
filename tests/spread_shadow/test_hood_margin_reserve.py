@@ -190,7 +190,7 @@ async def test_fresh_higher_fee_blocks_receiver_with_source_budget_retained(tmp_
 
 
 @pytest.mark.asyncio
-async def test_fresh_budget_success_records_both_and_preserves_quantity(tmp_path):
+async def test_fresh_budget_success_omits_unproved_baseline_delta_and_preserves_quantity(tmp_path):
     market = replace(metadata(), mark_price=D('100'), minimum_initial_margin_fraction=2500,
                      market_margin_mode=0)
     source, receiver = _margin_account(11, '5.1'), _margin_account(22, '5.1')
@@ -207,24 +207,34 @@ async def test_fresh_budget_success_records_both_and_preserves_quantity(tmp_path
 
     config = cycle_config(tmp_path / 'admitted', margin_reserve=OpeningMarginReserve(D('.05'), D('.01')))
     original = _margin_account(11, '20')
-    bounds = compute_quantity_bounds(market, original, _margin_account(22, '20'), D('100.1'),
+    original_receiver = _margin_account(22, '20')
+    bounds = compute_quantity_bounds(market, original, original_receiver, D('100.1'),
         receiver_bound=D('100.1'), direction=Direction.LONG, initial_reserve_quote=D('.05'))
     selection = RandomCycleSelection(quantity=D('.20'), quantity_tick=20, hold_seconds=20,
         opening_source_price=D('100.1'), opening_receiver_bound=D('100.1'),
         bounds=bounds, metadata_observed_at=1000, book_observed_at=1000)
     engine = RandomCycleEngine(ReadOnlyClient(), clock=AdvancingClock())
     engine._leverage_fractions = {11: 2500, 22: 2500}
-    engine._opening_plan_evidence = {'source': {'available_balance': D('20')},
-                                     'receiver': {'available_balance': D('20')}}
+    engine._opening_plan_evidence = {
+        'source': {'account_index': 11, 'account_source_identity': original.source_identity,
+                   'account_observed_at': original.observed_at, 'available_balance': D('20')},
+        'receiver': {'account_index': 22, 'account_source_identity': original_receiver.source_identity,
+                     'account_observed_at': original_receiver.observed_at, 'available_balance': D('20')},
+    }
     journal = DurableJournal(config.journal_path, clock=lambda: 1000)
     refreshed = await engine._revalidate_open(config, selection, market, book(),
-                                               original, _margin_account(22, '20'), journal=journal)
+                                               original, original_receiver, journal=journal)
     assert refreshed[-1].quantity == D('.20')
     assert refreshed[-1].quantity_tick == 20
     rows = [json.loads(line) for line in config.journal_path.read_text().splitlines()]
     legs = next(row['payload']['legs'] for row in rows if row['event'] == 'FRESH_OPENING_MARGIN_BUDGET')
     assert [leg['status'] for leg in legs] == ['ADMITTED', 'ADMITTED']
-    assert [D(leg['initial_to_fresh']['available_balance']) for leg in legs] == [D('-14.9'), D('-14.9')]
+    assert [leg['initial_plan_provenance'] for leg in legs] == ['INCOMPLETE_OR_CONFLICTING'] * 2
+    assert all(leg['initial_account_observed_at'] == 1000.0 for leg in legs)
+    assert all(leg['initial_metadata_observed_at'] is None for leg in legs)
+    assert all(leg['initial_book_observed_at'] is None for leg in legs)
+    assert [leg['initial_to_fresh'] for leg in legs] == [
+        {'available_balance': '-14.9'}, {'available_balance': '-14.9'}]
     assert all(D(leg['headroom']) >= D('.01') for leg in legs)
 
 

@@ -2265,7 +2265,7 @@ class RandomCycleEngine:
         journal.append("SELECTION_PROVED", {"selection": selection.as_dict(), "metadata": _metadata_payload(metadata), "book_observed_at": book.observed_at})
 
         source, receiver = await self._configure_leverage(
-            config, journal, metadata, selection, source, receiver,
+            config, journal, metadata, book, selection, source, receiver,
         )
 
         pair_budget = _PairAttemptBudget()
@@ -2529,7 +2529,7 @@ class RandomCycleEngine:
 
     async def _configure_leverage(
         self, config: RandomCycleConfig, journal: DurableJournal,
-        metadata: MarketMetadata, selection: RandomCycleSelection,
+        metadata: MarketMetadata, book: OrderBookSnapshot, selection: RandomCycleSelection,
         source: AccountSnapshot, receiver: AccountSnapshot,
     ) -> tuple[AccountSnapshot, AccountSnapshot]:
         setter = getattr(self.client, "update_leverage_fraction", None)
@@ -2573,6 +2573,15 @@ class RandomCycleEngine:
                 + parts['fee_cost'] + parts['adverse_entry_loss']
             )
             initial_evidence[label] = {
+                'account_index': account.account_index,
+                'account_source_identity': account.source_identity,
+                'account_observed_at': account.observed_at,
+                'metadata_market_id': metadata.market_id,
+                'metadata_symbol': metadata.symbol,
+                'metadata_observed_at': metadata.observed_at,
+                'book_market_id': book.market_id,
+                'book_symbol': book.symbol,
+                'book_observed_at': book.observed_at,
                 'available_balance': _available_balance(account, label),
                 'mark_price': metadata.mark_price,
                 'worst_price': worst_price,
@@ -2586,6 +2595,7 @@ class RandomCycleEngine:
             "quantity": format(selection.quantity, "f"), "price": format(selection.opening_source_price, "f"),
             "notional": format(notional, "f"), "target_fraction_bps": targets,
             "observed_fraction_bps": current, "opening_budgets": budgets,
+            "initial_plan_observations": initial_evidence,
             "initial_reserve_quote": (None if config.margin_reserve is None
                                       else format(config.margin_reserve.initial_quote, "f")),
             "dispatch_reserve_quote": (None if config.margin_reserve is None
@@ -2993,7 +3003,24 @@ class RandomCycleEngine:
         ):
             target = self._leverage_fractions.get(account.account_index)
             plan = self._opening_plan_evidence.get(label, {})
-            initial_account = initial_source if label == "source" else initial_receiver
+            preparation_account = initial_source if label == "source" else initial_receiver
+            account_baseline_proved = (
+                plan.get("account_index") == account.account_index
+                and plan.get("account_source_identity") == account.source_identity
+                and plan.get("account_observed_at") is not None
+            )
+            metadata_baseline_proved = (
+                plan.get("metadata_market_id") == metadata.market_id
+                and plan.get("metadata_symbol") == metadata.symbol
+                and plan.get("metadata_observed_at") is not None
+            )
+            book_baseline_proved = (
+                plan.get("book_market_id") == book.market_id
+                and plan.get("book_symbol") == book.symbol
+                and plan.get("book_observed_at") is not None
+            )
+            complete_baseline = (account_baseline_proved and metadata_baseline_proved
+                                 and book_baseline_proved)
             row: dict[str, Any] = {
                 "role": label, "account_index": account.account_index,
                 "quantity": format(selection.quantity, "f"),
@@ -3011,9 +3038,26 @@ class RandomCycleEngine:
                 "account_age_seconds": max(0.0, now - account.observed_at),
                 "metadata_observed_at": metadata.observed_at,
                 "metadata_age_seconds": max(0.0, now - metadata.observed_at),
-                "initial_metadata_observed_at": selection.metadata_observed_at,
-                "initial_account_observed_at": None if initial_account is None else initial_account.observed_at,
-                "initial_book_observed_at": selection.book_observed_at,
+                "initial_account_index": plan.get("account_index") if account_baseline_proved else None,
+                "initial_account_source_identity": (plan.get("account_source_identity")
+                                                    if account_baseline_proved else None),
+                "initial_account_observed_at": (plan.get("account_observed_at")
+                                                if account_baseline_proved else None),
+                "initial_metadata_market_id": (plan.get("metadata_market_id")
+                                               if metadata_baseline_proved else None),
+                "initial_metadata_symbol": (plan.get("metadata_symbol")
+                                            if metadata_baseline_proved else None),
+                "initial_metadata_observed_at": (plan.get("metadata_observed_at")
+                                                 if metadata_baseline_proved else None),
+                "initial_book_market_id": plan.get("book_market_id") if book_baseline_proved else None,
+                "initial_book_symbol": plan.get("book_symbol") if book_baseline_proved else None,
+                "initial_book_observed_at": (plan.get("book_observed_at")
+                                             if book_baseline_proved else None),
+                "initial_plan_provenance": ("COMPLETE" if complete_baseline else "INCOMPLETE_OR_CONFLICTING"),
+                "preparation_reference_account_observed_at": (
+                    None if preparation_account is None else preparation_account.observed_at),
+                "preparation_reference_metadata_observed_at": selection.metadata_observed_at,
+                "preparation_reference_book_observed_at": selection.book_observed_at,
                 "book_observed_at": book.observed_at,
                 "book_age_seconds": max(0.0, now - book.observed_at),
                 "initial_to_fresh": {}, "status": "UNKNOWN",
@@ -3060,11 +3104,16 @@ class RandomCycleEngine:
                             "deficit": format(max(Decimal(0), -headroom), "f"),
                             "shortfall_to_dispatch_reserve": format(max(Decimal(0), dispatch_reserve - headroom), "f"),
                             "status": "ADMITTED" if headroom >= dispatch_reserve else "INSUFFICIENT"})
-                for field, current in (("available_balance", balance), ("mark_price", metadata.mark_price),
-                                       ("worst_price", worst), ("required", required),
-                                       ("headroom", headroom), ("fee_rate", parts["fee_rate"])):
+                for field, current, proved in (
+                    ("available_balance", balance, account_baseline_proved),
+                    ("mark_price", metadata.mark_price, metadata_baseline_proved),
+                    ("worst_price", worst, book_baseline_proved),
+                    ("required", required, complete_baseline),
+                    ("headroom", headroom, complete_baseline),
+                    ("fee_rate", parts["fee_rate"], complete_baseline),
+                ):
                     before = plan.get(field)
-                    if before is not None and current is not None:
+                    if proved and before is not None and current is not None:
                         row["initial_to_fresh"][field] = format(current - before, "f")
                 if headroom < dispatch_reserve:
                     budget_failures.append((label, account.account_index, dispatch_reserve - headroom))
