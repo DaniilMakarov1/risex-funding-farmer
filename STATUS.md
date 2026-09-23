@@ -1,8 +1,8 @@
 # Current status
 
-## HCR-43 observer correction — under verification
+## HCR-43 observer correction — READY_FOR_REVIEW
 
-Auditor v2 rejected chief-v2 HEAD `2280619779a5b9e36cf46aa9b46a32a6d27dee1f` for boolean/float inbound identity and epoch equality and regressing local receipt time. The rejected branch and chief-v2/auditor-v2 packets are preserved. A new isolated branch `codex/spread-v1-hcr43-observer-correction` starts at accepted main `d6ac3aa969dd6789ae7f747a84b3e46402df8fe4` and ports intended HCR-43 changes with strict integer identities/epoch and persistent monotonic receipt chronology. Offline tests, full clean verification and self-review are pending in a separate chief-v3 packet. No live collection, mutation, runtime change or main integration is authorized.
+Auditor v2 rejected chief-v2 HEAD `2280619779a5b9e36cf46aa9b46a32a6d27dee1f` for boolean/float inbound identity and epoch equality and regressing local receipt time. The rejected branch and chief-v2/auditor-v2 packets are preserved. The isolated branch `codex/spread-v1-hcr43-observer-correction` starts at accepted main `d6ac3aa969dd6789ae7f747a84b3e46402df8fe4` and ports intended HCR-43 changes with strict integer identities/epoch and persistent monotonic receipt chronology. Relevant focused checks passed 194 tests; the final clean detached Python 3.11.5 / lighter-sdk 1.1.2 suite at source commit `bf0a930c197f3263d6260b9064e8139dababe049` passed 5201 tests, 3 skipped, 2 dependency warnings in 141.23 seconds. The combined diff and actual imports were self-reviewed; owner-only evidence is in `spread-shadow-runs/hood-hcr43-low-latency-20260923/chief-v3/`. This is an offline candidate for independent audit. No live collection, mutation, runtime change or main integration occurred or is authorized.
 
 ## HCR-43 offline low-latency candidate — in review
 
