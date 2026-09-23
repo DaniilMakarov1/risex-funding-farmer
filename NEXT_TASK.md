@@ -6,6 +6,8 @@ On 2026-09-23 the owner explicitly requested a restart of the Telegram controlle
 
 Before stopping PID 66692, prove no trading child and no operator launch lock holder. Stop it gracefully, verify lock release, fast-forward the clean local runtime main checkout to the verified remote main, apply the exact owner-only operator configuration, migrate its binding without altering other state, and start one controller with the same owner/config/credential boundary. Verify actual Python/import/SDK version, process/locks, config/binding, startup outcome and absence of an automatically launched child. If a child or conflicting writer appears, do not interrupt it; preserve the prepared work and report the concrete obstacle. Record actual steps and hashes in a new owner-only packet. No periodic monitoring or automatic retry campaign.
 
+Result: old PID 66692 exited on SIGINT with unchanged saved state and released its instance lock. Local main fast-forwarded to `90cfbdc0b7e1783011af507e0ae8767e9659cadd`. Exact reviewed reserve JSON was applied; one binding digest in state was atomically replaced with all other bytes preserved. New PID 91534 started from the local main checkout and holds the instance lock. Startup read-only recovery returned READY at 2026-09-23 15:25:26 Moscow time and removed the preserved administrative active barrier without replay; operator lock remains free and no trading child was observed. The packet `spread-shadow-runs/hood-hcr42-controller-restart-20260923/chief-v1/` retains original state/config backups, hashes and checks. No new trading campaign is authorized by this completed restart.
+
 ## Historical HCR-42 reserve release assignment
 
 ## Current finite release assignment
