@@ -358,6 +358,32 @@ class PlainAioHttp:
         self._session_lock = asyncio.Lock()
         self._closed = False
 
+    @staticmethod
+    def _timing_trace() -> Any:
+        """Observe aiohttp milestones without recording request or response data."""
+        import aiohttp
+
+        trace = aiohttp.TraceConfig()
+
+        async def mark(name: str, _session: Any, context: Any, _params: Any) -> None:
+            times = getattr(context, "trace_request_ctx", None)
+            if isinstance(times, dict):
+                times.setdefault(name, time.perf_counter())
+
+        for signal, name in (
+            (trace.on_connection_queued_start, "queue_start"),
+            (trace.on_connection_queued_end, "queue_end"),
+            (trace.on_connection_create_start, "connection_start"),
+            (trace.on_connection_create_end, "connection_end"),
+            (trace.on_connection_reuseconn, "connection_reused"),
+            (trace.on_request_headers_sent, "headers_signal"),
+            (trace.on_request_chunk_sent, "body_signal"),
+        ):
+            async def observer(session: Any, context: Any, params: Any, *, _name: str = name) -> None:
+                await mark(_name, session, context, params)
+            signal.append(observer)
+        return trace
+
     async def _session_for_request(self) -> Any:
         if self._closed:
             raise RuntimeError("HTTP transport is closed")
@@ -374,7 +400,7 @@ class PlainAioHttp:
             session = self._session
             if session is None or bool(getattr(session, "closed", False)):
                 timeout = aiohttp.ClientTimeout(total=self.timeout_seconds)
-                session = aiohttp.ClientSession(timeout=timeout)
+                session = aiohttp.ClientSession(timeout=timeout, trace_configs=[self._timing_trace()])
                 self._session = session
             return session
 
@@ -425,21 +451,53 @@ class PlainAioHttp:
     async def post_form(self, path: str, *, form: Mapping[str, Any]) -> dict[str, Any]:
         """Send exactly one mutation request without aiohttp-retry or SDK REST."""
 
+        entered = time.perf_counter()
         session = await self._session_for_request()
+        ready = time.perf_counter()
+        trace_times: dict[str, float] = {}
         async with session.post(
             f"{self.base_url}/{path.lstrip('/')}",
             data=dict(form),
             headers={"Content-Type": "application/x-www-form-urlencoded"},
             allow_redirects=False,
+            trace_request_ctx=trace_times,
         ) as response:
-            raw = await response.text()
+            headers_at = time.perf_counter()
+            content = getattr(response, "content", None)
+            if content is not None and callable(getattr(content, "read", None)):
+                first = await content.read(1)
+                first_byte_at = time.perf_counter() if first else None
+                rest = await response.read()
+                raw = (first + rest).decode("utf-8")
+            else:  # Lightweight offline transport fakes expose text only.
+                first_byte_at = None
+                raw = await response.text()
+            complete_at = time.perf_counter()
             try:
                 payload = json.loads(raw)
             except json.JSONDecodeError as exc:
                 raise RuntimeError(f"Lighter mutation response was not JSON (HTTP {response.status})") from exc
             if not isinstance(payload, Mapping):
                 raise RuntimeError("Lighter mutation response is not an object")
-            return {**dict(payload), "_http_status": response.status}
+            timing = {
+                "http_session_ready_seconds": ready - entered,
+                "http_response_headers_seconds": headers_at - entered,
+                "http_full_body_seconds": complete_at - entered,
+                "http_parse_seconds": time.perf_counter() - complete_at,
+            }
+            if first_byte_at is not None:
+                timing["http_first_body_byte_seconds"] = first_byte_at - entered
+            for key, signal in (("http_headers_signal_seconds", "headers_signal"),
+                                ("http_body_signal_seconds", "body_signal")):
+                if signal in trace_times:
+                    timing[key] = trace_times[signal] - entered
+            for key, start, end in (("http_queue_seconds", "queue_start", "queue_end"),
+                                    ("http_connection_setup_seconds", "connection_start", "connection_end")):
+                if start in trace_times and end in trace_times:
+                    timing[key] = trace_times[end] - trace_times[start]
+            if "connection_reused" in trace_times:
+                timing["http_connection_reused"] = 1.0
+            return {**dict(payload), "_http_status": response.status, "_transport_timing": timing}
 
 
 class LighterSdkClient:
@@ -1451,6 +1509,17 @@ class LighterSdkClient:
             )
         finally:
             prepared.diagnostic_timings["transport_roundtrip_seconds"] = time.perf_counter() - transport_started
+        if isinstance(response, Mapping):
+            trace = response.get("_transport_timing")
+            if isinstance(trace, Mapping):
+                for key in ("http_session_ready_seconds", "http_response_headers_seconds",
+                            "http_first_body_byte_seconds", "http_full_body_seconds",
+                            "http_parse_seconds", "http_headers_signal_seconds",
+                            "http_body_signal_seconds", "http_queue_seconds",
+                            "http_connection_setup_seconds", "http_connection_reused"):
+                    value = trace.get(key)
+                    if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value >= 0:
+                        prepared.diagnostic_timings[key] = float(value)
         code = _response_code(response)
         if code is None:
             raise RuntimeError("malformed or undecidable sendTx response")
@@ -1585,6 +1654,7 @@ class LighterSdkClient:
     async def cancel_order(self, account_index: int, market_id: int, order_id: str) -> MutationReceipt:
         deadline = self._pending_mutation_deadline
         self._pending_mutation_deadline = None
+        timings: dict[str, float] = {}
         key_index = self.config.api_key_index
         assert key_index is not None
         # As with submit_order, keep known pre-send failures as a rejected
@@ -1599,11 +1669,14 @@ class LighterSdkClient:
                 )
             async with self._preparation_lock_for(account_index, key_index):
                 signer = self._signer(account_index)
+                nonce_started = time.perf_counter()
                 nonce = await self._next_nonce(signer, key_index, deadline=deadline)
+                timings["cancel_nonce_seconds"] = time.perf_counter() - nonce_started
                 self._assert_nonce_available(account_index, key_index, nonce)
                 if time.monotonic() >= deadline:
                     raise TimeoutError("nonce acquisition crossed the final mutation barrier")
                 signer_type = type(signer)
+                signing_started = time.perf_counter()
                 result = await self._bounded(
                     _await(
                         signer.sign_cancel_order(
@@ -1617,11 +1690,12 @@ class LighterSdkClient:
                     deadline,
                     "cancel signing",
                 )
+                timings["cancel_signing_seconds"] = time.perf_counter() - signing_started
                 if not isinstance(result, tuple) or len(result) != 4:
                     raise RuntimeError("lighter-sdk sign_cancel_order returned an unsupported shape")
                 tx_type, tx_info, tx_hash, error = result
                 if error:
-                    return MutationReceipt(False, order_id, _safe_text(tx_hash), sanitize_exception(ValueError(str(error))))
+                    return MutationReceipt(False, order_id, _safe_text(tx_hash), sanitize_exception(ValueError(str(error))), diagnostic_timings=timings)
                 if (
                     isinstance(tx_type, bool)
                     or not isinstance(tx_type, int)
@@ -1635,12 +1709,24 @@ class LighterSdkClient:
                 # nonce directly before releasing the serialized signing lock.
                 self._block_nonce(account_index, key_index, nonce)
         except Exception as exc:
-            return MutationReceipt(False, order_id, None, sanitize_exception(exc))
+            return MutationReceipt(False, order_id, None, sanitize_exception(exc), diagnostic_timings=timings)
+        transport_started = time.perf_counter()
         response = await self._bounded(
             self._send_signed_tx(tx_type, tx_info),
             deadline,
             "cancel dispatch",
         )
+        timings["cancel_transport_roundtrip_seconds"] = time.perf_counter() - transport_started
+        if isinstance(response, Mapping) and isinstance(response.get("_transport_timing"), Mapping):
+            for name, value in response["_transport_timing"].items():
+                if (name in {"http_session_ready_seconds", "http_response_headers_seconds",
+                             "http_first_body_byte_seconds", "http_full_body_seconds",
+                             "http_parse_seconds", "http_headers_signal_seconds",
+                             "http_body_signal_seconds", "http_queue_seconds",
+                             "http_connection_setup_seconds", "http_connection_reused"}
+                        and isinstance(value, (int, float)) and not isinstance(value, bool)
+                        and math.isfinite(value) and value >= 0):
+                    timings[name] = float(value)
         code = _response_code(response)
         if code is None:
             raise RuntimeError("malformed or undecidable sendTx response")
@@ -1650,6 +1736,7 @@ class LighterSdkClient:
             tx_hash=_safe_text(tx_hash) or _safe_text(_model_dict(response).get("tx_hash")),
             error=None if code == 200 else f"send_tx response code {code}",
             response_code=code,
+            diagnostic_timings=timings,
         )
 
 def _response_code(value: Any) -> int | None:

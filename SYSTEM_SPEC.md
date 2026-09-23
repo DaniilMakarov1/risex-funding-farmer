@@ -1,9 +1,11 @@
 # Current system specification
 
-SYSTEM_SPEC_VERSION = 5.6-candidate
+SYSTEM_SPEC_VERSION = 5.7-candidate
 SPEC_STATUS = OPERATOR_ROBINHOOD_CYCLE
 
-This file is the single current behavior contract. It consolidates accepted HCR-1 through HCR-41 behavior and describes the unaccepted HCR-42 candidate on this branch. Acceptance/deployment is in STATUS, finite authority in NEXT_TASK, operation in README. Development correctness does not establish live strategy success.
+This file is the single current behavior contract. It consolidates accepted behavior through HCR-42 and describes the unaccepted HCR-43 offline candidate on this branch. Acceptance/deployment is in STATUS, finite authority in NEXT_TASK, operation in README. Development correctness does not establish live strategy success.
+
+HCR-43 candidate keeps the existing HTTP send and exact REST admission path for both paired opening and reduce-only paired closing. The production HTTP mutation wrapper now records only numeric local milestones: session readiness, aiohttp connection queue/setup or reuse when signaled, request headers/body callback signals, response headers, first body byte when available, complete body and JSON parse. These callbacks are local transport observations, not proof of wire delivery or matching-engine acceptance; missing signals remain absent. Prepared order diagnostics enter the existing latency record, and cancellation nonce/signing/transport diagnostics enter its result journal. No token, signed body or private response frame is included in these timings. After receiver terminal observation, the exact source lookup immediately preceding cancellation is reused for the cancellation freshness/identity guard, eliminating the formerly duplicated exact REST lookup in that path. All other cancellation paths retain their own exact recheck, and actual cancellation completion still requires reconciliation. This candidate has no WS-driven trading admission, no new sender, and no live latency or matching claim.
 
 ## Product and boundaries
 

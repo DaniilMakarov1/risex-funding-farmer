@@ -295,8 +295,9 @@ class _FakeResponse:
 class _CountingSession:
     instances = []
 
-    def __init__(self, *, timeout):
+    def __init__(self, *, timeout, trace_configs=()):
         self.timeout = timeout
+        self.trace_configs = trace_configs
         self.closed = False
         self.calls = []
         self.close_calls = 0
@@ -337,6 +338,40 @@ async def test_plain_http_reuses_one_session_and_keeps_request_local_auth(monkey
     await transport.aclose()
     assert session.close_calls == 1
     assert session.closed is True
+
+
+@pytest.mark.asyncio
+async def test_plain_http_mutation_trace_uses_only_numeric_milestones():
+    from aiohttp import web
+
+    async def response(_request):
+        return web.json_response({"code": 200, "tx_hash": "synthetic"})
+
+    app = web.Application()
+    app.router.add_post("/api/v1/sendTx", response)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 0)
+    await site.start()
+    port = site._server.sockets[0].getsockname()[1]
+    transport = PlainAioHttp(f"http://127.0.0.1:{port}", timeout_seconds=2)
+    try:
+        first = await transport.post_form("api/v1/sendTx", form={"tx_type": 14, "tx_info": "private-synthetic-payload"})
+        second = await transport.post_form("api/v1/sendTx", form={"tx_type": 14, "tx_info": "private-synthetic-payload"})
+    finally:
+        await transport.aclose()
+        await runner.cleanup()
+    timing = first["_transport_timing"]
+    assert first["code"] == second["code"] == 200
+    assert timing["http_session_ready_seconds"] <= timing["http_response_headers_seconds"]
+    assert timing["http_response_headers_seconds"] <= timing["http_first_body_byte_seconds"]
+    assert timing["http_first_body_byte_seconds"] <= timing["http_full_body_seconds"]
+    assert "http_body_signal_seconds" in timing
+    assert timing["http_body_signal_seconds"] <= timing["http_response_headers_seconds"]
+    assert timing["http_connection_setup_seconds"] >= 0
+    assert second["_transport_timing"].get("http_connection_reused") == 1.0
+    assert "private-synthetic-payload" not in repr(timing)
+    assert all(isinstance(value, float) and value >= 0 for value in timing.values())
 
 
 @pytest.mark.asyncio

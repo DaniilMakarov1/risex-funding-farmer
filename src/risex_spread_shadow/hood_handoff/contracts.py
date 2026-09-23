@@ -10,6 +10,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from enum import StrEnum
+import math
+import re
 from typing import Any, Mapping, Sequence
 from urllib.parse import urlsplit
 
@@ -1637,6 +1639,7 @@ class MutationReceipt:
     tx_hash: str | None
     error: str | None = None
     response_code: int | None = None
+    diagnostic_timings: Mapping[str, float] | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.accepted, bool):
@@ -1649,6 +1652,14 @@ class MutationReceipt:
             _text(self.error, "error")
         if self.response_code is not None:
             _int(self.response_code, "response_code", minimum=100)
+        if self.diagnostic_timings is not None:
+            if not isinstance(self.diagnostic_timings, Mapping) or any(
+                not isinstance(key, str) or not re.fullmatch(r"[a-z_]+", key)
+                or isinstance(value, bool) or not isinstance(value, (int, float))
+                or not math.isfinite(value) or value < 0
+                for key, value in self.diagnostic_timings.items()
+            ):
+                raise ContractError("mutation diagnostic timings must be finite nonnegative numbers")
 
 
 @dataclass(frozen=True, slots=True)

@@ -746,6 +746,31 @@ async def test_paired_opening_plan_is_explicit_and_builds_opposite_positions(tmp
 
 
 @pytest.mark.asyncio
+async def test_partial_receiver_cancels_after_one_fresh_exact_source_read(tmp_path):
+    class CountingClient(PairedClient):
+        def __init__(self):
+            super().__init__(receiver_fill_quantity=Decimal("0.10"))
+            self.post_receiver_source_reads = 0
+            self.reads_at_cancel = None
+
+        async def lookup_order(self, account_index, market_id, *, order_id=None, client_order_index=None):
+            if self.receiver_order is not None and account_index == self.source_account_index and self.reads_at_cancel is None:
+                self.post_receiver_source_reads += 1
+            return await super().lookup_order(account_index, market_id, order_id=order_id, client_order_index=client_order_index)
+
+        async def cancel_order(self, account_index, market_id, order_id):
+            self.reads_at_cancel = self.post_receiver_source_reads
+            return await super().cancel_order(account_index, market_id, order_id)
+
+    client = CountingClient()
+    result = await run_handoff(config(tmp_path / "one-source-read.jsonl"), client, clock=Clock())
+    assert client.cancellations == ["source-0"]
+    assert client.reads_at_cancel == 1
+    assert result.source.filled_quantity == Decimal("0.10")
+    assert result.receiver.filled_quantity == Decimal("0.10")
+
+
+@pytest.mark.asyncio
 async def test_prepared_pair_is_bound_before_source_exposure_and_receiver_dispatch_is_later(tmp_path):
     client = PreparedPairedClient()
     result = await run_handoff(config(tmp_path / "prepared-pair.jsonl"), client, clock=Clock())

@@ -336,6 +336,9 @@ async def test_sdk_sign_tuple_and_send_are_each_single_explicit_call(monkeypatch
     assert signer.sign_calls[0]["nonce"] == 41
     cancel = await client.cancel_order(11, 7, "99")
     assert cancel.accepted
+    assert cancel.diagnostic_timings is not None
+    assert {"cancel_nonce_seconds", "cancel_signing_seconds", "cancel_transport_roundtrip_seconds"} <= set(cancel.diagnostic_timings)
+    assert all(value >= 0 for value in cancel.diagnostic_timings.values())
     assert len(signer.cancel_calls) == 1
     assert len(client._http.calls) == 2
     assert signer.cancel_calls[0]["nonce"] == 42

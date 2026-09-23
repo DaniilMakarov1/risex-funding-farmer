@@ -115,6 +115,7 @@ def _as_receipt(value: MutationReceipt | Mapping[str, Any]) -> MutationReceipt:
                 else sanitize_exception(ValueError(value.error))
             ),
             response_code=value.response_code,
+            diagnostic_timings=value.diagnostic_timings,
         )
     return MutationReceipt(
         accepted=_bool(value.get("accepted", False), "accepted"),
@@ -329,7 +330,7 @@ def _prepared_timing_values(prepared: Any, leg: str) -> dict[str, float]:
         return {}
     return {
         f"{leg}_{name}": float(value)
-        for name in ("preparation_lock_wait_seconds", "nonce_acquisition_seconds", "signing_call_seconds", "transport_roundtrip_seconds", "nonce_reserved_before_quote")
+        for name in ("preparation_lock_wait_seconds", "nonce_acquisition_seconds", "signing_call_seconds", "transport_roundtrip_seconds", "nonce_reserved_before_quote", "http_session_ready_seconds", "http_response_headers_seconds", "http_first_body_byte_seconds", "http_full_body_seconds", "http_parse_seconds", "http_headers_signal_seconds", "http_body_signal_seconds", "http_queue_seconds", "http_connection_setup_seconds", "http_connection_reused")
         if isinstance((value := values.get(name)), (int, float))
         and not isinstance(value, bool) and math.isfinite(value) and value >= 0
     }
@@ -1665,6 +1666,7 @@ class HandoffEngine:
                     run_id,
                     unknown_reasons,
                     expected_order_id=source_order.order_id,
+                    exact_order_just_read=True,
                 )
             elif not any("source cancellation lookup unresolved" in item for item in unknown_reasons):
                 unknown_reasons.append("source order disappeared before cancellation reconciliation")
@@ -2456,6 +2458,7 @@ class HandoffEngine:
         unknown_reasons: list[str],
         *,
         expected_order_id: str | None = None,
+        exact_order_just_read: bool = False,
     ) -> None:
         operation_mode = (
             OperationMode.CLOSE_REOPEN
@@ -2485,9 +2488,13 @@ class HandoffEngine:
             ):
                 return
         try:
-            # Recheck the exact owner/market/order immediately before the only
-            # cancellation mutation.  Never cancel by a bare client index.
-            current = await self._lookup_order(plan, order.order_id)
+            # Require the exact owner/market/order immediately before the only
+            # cancellation mutation. Never cancel by a bare client index.
+            # The receiver-terminal path has just fetched this exact source
+            # identity and passes that same observation without an intervening
+            # await. A second identical REST read adds latency but no stronger
+            # ordering guarantee against a concurrent venue fill.
+            current = order if exact_order_just_read else await self._lookup_order(plan, order.order_id)
             if (
                 current is None
                 or not self._order_matches(current, plan)
@@ -2552,6 +2559,18 @@ class HandoffEngine:
                     "tx_hash": receipt.tx_hash,
                     "response_code": receipt.response_code,
                     "error": receipt.error,
+                    "diagnostic_timings": {
+                        key: value for key, value in (receipt.diagnostic_timings or {}).items()
+                        if key in {
+                            "cancel_nonce_seconds", "cancel_signing_seconds",
+                            "cancel_transport_roundtrip_seconds", "http_session_ready_seconds",
+                            "http_response_headers_seconds", "http_first_body_byte_seconds",
+                            "http_full_body_seconds", "http_parse_seconds",
+                            "http_headers_signal_seconds", "http_body_signal_seconds",
+                            "http_queue_seconds", "http_connection_setup_seconds",
+                            "http_connection_reused",
+                        }
+                    },
                 },
                 run_id=run_id,
             )
