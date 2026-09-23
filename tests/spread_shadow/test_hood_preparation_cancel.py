@@ -2,6 +2,7 @@
 import asyncio
 from dataclasses import replace
 import json
+import time
 
 import pytest
 
@@ -129,6 +130,20 @@ async def test_cancel_after_prepared_identity_but_before_send_is_not_sent():
         assert not adapter._http.calls
         receipt = await adapter.update_leverage_fraction(11, 7, 4166, 0)
         assert receipt.accepted and len(adapter._http.calls) == 1
+    finally:
+        await adapter.aclose()
+
+
+@pytest.mark.asyncio
+async def test_prepared_journal_crossing_deadline_is_proved_not_sent():
+    adapter = _constant_nonce_client(prefix='prepared-deadline', signer=ValidSigner())
+    adapter.config = replace(adapter.config, request_timeout_seconds=.01)
+    adapter._signer(11)
+    try:
+        with pytest.raises(LeverageNotSent):
+            await adapter.update_leverage_fraction(11, 7, 4166, 0,
+                prepared_intent=lambda identity: time.sleep(.02))
+        assert not adapter._http.calls
     finally:
         await adapter.aclose()
 

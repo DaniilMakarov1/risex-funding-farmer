@@ -1527,6 +1527,8 @@ class LighterSdkClient:
             task = asyncio.current_task()
             if task is not None and task.cancelling():
                 raise asyncio.CancelledError()
+            if time.monotonic() >= deadline:
+                raise TimeoutError("leverage preparation crossed its mutation deadline")
         except asyncio.CancelledError:
             # Cancellation in this block has not entered sendTx. Persist that
             # fact synchronously before propagating the caller's cancellation.
