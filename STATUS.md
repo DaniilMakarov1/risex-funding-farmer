@@ -1,5 +1,13 @@
 # Current status
 
+## HCR-41 — assigned for correction and independent review
+
+Accepted runtime remains `1af259dc766928bcb247c10fdd63487d48c5d6cb` (HCR-40 code `ca10b80d7811e49d842a884099169faef451c805`). The owner's 2026-09-23 request authorizes Chief to address the auditor's finite findings and return a candidate for checking. NEXT_TASK defines ownership and acceptance; the auditor is the sole integration owner. This assignment changes no runtime behavior and deploys no candidate.
+
+The independent read-only review verified all 13 source-manifest files for cycles046–050 and HCR-40's full-suite evidence. It reproduced a missing fallback freshness deadline, near-zero modeled margin headroom, terminal-status drift causing false UNKNOWN in cycle050's report, and a historical leverage barrier without later resolution. Additional focused checks passed 140 tests. Evidence: `/Users/daniilmakarov/Desktop/RISEx Spread Shadow/spread-shadow-runs/hood-chief-review-20260923/solo-v1/`. No original journal or production setting changed.
+
+The owner's later sample has eight source attempts, one receiver submission and zero own reciprocal fills. Three cases prove lost price priority; three lack the exact public source level despite private open-state evidence. Five residual closes in 047/050 include three slippage cancellations before cleanup. Raw final reconciliation shows flat inventory for those completed cycles; the current cycle050 report incorrectly downgrades it because its terminal set omits canceled-margin-not-allowed. cycle048 stays launch-only/incomplete. These facts update live-validation coverage after the deployment snapshot below; they do not establish current positions or successful normal paired closure.
+
 ## HCR-40 — accepted and deployed
 
 The implementation `ca10b80d7811e49d842a884099169faef451c805` is integrated into local and remote main. The same agent implemented, tested and self-reviewed it; no independent review is claimed. A clean isolated Python 3.11.5 suite passed **5074 tests, 3 skipped**. A focused hood run passed 833 tests before the final sizing-bound refinement; the final full run covers that refinement. The first dirty-checkout full run had 16 failures: ten tests require a clean Git checkout, two reflected old margin expectations and were corrected, and four frozen S3 fixture tests depended on host monotonic uptime. No unrelated frozen code was changed or failures skipped. The final clean run passed in full.
