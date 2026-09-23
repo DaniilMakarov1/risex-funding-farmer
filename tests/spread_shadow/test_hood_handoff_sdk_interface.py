@@ -16,6 +16,7 @@ from risex_spread_shadow.hood_handoff import (
     REQUIRED_LIGHTER_SDK_VERSION,
     StaticSecretProvider,
 )
+from risex_spread_shadow.hood_handoff.contracts import LeverageNotSent
 
 
 def test_sdk_pin_and_single_attempt_surface_are_explicit():
@@ -908,6 +909,96 @@ async def test_leverage_fraction_is_signed_exactly_once_and_ambiguous_send_is_no
     assert signer.leverage_calls[0]["margin_mode"] == 0
     assert len(client._http.calls) == 1
     await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_leverage_prepared_identity_is_durable_boundary_before_single_send():
+    class ValidLeverageSigner(FakeSigner):
+        async def sign_update_leverage(self, **kwargs):
+            self.leverage_calls.append(kwargs)
+            return (20, 'signed-leverage-info', 'aA' * 40, None)
+
+    signer = ValidLeverageSigner(account_index=11)
+    client = _constant_nonce_client(prefix="leverage-prepared-identity", signer=signer,
+                                    http_factory=AmbiguousConstantHttp)
+    client._lighter = lambda: FakeModule
+    identities = []
+    with pytest.raises(TimeoutError):
+        await client.update_leverage_fraction(
+            11, 7, 4166, 0, prepared_intent=lambda value: identities.append(dict(value)))
+    assert identities == [{
+        'account_index': 11, 'market_id': 7, 'api_key_index': client.config.api_key_index,
+        'fraction_bps': 4166, 'margin_mode': 0, 'nonce': 41,
+        'tx_hash': 'aA' * 40, 'tx_type': 20,
+    }]
+    assert len(client._http.calls) == 1
+    assert not {'tx_info', 'signature', 'private_key'} & identities[0].keys()
+    await client.aclose()
+
+    refused = _constant_nonce_client(prefix="leverage-prepared-refusal", signer=ValidLeverageSigner(account_index=11))
+    refused._lighter = lambda: FakeModule
+    with pytest.raises(LeverageNotSent):
+        await refused.update_leverage_fraction(
+            11, 7, 4166, 0, prepared_intent=lambda _: (_ for _ in ()).throw(OSError('journal unavailable')))
+    assert not refused._http.calls
+    await refused.aclose()
+
+
+@pytest.mark.asyncio
+async def test_leverage_transaction_read_returns_only_identity_and_finality_fields():
+    tx_hash = 'bB' * 40
+
+    class TxApi:
+        def __init__(self, api_client):
+            pass
+
+        async def tx(self, *, by, value, _request_timeout):
+            assert (by, value) == ('hash', tx_hash)
+            return {'code': 200, 'hash': tx_hash, 'type': 20, 'status': 2,
+                    'account_index': 11, 'api_key_index': 4, 'nonce': 41,
+                    'executed_at': 1000, 'committed_at': 1001, 'verified_at': 1002,
+                    'info': 'signed/private transaction body'}
+
+    class Module(FakeModule):
+        TransactionApi = TxApi
+
+    client = _constant_nonce_client(prefix='leverage-transaction-read')
+    client._lighter = lambda: Module
+    value = await client.read_leverage_transaction(tx_hash)
+    assert value == {'hash': tx_hash, 'type': 20, 'status': 2,
+                     'account_index': 11, 'api_key_index': 4, 'nonce': 41,
+                     'executed_at': 1000, 'committed_at': 1001, 'verified_at': 1002}
+    assert 'info' not in value
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('times', [
+    (1000, 1001, 10**18), (1000, 1001, 999), (1000, 0, 1002),
+])
+async def test_leverage_transaction_diagnostic_rejects_unproved_times(times):
+    tx_hash = 'bB' * 40
+
+    class TxApi:
+        def __init__(self, api_client):
+            pass
+
+        async def tx(self, *, by, value, _request_timeout):
+            return {'code': 200, 'hash': tx_hash, 'type': 20, 'status': 2,
+                    'account_index': 11, 'api_key_index': 4, 'nonce': 41,
+                    'executed_at': times[0], 'committed_at': times[1],
+                    'verified_at': times[2]}
+
+    class Module(FakeModule):
+        TransactionApi = TxApi
+
+    client = _constant_nonce_client(prefix='leverage-transaction-invalid-time')
+    client._lighter = lambda: Module
+    try:
+        with pytest.raises(ContractError, match='timing is unproved'):
+            await client.read_leverage_transaction(tx_hash)
+    finally:
+        await client.aclose()
 
 
 @pytest.mark.asyncio

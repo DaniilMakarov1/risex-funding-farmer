@@ -120,6 +120,23 @@ def unavailable_message(blocked=False, not_launched=False):
             ('Следующая /run проверит текущую готовность; /close — закрыть остаток.' if blocked else '/status — состояние контроллера'))
 
 
+def launch_failure_message(name, code, *, blocked=False):
+    reasons = {
+        'PRIOR_LEVERAGE_UNRESOLVED': 'Прежняя настройка плеча ещё не сверена.',
+        'PRIOR_ORDER_UNRESOLVED': 'Прежняя заявка ещё не сверена.',
+        'CREDENTIAL_UNAVAILABLE': 'Доступ к сохранённым ключам не подтверждён.',
+        'PREFLIGHT_REFUSED': 'Проверка готовности отказала до начала цикла.',
+        'PREPARATION_UNAVAILABLE': 'Подготовка запуска завершилась ошибкой.',
+    }
+    reason = reasons.get(code)
+    if reason is None:
+        return unavailable_message(blocked)
+    return (f'<b>Цикл {text(name, 32)} не начался</b>\n{reason} '
+            'Журнал цикла не создан; исполнение и текущие позиции этим слотом не доказаны. '
+            'Автоматического повтора нет. /accounts — проверить текущие счета; '
+            '/close — закрыть доказанный остаток.')
+
+
 def saved_message(name, report, *, blocked=False, detailed=False):
     lines = [f'<b>📋 Результат цикла</b> · <code>{text(name, 32)}</code>']
     if blocked:

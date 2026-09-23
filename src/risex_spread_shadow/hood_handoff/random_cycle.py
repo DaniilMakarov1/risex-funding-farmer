@@ -30,6 +30,7 @@ from .contracts import (
     Direction,
     HandoffConfig,
     HandoffResult,
+    LeverageNotSent,
     MarketMetadata,
     MutationReceipt,
     OFFICIAL_ROBINHOOD_API_URL,
@@ -42,6 +43,7 @@ from .contracts import (
     PreflightBlocked,
     TradeReceipt,
     TERMINAL_ORDER_STATUSES,
+    _nonnegative,
     decimal_to_integer,
 )
 from .engine import (
@@ -68,6 +70,10 @@ OPENING_JOURNAL_NAME = "opening.jsonl"
 CLOSING_JOURNAL_NAME = "closing.jsonl"
 LAUNCH_METADATA_NAME = "launch.json"
 ADMISSION_METADATA_NAME = "admission.json"
+# Highest published Robinhood tier fees as of the pinned 2026-09-14 schedule.
+# These bound an unknown account tier; live market fee evidence may raise them.
+ROBINHOOD_MAKER_FEE_CAP = Decimal("0.00012")
+ROBINHOOD_TAKER_FEE_CAP = Decimal("0.00035")
 
 
 def _require_owner_only_directory(path: Path, *, label: str) -> None:
@@ -489,6 +495,7 @@ def _observed_leverage_fraction(snapshot: AccountSnapshot, label: str) -> int:
 
 def minimal_sufficient_leverage_fraction(
     available_balance: Decimal, notional: Decimal, market_minimum_fraction: int,
+    *, fee_cost: Decimal = Decimal(0), adverse_entry_loss: Decimal = Decimal(0),
 ) -> int:
     """Largest integer IMF (lowest leverage) that fits the free-balance model.
 
@@ -498,10 +505,39 @@ def minimal_sufficient_leverage_fraction(
     amount = _positive(notional, "notional")
     minimum = _int(market_minimum_fraction, "market_minimum_fraction", minimum=1)
     floor = max(2500, minimum)  # 4x maximum; 10000 is 1x.
-    fraction = min(10000, int((balance * 10000 / amount).to_integral_value(rounding=ROUND_FLOOR)))
+    cost = _nonnegative(fee_cost, "fee_cost") + _nonnegative(adverse_entry_loss, "adverse_entry_loss")
+    if cost >= balance:
+        raise PreflightBlocked("opening fee and entry loss consume available balance")
+    fraction = min(10000, int(((balance - cost) * 10000 / amount).to_integral_value(rounding=ROUND_FLOOR)))
     if fraction < floor:
         raise PreflightBlocked("selected quantity needs more than supported 4x leverage or available margin")
     return fraction
+
+
+def _opening_budget_components(
+    metadata: MarketMetadata, account: AccountSnapshot, *, label: str,
+    quantity: Decimal, worst_price: Decimal, side: str,
+) -> dict[str, Decimal]:
+    """Conservative snapshot components for a flat Robinhood opening leg."""
+    if metadata.mark_price is None:
+        raise PreflightBlocked("fresh Robinhood mark price is missing")
+    mark = _positive(metadata.mark_price, "mark_price")
+    price = _positive(worst_price, "opening worst price")
+    amount = _positive(quantity, "opening quantity")
+    observed_rate = metadata.source_fee_rate if label == "source" else metadata.receiver_fee_rate
+    account_rate = account.fee_rate
+    rates = [ROBINHOOD_MAKER_FEE_CAP if label == "source" else ROBINHOOD_TAKER_FEE_CAP]
+    for value in (observed_rate, account_rate):
+        if value is not None:
+            rates.append(_nonnegative(value, "opening fee rate"))
+    fee_rate = max(rates)
+    adverse_per_unit = max(Decimal(0), price - mark if side == "BUY" else mark - price)
+    return {
+        "mark_notional": amount * mark,
+        "fee_cost": amount * price * fee_rate,
+        "adverse_entry_loss": amount * adverse_per_unit,
+        "fee_rate": fee_rate,
+    }
 
 
 def compute_quantity_bounds(
@@ -509,6 +545,7 @@ def compute_quantity_bounds(
     source: AccountSnapshot,
     receiver: AccountSnapshot,
     opening_price: Decimal,
+    *, receiver_bound: Decimal | None = None, direction: Direction | None = None,
 ) -> RandomQuantityBounds:
     """Compute legal integer ticks within the owner's fourfold free-balance cap."""
 
@@ -525,10 +562,29 @@ def compute_quantity_bounds(
         (metadata.minimum_quote_amount / price / step).to_integral_value(rounding=ROUND_CEILING)
     )
     minimum_fraction = max(2500, metadata.minimum_initial_margin_fraction or 2500)
-    upper = int(
-        (min(source_balance, receiver_balance) * 10000 / minimum_fraction / price / step)
-        .to_integral_value(rounding=ROUND_FLOOR)
-    )
+    if source.margin_evidence is not None or receiver.margin_evidence is not None:
+        if (source.margin_evidence is None or receiver.margin_evidence is None
+                or receiver_bound is None or direction is None):
+            raise PreflightBlocked("opening margin budget inputs are incomplete")
+        source_side = direction.source_side
+        receiver_side = "BUY" if source_side == "SELL" else "SELL"
+        source_cost = _opening_budget_components(metadata, source, label="source",
+            quantity=Decimal(1), worst_price=price, side=source_side)
+        receiver_cost = _opening_budget_components(metadata, receiver, label="receiver",
+            quantity=Decimal(1), worst_price=receiver_bound, side=receiver_side)
+        def unit_requirement(parts):
+            return (parts['mark_notional'] * Decimal(minimum_fraction) / 10000
+                    + parts['fee_cost'] + parts['adverse_entry_loss'])
+        original_owner_cap = min(source_balance, receiver_balance) * 10000 / minimum_fraction / price
+        upper_quantity = min(original_owner_cap,
+                             source_balance / unit_requirement(source_cost),
+                             receiver_balance / unit_requirement(receiver_cost))
+        upper = int((upper_quantity / step).to_integral_value(rounding=ROUND_FLOOR))
+    else:
+        upper = int(
+            (min(source_balance, receiver_balance) * 10000 / minimum_fraction / price / step)
+            .to_integral_value(rounding=ROUND_FLOOR)
+        )
     lower = max(lower_base, lower_quote)
     if lower <= 0:
         raise PreflightBlocked("venue minimums produce no positive size tick")
@@ -2151,7 +2207,8 @@ class RandomCycleEngine:
             now=now,
             freshness_seconds=config.freshness_seconds,
         )
-        bounds = compute_quantity_bounds(metadata, source, receiver, proposal.source_limit_price)
+        bounds = compute_quantity_bounds(metadata, source, receiver, proposal.source_limit_price,
+                                         receiver_bound=proposal.receiver_worst_price, direction=config.direction)
         quantity, quantity_tick, hold_seconds = select_random_quantity(bounds, self.rng)
         selection = RandomCycleSelection(
             quantity=quantity,
@@ -2452,19 +2509,31 @@ class RandomCycleEngine:
             raise PreflightBlocked("leverage can only be configured before a flat cycle")
         notional = selection.quantity * selection.opening_source_price
         original = {source.account_index: source, receiver.account_index: receiver}
-        targets = {
-            account.account_index: minimal_sufficient_leverage_fraction(
-                _available_balance(account, label), notional,
+        budgets = {}
+        targets = {}
+        source_side = config.direction.source_side
+        for label, account, worst_price, side in (
+            ("source", source, selection.opening_source_price, source_side),
+            ("receiver", receiver, selection.opening_receiver_bound,
+             "BUY" if source_side == "SELL" else "SELL"),
+        ):
+            if account.margin_evidence is not None:
+                parts = _opening_budget_components(metadata, account, label=label,
+                    quantity=selection.quantity, worst_price=worst_price, side=side)
+            else:
+                parts = {'mark_notional': notional, 'fee_cost': Decimal(0),
+                         'adverse_entry_loss': Decimal(0), 'fee_rate': Decimal(0)}
+            budgets[label] = {key: format(value, 'f') for key, value in parts.items()}
+            targets[account.account_index] = minimal_sufficient_leverage_fraction(
+                _available_balance(account, label), parts['mark_notional'],
                 metadata.minimum_initial_margin_fraction,
-            )
-            for label, account in (("source", source), ("receiver", receiver))
-        }
+                fee_cost=parts['fee_cost'], adverse_entry_loss=parts['adverse_entry_loss'])
         current = {index: _observed_leverage_fraction(account, "source" if index == source.account_index else "receiver")
                    for index, account in original.items()}
         journal.append("LEVERAGE_PLAN", {
             "quantity": format(selection.quantity, "f"), "price": format(selection.opening_source_price, "f"),
             "notional": format(notional, "f"), "target_fraction_bps": targets,
-            "observed_fraction_bps": current,
+            "observed_fraction_bps": current, "opening_budgets": budgets,
         })
         for index in (source.account_index, receiver.account_index):
             if current[index] == targets[index]:
@@ -2473,11 +2542,23 @@ class RandomCycleEngine:
             journal.append("LEVERAGE_UPDATE_INTENT", {
                 "account_index": index, "market_id": config.market_id,
                 "fraction_bps": targets[index], "margin_mode": 0,
+                "source_identity": original[index].source_identity,
             })
-            receipt = await self._bounded(
-                setter(index, config.market_id, targets[index], 0),
-                config, "leverage setting",
+            setting_call = (
+                setter(index, config.market_id, targets[index], 0,
+                       prepared_intent=lambda identity: journal.append("LEVERAGE_TX_PREPARED", identity))
+                if getattr(self.client, "supports_leverage_prepared_intent", False)
+                else setter(index, config.market_id, targets[index], 0)
             )
+            try:
+                receipt = await self._bounded(setting_call, config, "leverage setting")
+            except LeverageNotSent as exc:
+                journal.append("LEVERAGE_UPDATE_NOT_SENT", {
+                    "account_index": index, "market_id": config.market_id,
+                    "fraction_bps": targets[index],
+                })
+                self._stage = "PREFLIGHT"
+                raise PreflightBlocked(f"account {index} leverage setting was not sent") from exc
             if not isinstance(receipt, MutationReceipt):
                 raise PreflightBlocked(f"account {index} leverage setting response is undecidable")
             if not receipt.accepted:
@@ -2845,9 +2926,20 @@ class RandomCycleEngine:
             if fraction is not None:
                 if _observed_leverage_fraction(account, label) != fraction:
                     raise PreflightBlocked(f"{label} leverage changed before opening mutation")
-                if selection.quantity * proposal.source_limit_price * fraction > _available_balance(account, label) * 10000:
+                if account.margin_evidence is not None:
+                    side = config.direction.source_side if label == 'source' else (
+                        'BUY' if config.direction.source_side == 'SELL' else 'SELL')
+                    worst = proposal.source_limit_price if label == 'source' else proposal.receiver_worst_price
+                    parts = _opening_budget_components(metadata, account, label=label,
+                        quantity=selection.quantity, worst_price=worst, side=side)
+                    required = (parts['mark_notional'] * Decimal(fraction) / 10000
+                                + parts['fee_cost'] + parts['adverse_entry_loss'])
+                else:
+                    required = selection.quantity * proposal.source_limit_price * Decimal(fraction) / 10000
+                if required > _available_balance(account, label):
                     raise PreflightBlocked(f"{label} selected quantity exceeds fresh free-balance margin model")
-        refreshed_bounds = compute_quantity_bounds(metadata, source, receiver, proposal.source_limit_price)
+        refreshed_bounds = compute_quantity_bounds(metadata, source, receiver, proposal.source_limit_price,
+                                                   receiver_bound=proposal.receiver_worst_price, direction=config.direction)
         if refreshed_bounds.size_step != selection.bounds.size_step:
             raise PreflightBlocked("opening size grid changed before mutation")
         if selection.quantity_tick < refreshed_bounds.minimum_base_tick or selection.quantity_tick < refreshed_bounds.minimum_quote_tick:
@@ -3336,13 +3428,43 @@ class RandomCycleEngine:
                 continue
 
             attempt_ordinal += 1
-            result = await self._fallback_one(
-                config,
-                journal,
-                before,
-                residual,
-                attempt_ordinal=attempt_ordinal,
-            )
+            reserve = getattr(self.client, "reserve_order_nonce", None)
+            invalidate = getattr(self.client, "invalidate_reserved_nonce", None)
+            prepared_capable = (callable(reserve) and callable(invalidate)
+                               and callable(getattr(self.client, "prepare_order", None))
+                               and callable(getattr(self.client, "submit_prepared_order", None))
+                               and callable(getattr(self.client, "invalidate_prepared_order", None)))
+            reserved_nonce = None
+            result = None
+            if prepared_capable:
+                try:
+                    reserved_nonce = await self._bounded(
+                        reserve(account_index, deadline=time.monotonic() + config.freshness_seconds),
+                        config, "fallback pre-quote nonce reservation",
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    reason = f"fallback pre-quote nonce reservation failed: {sanitize_exception(exc)}"
+                    journal.append("FALLBACK_PREPARATION_FAILED", {
+                        "account_index": account_index, "attempt": attempt_ordinal,
+                        "reason": reason, "sent": False,
+                    })
+                    result = FallbackResult(
+                        account_index, "SELL" if before.signed_position > 0 else "BUY",
+                        residual, False, Outcome.PARTIAL, reason=reason,
+                        attempt=attempt_ordinal,
+                    )
+            if result is None:
+                try:
+                    result = await self._fallback_one(
+                        config, journal, before, residual,
+                        attempt_ordinal=attempt_ordinal,
+                        reserved_nonce=reserved_nonce,
+                    )
+                finally:
+                    if reserved_nonce is not None:
+                        await invalidate(reserved_nonce)
             results.append(result)
             if self._identity_barrier is not None and result.outcome is not Outcome.UNKNOWN:
                 observed = await fresh_accounts()
@@ -3695,6 +3817,7 @@ class RandomCycleEngine:
         residual: Decimal,
         *,
         attempt_ordinal: int = 1,
+        reserved_nonce: Any | None = None,
     ) -> FallbackResult:
         initial_before = before
         side = "SELL" if before.signed_position > 0 else "BUY"
@@ -3707,6 +3830,7 @@ class RandomCycleEngine:
         history_pages: list[Any] = []
         history_complete: bool | None = None
         after: AccountSnapshot | None = None
+        preparation_timings: dict[str, float] = {}
 
         def finish(result: FallbackResult, *, reconciliation_event: str | None = None) -> FallbackResult:
             state = _fallback_reconciliation_state(
@@ -3778,6 +3902,7 @@ class RandomCycleEngine:
                 )
             )
         try:
+            metadata_read_started = time.perf_counter()
             metadata = _as_market(
                 await self._bounded(
                     self.client.market_metadata(config.market_id),
@@ -3785,10 +3910,13 @@ class RandomCycleEngine:
                     "fallback market read",
                 )
             )
+            preparation_timings["metadata_read_seconds"] = time.perf_counter() - metadata_read_started
+            book_read_started = time.perf_counter()
             book = _as_book(
                 await self._bounded(self._order_book(config.market_id), config, "fallback order book read"),
                 metadata,
             )
+            preparation_timings["book_read_seconds"] = time.perf_counter() - book_read_started
             _validate_market_book(config, metadata, book, self.clock.now())
         except asyncio.CancelledError:
             raise
@@ -3812,10 +3940,12 @@ class RandomCycleEngine:
         # barrier and this mutation must stop this account's fallback rather
         # than turn a new/external position into cycle inventory.
         try:
+            account_read_started = time.perf_counter()
             current = await self._recovery_read(
                 config, lambda: self._read_account(config, before.account_index, "fallback account recheck"),
                 "fallback account recheck", journal,
             )
+            preparation_timings["account_recheck_seconds"] = time.perf_counter() - account_read_started
             label = "source" if before.account_index == config.source_account_index else "receiver"
             _validate_account_fresh(
                 config,
@@ -3913,6 +4043,34 @@ class RandomCycleEngine:
                 "attempt": attempt_ordinal,
             })
         price_int = decimal_to_integer(bound, metadata.price_decimals, "fallback executable price")
+        # The SDK must inherit the remaining lifetime of every observation
+        # used for this close.  A fresh deadline created inside submit_order
+        # would allow nonce acquisition/signing to outlive the book quote.
+        barrier_now = self.clock.now()
+        if any(observed_at > barrier_now for observed_at in
+               (metadata.observed_at, book.observed_at, before.observed_at)):
+            return finish(FallbackResult(
+                before.account_index, side, residual, False, Outcome.PARTIAL,
+                reason="fallback evidence is from the future before mutation",
+                attempt=attempt_ordinal,
+            ))
+        evidence_remaining = min(
+            config.freshness_seconds - (barrier_now - observed_at)
+            for observed_at in (metadata.observed_at, book.observed_at, before.observed_at)
+        )
+        if evidence_remaining <= 0:
+            return finish(
+                FallbackResult(
+                    before.account_index, side, residual, False, Outcome.PARTIAL,
+                    reason="fallback market/account evidence expired before mutation",
+                    attempt=attempt_ordinal,
+                )
+            )
+        mutation_deadline = time.monotonic() + min(
+            evidence_remaining, config.request_timeout_seconds,
+        )
+        if reserved_nonce is not None:
+            mutation_deadline = min(mutation_deadline, reserved_nonce.deadline)
         client_order_index = _client_order_index(
             journal.run_id,
             f"fallback-{attempt_ordinal}-{before.account_index}",
@@ -3930,24 +4088,95 @@ class RandomCycleEngine:
             reduce_only=True,
             order_expiry_ms=0,
             client_order_index=client_order_index,
+            mutation_deadline_monotonic=mutation_deadline,
         )
-        journal.append(
-            "FALLBACK_DISPATCH_INTENT",
-            {
-                "plan": plan.as_dict(),
-                "account_index": before.account_index,
-                "attempt": attempt_ordinal,
-            },
-        )
+        journal.append("FALLBACK_SEND_BARRIER", {
+            "account_index": before.account_index,
+            "attempt": attempt_ordinal,
+            "market_metadata_age_seconds": barrier_now - metadata.observed_at,
+            "book_age_seconds": barrier_now - book.observed_at,
+            "account_age_seconds": barrier_now - before.observed_at,
+            "evidence_remaining_seconds": evidence_remaining,
+            "send_deadline_budget_seconds": min(evidence_remaining, config.request_timeout_seconds),
+            "preparation_timings": preparation_timings,
+        })
+        prepared = None
+        if reserved_nonce is not None:
+            try:
+                prepared = await self._bounded(
+                    self.client.prepare_order(plan, reserved_nonce=reserved_nonce),
+                    config, "fallback order preparation",
+                )
+                if time.monotonic() >= mutation_deadline:
+                    raise TimeoutError("fallback order preparation crossed the final mutation barrier")
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                reason = f"fallback order preparation failed before send: {sanitize_exception(exc)}"
+                journal.append("FALLBACK_PREPARATION_FAILED", {
+                    "account_index": before.account_index, "attempt": attempt_ordinal,
+                    "reason": reason, "sent": False, "preparation_timings": preparation_timings,
+                })
+                return finish(FallbackResult(
+                    before.account_index, side, residual, False, Outcome.PARTIAL,
+                    reason=reason, attempt=attempt_ordinal,
+                ))
+            finally:
+                if prepared is not None and time.monotonic() >= mutation_deadline:
+                    await self.client.invalidate_prepared_order(prepared)
+        if prepared is not None:
+            preparation_timings.update({
+                key: value for key, value in prepared.diagnostic_timings.items()
+                if key in {"preparation_lock_wait_seconds", "nonce_acquisition_seconds",
+                           "signing_call_seconds", "nonce_reserved_before_quote"}
+                and isinstance(value, (int, float)) and math.isfinite(value)
+            })
+        def refresh_transport_timing() -> None:
+            if prepared is None:
+                return
+            value = prepared.diagnostic_timings.get("transport_roundtrip_seconds")
+            if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value >= 0:
+                preparation_timings["transport_roundtrip_seconds"] = value
+
+        try:
+            if prepared is not None:
+                journal.append("FALLBACK_PREPARATION_TIMINGS", {
+                    "account_index": before.account_index, "attempt": attempt_ordinal,
+                    "timings": preparation_timings,
+                })
+                journal.append("FALLBACK_PREPARED_SEND_BARRIER", {
+                    "account_index": before.account_index, "attempt": attempt_ordinal,
+                    "book_age_seconds": self.clock.now() - book.observed_at,
+                    "account_age_seconds": self.clock.now() - before.observed_at,
+                    "deadline_remaining_seconds": mutation_deadline - time.monotonic(),
+                })
+            fallback_intent = journal.append(
+                "FALLBACK_DISPATCH_INTENT",
+                {
+                    "plan": plan.as_dict(),
+                    "account_index": before.account_index,
+                    "attempt": attempt_ordinal,
+                },
+            )
+        except BaseException:
+            if prepared is not None:
+                await self.client.invalidate_prepared_order(prepared)
+            raise
         try:
             receipt = _as_receipt(
-                await self._bounded(self.client.submit_order(plan), config, "fallback mutation")
+                await self._bounded(
+                    self.client.submit_prepared_order(plan, prepared, deadline=mutation_deadline)
+                    if prepared is not None else self.client.submit_order(plan),
+                    config, "fallback mutation",
+                )
             )
         except asyncio.CancelledError:
+            refresh_transport_timing()
             reason = "cancellation after fallback intent"
             journal.append(
                 "FALLBACK_DISPATCH_UNKNOWN",
-                {"account_index": before.account_index, "attempt": attempt_ordinal, "reason": reason},
+                {"account_index": before.account_index, "attempt": attempt_ordinal,
+                 "reason": reason, "preparation_timings": preparation_timings},
             )
             finish(
                 FallbackResult(
@@ -3962,10 +4191,12 @@ class RandomCycleEngine:
             )
             raise
         except BaseException as exc:
+            refresh_transport_timing()
             reason = f"fallback dispatch outcome unknown: {sanitize_exception(exc)}"
             journal.append(
                 "FALLBACK_DISPATCH_UNKNOWN",
-                {"account_index": before.account_index, "attempt": attempt_ordinal, "reason": reason},
+                {"account_index": before.account_index, "attempt": attempt_ordinal,
+                 "reason": reason, "preparation_timings": preparation_timings},
             )
             return finish(
                 FallbackResult(
@@ -3978,6 +4209,7 @@ class RandomCycleEngine:
                     attempt=attempt_ordinal,
                 )
             )
+        refresh_transport_timing()
         journal.append(
             "FALLBACK_DISPATCH_RESULT",
             {
@@ -3986,6 +4218,9 @@ class RandomCycleEngine:
                 "accepted": receipt.accepted,
                 "order_id": receipt.order_id,
                 "receipt": _receipt_payload(receipt),
+                "quote_age_at_response_seconds": self.clock.now() - book.observed_at,
+                "intent_to_response_seconds": self.clock.now() - fallback_intent.at,
+                "preparation_timings": preparation_timings,
             },
         )
         if not receipt.accepted:

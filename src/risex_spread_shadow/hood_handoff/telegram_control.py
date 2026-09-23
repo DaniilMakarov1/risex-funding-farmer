@@ -22,7 +22,7 @@ import aiohttp
 
 from .keychain import MacOSKeychainBackend, read_hidden_secret
 from .offline_report import load_saved_cycle_report
-from .operator_view import read_lifecycle, read_execution_notices
+from .operator_view import read_lifecycle, read_execution_notices, read_launch_failure
 from .operator_control import exclusive_lock
 from . import telegram_messages as views
 
@@ -210,6 +210,10 @@ class Controller:
                 last = {'cycle': slots[-1]}
         if not last:
             return views.empty_message(blocked)
+        failure_code = (read_launch_failure(self.operator / last['cycle'])
+                        if isinstance(last.get('cycle'), str) else None)
+        if failure_code is not None:
+            return views.launch_failure_message(last['cycle'], failure_code, blocked=blocked)
         report = self.report(last.get('cycle'))
         if report is None:
             return views.unavailable_message(blocked, last.get('status') == 'NOT_LAUNCHED')

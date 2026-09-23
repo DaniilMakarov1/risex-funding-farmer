@@ -19,6 +19,8 @@ import re
 from typing import Any, Iterable, Mapping, Sequence
 
 from .journal import sanitize
+from .contracts import TERMINAL_ORDER_STATUSES
+from .operator_view import result_lines
 
 
 REPORT_SCHEMA = "hcr-27-offline-cycle-report-v1"
@@ -107,6 +109,7 @@ _PROJECTED_KEYS = frozenset(
         "priority_proof_admitted",
         "priority_reason",
         "priority_status",
+        "visibility_status",
         "price",
         "reason",
         "receiver",
@@ -182,6 +185,11 @@ _PROJECTED_KEYS = _PROJECTED_KEYS | frozenset({
     *(f"{leg}_{stage}" for leg in ("source", "receiver") for stage in (
         "preparation_lock_wait_seconds", "nonce_acquisition_seconds", "signing_call_seconds", "transport_roundtrip_seconds", "nonce_reserved_before_quote",
     )),
+    "preparation_timings", "metadata_read_seconds", "book_read_seconds",
+    "account_recheck_seconds", "preparation_lock_wait_seconds",
+    "nonce_acquisition_seconds", "signing_call_seconds",
+    "transport_roundtrip_seconds", "nonce_reserved_before_quote",
+    "book_request_started_at", "book_request_finished_at", "book_continuity",
 })
 
 _OMIT_BULKY_KEYS = frozenset(
@@ -861,10 +869,9 @@ def _execution_evidence(
     executions: list[dict[str, Any]] = []
     fills: list[dict[str, Any]] = []
     issues: list[dict[str, Any]] = []
-    terminal_statuses = {
-        "filled", "canceled", "cancelled", "canceled-post-only",
-        "canceled-too-much-slippage", "canceled-not-enough-liquidity", "rejected", "expired",
-    }
+    # The execution contract owns supported venue terminal statuses.  Keep
+    # only the two historical spellings that older saved reports used.
+    terminal_statuses = TERMINAL_ORDER_STATUSES | {"cancelled", "rejected", "expired"}
     cycle = next((item for item in files if item.kind == "cycle"), None)
     binding = next((r.payload["binding"] for r in (cycle.records if cycle else [])
                     if isinstance(r.payload.get("binding"), Mapping)), {})
@@ -1556,6 +1563,65 @@ def _latency_reports(
             item[f"{name}_seconds"] = value["seconds"]
         reports[data.kind].append(item)
 
+    for data in files:
+        attempts: dict[tuple[int, int], dict[str, Any]] = {}
+        for record in data.records:
+            if record.event not in {
+                "FALLBACK_SEND_BARRIER", "FALLBACK_PREPARATION_FAILED",
+                "FALLBACK_DISPATCH_INTENT", "FALLBACK_DISPATCH_RESULT",
+                "FALLBACK_DISPATCH_UNKNOWN", "FALLBACK_ATTEMPT_EVIDENCE",
+            }:
+                continue
+            account, ordinal = record.payload.get("account_index"), record.payload.get("attempt")
+            if type(account) is not int or type(ordinal) is not int:
+                continue
+            attempts.setdefault((account, ordinal), {})[record.event] = record
+        for (account, ordinal), events in sorted(attempts.items()):
+            dispatch = events.get("FALLBACK_DISPATCH_RESULT") or events.get("FALLBACK_DISPATCH_UNKNOWN")
+            failure = events.get("FALLBACK_PREPARATION_FAILED")
+            barrier = events.get("FALLBACK_SEND_BARRIER")
+            timings = (dispatch or failure or barrier)
+            raw = timings.payload.get("preparation_timings") if timings else None
+            raw = raw if isinstance(raw, Mapping) else {}
+            measurements = {
+                stage: _latency_measure(
+                    stage, raw.get(f"{stage}_seconds"),
+                    basis=f"fallback {stage}; local elapsed interval", overlap=True,
+                    issues=interval_issues,
+                ) for stage in (
+                    "metadata_read", "book_read", "account_recheck",
+                    "preparation_lock_wait", "nonce_acquisition", "signing_call",
+                    "transport_roundtrip",
+                )
+            }
+            evidence = events.get("FALLBACK_ATTEMPT_EVIDENCE")
+            intent = events.get("FALLBACK_DISPATCH_INTENT")
+            order = evidence.payload.get("order") if evidence else None
+            terminal_at = _finite_number(order.get("observed_at")) if isinstance(order, Mapping) and order.get("status") in TERMINAL_ORDER_STATUSES else None
+            measurements["terminal_order_observation"] = (
+                _latency_measure(
+                    "terminal_order_observation",
+                    None if intent is None or terminal_at is None else terminal_at - intent["at"],
+                    basis="durable dispatch intent to terminal order observed_at; not exchange-only matching latency",
+                    overlap=True, issues=interval_issues,
+                ) if terminal_at is not None else _latency_unknown(
+                    "terminal_order_observation", basis="terminal order observed_at",
+                    reason="no proven terminal order observation for this fallback attempt",
+                )
+            )
+            measurements["attempt_reconciliation"] = _latency_measure(
+                "attempt_reconciliation",
+                None if dispatch is None or evidence is None else evidence["at"] - dispatch["at"],
+                basis="dispatch result/unknown to durable fallback attempt evidence; includes polling and reads",
+                overlap=True, issues=interval_issues,
+            )
+            reports["fallback"].append({
+                "path": str(data.path), "account_index": account, "attempt": ordinal,
+                "dispatch_status": "RESULT" if dispatch and dispatch.event == "FALLBACK_DISPATCH_RESULT"
+                    else "UNKNOWN" if dispatch else "NOT_SENT",
+                "measurements": measurements, "not_additive": True,
+            })
+
     cycle_data = next((data for data in files if data.kind == "cycle"), None)
     cycle_latency: dict[str, Any] = {"phase_intervals": []}
     if cycle_data is not None:
@@ -1980,6 +2046,11 @@ def _paired_execution(
     elif receiver_fills and not source_fills or not receiver_dispatched and not receiver_fills:
         status = "FAILED"
         reasons.append("the intended paired cycle did not execute both required legs")
+    elif not source_fills and not receiver_fills and any(
+        phase["status"] == "NO_FILL" for phase in mutual_results
+    ):
+        status = "FAILED"
+        reasons.append("both terminal opening legs filled zero; paired execution did not occur")
     else:
         status = "PARTIAL" if parent_payload.get("outcome") in {"SUCCESS", "PARTIAL"} and receiver_fills and source_fills else "UNKNOWN"
         reasons.append("a complete paired opening and closing without fallback is not proven")
@@ -2452,10 +2523,6 @@ def render_human(report: Mapping[str, Any]) -> str:
     """Render the conservative report in concise Russian for an operator."""
 
     cycle = report.get("cycle") if isinstance(report.get("cycle"), Mapping) else {}
-    inventory = report.get("inventory") if isinstance(report.get("inventory"), Mapping) else {}
-    paired = report.get("paired_execution") if isinstance(report.get("paired_execution"), Mapping) else {}
-    economics = report.get("economics") if isinstance(report.get("economics"), Mapping) else {}
-    fees = economics.get("fees") if isinstance(economics.get("fees"), Mapping) else {}
     fills = report.get("confirmed_fills") if isinstance(report.get("confirmed_fills"), list) else []
     actions = report.get("dispatched_actions") if isinstance(report.get("dispatched_actions"), list) else []
     planned = report.get("planned_actions") if isinstance(report.get("planned_actions"), list) else []
@@ -2465,11 +2532,10 @@ def render_human(report: Mapping[str, Any]) -> str:
         f"Статус отчёта: {report.get('status', 'UNKNOWN')}; цикл: {cycle.get('outcome', 'UNKNOWN')}; terminal={cycle.get('terminal', False)}.",
         f"Путь: {report.get('cycle_path', report.get('input_path', 'UNKNOWN'))}.",
         f"Планы: {len(planned)}; mutation intents: {len(actions)}; подтверждённые fills: {len(fills)}.",
-        f"Paired execution: {paired.get('status', 'UNKNOWN')}; receiver dispatched={paired.get('receiver_dispatched', False)}.",
-        f"Inventory: {inventory.get('status', 'UNKNOWN')} — source={_display_number(inventory.get('source'))}, receiver={_display_number(inventory.get('receiver'))}.",
-        f"Fees: {fees.get('status', 'UNKNOWN')}; total={fees.get('total')}; funding: UNKNOWN (отдельная классификация).",
-        f"Closed execution PnL: {economics.get('closed_execution_pnl', {})}.",
     ]
+    # Use the same conservative execution explanation as Telegram. The report
+    # reader must not hide an external counterparty or a known terminal reason.
+    lines.extend(result_lines(report, detailed=False))
     order_state = report.get("order_state", {})
     if isinstance(order_state, Mapping):
         lines.append(f"Неразрешённые наблюдавшиеся ордера: {len(order_state.get('unresolved_observed_orders', []))}; неразрешённые намерения: {len(order_state.get('unresolved_intents', []))}. Только сохранённые наблюдения.")

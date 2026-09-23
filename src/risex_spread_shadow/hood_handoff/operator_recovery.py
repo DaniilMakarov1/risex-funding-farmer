@@ -9,15 +9,16 @@ import math
 import os
 from pathlib import Path
 import re
+import time
 
 from .contracts import ContractError, OrderPlan, OrderSnapshot, Outcome, PreflightBlocked
 from .journal import DurableJournal, sanitize_exception
 from .keychain import KeychainSecretProvider
 from .operator_control import exclusive_lock
 from .provenance import capture_provenance
-from .random_cycle import RandomCycleEngine, _account_payload, _fallback_order_mismatch_map, _recovery_stop_reason
+from .random_cycle import RandomCycleEngine, _account_payload, _fallback_order_mismatch_map, _observed_leverage_fraction, _recovery_stop_reason
 from .readiness import ReadOnlyLighterSdkClient
-from .sdk import PlainAioHttp, _order_snapshot_mapping, _require_success_code
+from .sdk import PlainAioHttp, _leverage_next_nonce, _leverage_tx_diagnostic, _leverage_tx_hash, _order_snapshot_mapping, _require_success_code
 from .telegram_accounts import missing_key
 
 SLOT = re.compile(r'(?:cycle|close)-[0-9]{3,}')
@@ -32,6 +33,33 @@ def terminal_matches(order, item):
 
 class RecoveryReadClient(ReadOnlyLighterSdkClient):
     """Auth/account/exact-order reads only; no mutation signer or nonce path."""
+
+    async def read_leverage_transaction(self, tx_hash):
+        if _leverage_tx_hash(tx_hash) is None:
+            raise ContractError('leverage transaction hash is invalid')
+        token = await self._authorization(self.source_account_index)
+        http = PlainAioHttp(self.config.api_base_url, timeout_seconds=self.config.request_timeout_seconds)
+        try:
+            payload = await http.get('api/v1/tx', params={'by': 'hash', 'value': tx_hash},
+                                     authorization=token)
+        finally:
+            await http.aclose()
+        _require_success_code(payload, 'transaction')
+        return _leverage_tx_diagnostic(payload, tx_hash, self._clock())
+
+    async def read_leverage_next_nonce(self, account_index, api_key_index):
+        if (account_index not in {self.source_account_index, self.receiver_account_index}
+                or api_key_index != self.config.api_key_index):
+            raise ContractError('nextNonce identity is invalid')
+        token = await self._authorization(account_index)
+        http = PlainAioHttp(self.config.api_base_url, timeout_seconds=self.config.request_timeout_seconds)
+        try:
+            payload = await http.get('api/v1/nextNonce',
+                                     params={'account_index': account_index, 'api_key_index': api_key_index},
+                                     authorization=token)
+        finally:
+            await http.aclose()
+        return _leverage_next_nonce(payload)
 
     async def lookup_order(self, account_index, market_id, *, client_order_index):
         token = await self._authorization(account_index)
@@ -167,10 +195,30 @@ def prior_intents(operator, config):
                             or payload.get('margin_mode') != 0 or type(fraction) is not int
                             or not 2500 <= fraction <= 10000 or index in local_leverage):
                         raise PreflightBlocked('historical leverage setting intent is invalid')
-                    item = {'account_index': index, 'fraction_bps': fraction, 'resolved': False}
+                    item = {'account_index': index, 'fraction_bps': fraction, 'resolved': False,
+                            'source_identity': payload.get('source_identity'),
+                            'prepared_identity': None, 'journal_path': str(path),
+                            'journal_sha256': digest.hexdigest(), 'intent_at': row['at']}
                     local_leverage[index] = item
                     unresolved_leverage.append(item)
-                elif event in {'LEVERAGE_UPDATE_CONFIRMED', 'LEVERAGE_UPDATE_REJECTED'}:
+                elif event == 'LEVERAGE_TX_PREPARED':
+                    index = payload.get('account_index')
+                    item = local_leverage.get(index)
+                    if (item is None or item['prepared_identity'] is not None
+                            or payload.get('market_id') != config.market_id
+                            or payload.get('fraction_bps') != item['fraction_bps']
+                            or payload.get('margin_mode') != 0
+                            or payload.get('api_key_index') != config.api_key_index
+                            or payload.get('tx_type') != 20
+                            or type(payload.get('nonce')) is not int
+                            or _leverage_tx_hash(payload.get('tx_hash')) is None):
+                        raise PreflightBlocked('historical prepared leverage transaction conflicts with intent')
+                    item['prepared_identity'] = {
+                        'hash': payload['tx_hash'], 'nonce': payload['nonce'],
+                        'account_index': index, 'api_key_index': config.api_key_index,
+                    }
+                elif event in {'LEVERAGE_UPDATE_CONFIRMED', 'LEVERAGE_UPDATE_REJECTED',
+                               'LEVERAGE_UPDATE_NOT_SENT'}:
                     index = payload.get('account_index')
                     item = local_leverage.get(index)
                     if (item is None or item['resolved'] or payload.get('market_id') != config.market_id
@@ -208,15 +256,137 @@ def prior_intents(operator, config):
                                 raise PreflightBlocked('historical terminal order conflicts with intent')
                             if terminal_matches(order, item) and order.observed_at >= item['at']:
                                 item.update(resolved=True, order=order)
-    return list(intents.values()), files, sum(not item['resolved'] for item in unresolved_leverage)
+    pending_leverage = [item for item in unresolved_leverage if not item['resolved']]
+    return list(intents.values()), files, pending_leverage
+
+
+def _leverage_checkpoints(operator):
+    path = Path(operator) / 'recovery-checks.jsonl'
+    if not path.exists():
+        return {}
+    if path.is_symlink() or not path.is_file():
+        raise PreflightBlocked('unsafe recovery checkpoint')
+    checkpoints = {}
+    for row in journal_rows(path):
+        if row['event'] != 'LEVERAGE_RESOLUTION_CHECKPOINT':
+            continue
+        payload = row['payload']
+        # Version 1 was an unaccepted inference from status/timestamps alone.
+        if payload.get('proof_version') != 2:
+            continue
+        original = payload.get('original_path')
+        account_index = payload.get('account_index')
+        key = (original, account_index)
+        if (not isinstance(original, str) or type(account_index) is not int
+                or key in checkpoints):
+            raise PreflightBlocked('duplicate or invalid leverage checkpoint')
+        checkpoints[key] = payload
+    return checkpoints
+
+
+def _checkpoint_matches(item, checkpoints):
+    payload = checkpoints.get((item['journal_path'], item['account_index']))
+    if payload is None:
+        return False
+    identity = item['prepared_identity']
+    if identity is None:
+        raise PreflightBlocked('checkpoint lacks an original prepared transaction')
+    expected = {
+        'original_path': item['journal_path'], 'original_sha256': item['journal_sha256'],
+        'account_index': item['account_index'], 'source_identity': item['source_identity'],
+        'fraction_bps': item['fraction_bps'], 'tx_hash': identity['hash'],
+        'nonce': identity['nonce'], 'api_key_index': identity['api_key_index'],
+        'tx_type': 20,
+    }
+    if (any(payload.get(key) != value for key, value in expected.items())
+            or type(payload.get('tx_status')) is not int
+            or payload['tx_status'] not in (0, 2)
+            or any(type(payload.get(key)) is not int or payload[key] <= 0
+                   for key in ('executed_at', 'committed_at', 'verified_at'))
+            or not payload['executed_at'] <= payload['committed_at'] <= payload['verified_at']
+            or type(payload.get('next_nonce')) is not int
+            or payload['next_nonce'] <= identity['nonce']
+            or isinstance(payload.get('account_observed_at'), bool)
+            or not isinstance(payload.get('account_observed_at'), (int, float))
+            or not math.isfinite(payload['account_observed_at'])
+            or payload['account_observed_at'] < payload['verified_at']):
+        raise PreflightBlocked('leverage checkpoint conflicts with immutable history')
+    return True
 
 
 async def resolve_prior(config, client, operator, *, clock=None, require_leverage_resolved=True):
     """Resolve outstanding creations before admitting a new operation."""
     engine = RandomCycleEngine(client, clock=clock)
-    intents, files, unknown_leverage = await asyncio.to_thread(prior_intents, operator, config)
-    if unknown_leverage and require_leverage_resolved:
-        raise PreflightBlocked('previous leverage setting is unresolved; new /run needs manual reconciliation')
+    intents, files, pending_leverage = await asyncio.to_thread(prior_intents, operator, config)
+    if pending_leverage and require_leverage_resolved:
+        checkpoints = await asyncio.to_thread(_leverage_checkpoints, operator)
+        unresolved_settings = [item for item in pending_leverage if not _checkpoint_matches(item, checkpoints)]
+        if unresolved_settings:
+            if len(unresolved_settings) > config.max_poll_count:
+                raise PreflightBlocked('too many unresolved leverage settings for a bounded check')
+            reader = getattr(client, 'read_leverage_transaction', None)
+            nonce_reader = getattr(client, 'read_leverage_next_nonce', None)
+            if (not callable(reader) or not callable(nonce_reader)
+                    or any(not item['prepared_identity'] or not item['source_identity']
+                           for item in unresolved_settings)):
+                raise PreflightBlocked('previous leverage setting lacks provable transaction identity')
+            deadline = time.monotonic() + config.reconcile_timeout_seconds
+
+            def remaining():
+                value = min(config.request_timeout_seconds, deadline - time.monotonic())
+                if value <= 0:
+                    raise PreflightBlocked('leverage recovery exceeded configured bound')
+                return value
+
+            proved = []
+            for item in unresolved_settings:
+                identity = item['prepared_identity']
+                tx = await asyncio.wait_for(reader(identity['hash']), timeout=remaining())
+                try:
+                    tx = _leverage_tx_diagnostic(tx, identity['hash'], engine.clock.now())
+                except (ContractError, TypeError, AttributeError) as exc:
+                    raise PreflightBlocked('previous leverage transaction evidence is incomplete') from exc
+                if (any(tx.get(key) != value for key, value in identity.items())
+                        or tx['status'] not in (0, 2)
+                        or tx['executed_at'] < math.floor(item['intent_at'])
+                        or tx['committed_at'] <= 0 or tx['verified_at'] <= 0):
+                    raise PreflightBlocked('previous leverage transaction is pending or conflicting')
+                next_nonce = await asyncio.wait_for(
+                    nonce_reader(identity['account_index'], identity['api_key_index']),
+                    timeout=remaining())
+                if type(next_nonce) is not int or next_nonce <= identity['nonce']:
+                    raise PreflightBlocked('previous leverage nonce consumption is unproved')
+                proved.append((item, tx, next_nonce))
+            source, receiver = await asyncio.wait_for(engine._recovery_accounts(config), timeout=remaining())
+            accounts = {source.account_index: source, receiver.account_index: receiver}
+            for item, tx, _ in proved:
+                account = accounts[item['account_index']]
+                label = 'source' if account.account_index == config.source_account_index else 'receiver'
+                if (account.source_identity != item['source_identity']
+                        or account.signed_position != 0 or account.active_orders
+                        or (tx['status'] == 2 and
+                            _observed_leverage_fraction(account, label) != item['fraction_bps'])):
+                    raise PreflightBlocked('previous leverage transaction conflicts with fresh account setting')
+            checkpoint = DurableJournal(Path(operator) / 'recovery-checks.jsonl', clock=engine.clock.now)
+            checkpoint.acquire_attempt()
+            try:
+                for item, tx, next_nonce in proved:
+                    checkpoint.append('LEVERAGE_RESOLUTION_CHECKPOINT', {
+                        'proof_version': 2, 'original_path': item['journal_path'],
+                        'original_sha256': item['journal_sha256'],
+                        'account_index': item['account_index'],
+                        'source_identity': item['source_identity'],
+                        'fraction_bps': item['fraction_bps'],
+                        'tx_hash': tx['hash'], 'nonce': tx['nonce'],
+                        'api_key_index': tx['api_key_index'], 'tx_type': tx['type'],
+                        'tx_status': tx['status'], 'executed_at': tx['executed_at'],
+                        'committed_at': tx['committed_at'], 'verified_at': tx['verified_at'],
+                        'next_nonce': next_nonce,
+                        'account_observed_at': accounts[item['account_index']].observed_at,
+                    })
+            finally:
+                checkpoint.release_attempt()
+        pending_leverage = []
     unresolved = [item for item in intents if not item['resolved']]
     if len(unresolved) > config.max_poll_count:
         raise PreflightBlocked('too many unresolved historical intents for a bounded check')
@@ -235,7 +405,7 @@ async def resolve_prior(config, client, operator, *, clock=None, require_leverag
                             'client_order_index': order.client_order_index, 'status': order.status,
                             'observed_at': order.observed_at})
     await asyncio.wait_for(resolve(), timeout=config.reconcile_timeout_seconds)
-    return {'previous_intents': len(intents), 'unresolved_leverage_settings': unknown_leverage,
+    return {'previous_intents': len(intents), 'unresolved_leverage_settings': len(pending_leverage),
             'resolved_now': checked, 'inputs': files}
 
 

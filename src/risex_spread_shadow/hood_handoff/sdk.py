@@ -26,6 +26,7 @@ from .contracts import (
     ContractError,
     HandoffConfig,
     HistoryPage,
+    LeverageNotSent,
     MarketMetadata,
     MutationReceipt,
     OrderPlan,
@@ -41,6 +42,43 @@ REQUIRED_LIGHTER_SDK_VERSION = "1.1.2"
 # The official orderBookOrders endpoint requires a bounded page size.  This is
 # a transport/read bound only; slice quantity remains operator/depth-driven.
 ROBINHOOD_ORDER_BOOK_LIMIT = 250
+
+
+def _leverage_tx_hash(value: Any) -> str | None:
+    """Keep the pinned native signer's exact, bounded transaction identity."""
+    return value if isinstance(value, str) and re.fullmatch(r"[0-9a-fA-F]{80}", value) else None
+
+
+def _leverage_tx_diagnostic(raw: Mapping[str, Any], tx_hash: str, now: float) -> dict[str, Any]:
+    """Sanitize a transaction read; these fields do not establish finality."""
+    result = {key: raw.get(key) for key in (
+        "hash", "type", "status", "account_index", "api_key_index",
+        "nonce", "executed_at", "committed_at", "verified_at",
+    )}
+    numeric = ("type", "status", "account_index", "api_key_index", "nonce",
+               "executed_at", "committed_at", "verified_at")
+    if (_leverage_tx_hash(tx_hash) is None or result["hash"] != tx_hash
+            or any(type(result[key]) is not int for key in numeric)):
+        raise ContractError("leverage transaction identity or status is incomplete")
+    if (result["type"] != 20 or result["status"] not in (0, 1, 2, 3)
+            or any(result[key] < 0 for key in numeric)):
+        raise ContractError("leverage transaction diagnostic fields are invalid")
+    times = [result[key] for key in ("executed_at", "committed_at", "verified_at")]
+    # The documented examples use epoch seconds. Do not convert guessed units:
+    # an incompatible or future value is diagnostic uncertainty, never proof.
+    if (not math.isfinite(now) or now <= 0 or any(t > now for t in times)
+            or any(later and (not earlier or later < earlier)
+                   for earlier, later in zip(times, times[1:]))):
+        raise ContractError("leverage transaction timing is unproved")
+    return result
+
+
+def _leverage_next_nonce(raw: Mapping[str, Any]) -> int:
+    _require_success_code(raw, "nextNonce")
+    nonce = raw.get("nonce")
+    if type(nonce) is not int or nonce < 0:
+        raise ContractError("nextNonce is incomplete")
+    return nonce
 
 
 class SecretProvider(Protocol):
@@ -407,6 +445,8 @@ class PlainAioHttp:
 class LighterSdkClient:
     """Production adapter, constructed only after explicit operator opt-in."""
 
+    supports_leverage_prepared_intent = True
+
     source_account_index: int
     receiver_account_index: int
 
@@ -631,12 +671,21 @@ class LighterSdkClient:
             "minimum_base_amount": "min_base_amount",
             "minimum_quote_amount": "min_quote_amount",
             "minimum_initial_margin_fraction": "min_initial_margin_fraction",
+            "mark_price": "mark_price",
         }
         for target, source in observed_aliases.items():
             if source in observed:
                 if target in evidence and str(evidence[target]) != str(observed[source]):
                     raise ContractError(f"market evidence conflicts with orderBookDetails {source}")
                 evidence[target] = observed[source]
+        # The matching market fee fields are percentages in the official
+        # order-book metadata. Keep any higher explicit operator evidence.
+        for target, source in (("source_fee_rate", "maker_fee"),
+                               ("receiver_fee_rate", "taker_fee")):
+            if source in observed and observed[source] is not None:
+                observed_rate = _nonnegative(observed[source], source) / 100
+                supplied = _nonnegative(evidence[target], target) if evidence.get(target) is not None else observed_rate
+                evidence[target] = format(max(observed_rate, supplied), "f")
         market_config = observed.get("market_config")
         if isinstance(market_config, Mapping):
             evidence["market_margin_mode"] = market_config.get("market_margin_mode")
@@ -689,12 +738,19 @@ class LighterSdkClient:
             "size_decimals": "supported_size_decimals",
             "minimum_base_amount": "min_base_amount",
             "minimum_quote_amount": "min_quote_amount",
+            "mark_price": "mark_price",
         }
         for target, source in aliases.items():
             if source in observed:
                 if target in evidence and str(evidence[target]) != str(observed[source]):
                     raise ContractError(f"market evidence conflicts with orderBookDetails {source}")
                 evidence[target] = observed[source]
+        for target, source in (("source_fee_rate", "maker_fee"),
+                               ("receiver_fee_rate", "taker_fee")):
+            if source in observed and observed[source] is not None:
+                observed_rate = _nonnegative(observed[source], source) / 100
+                supplied = _nonnegative(evidence[target], target) if evidence.get(target) is not None else observed_rate
+                evidence[target] = format(max(observed_rate, supplied), "f")
         if "min_initial_margin_fraction" in observed:
             evidence["minimum_initial_margin_fraction"] = observed["min_initial_margin_fraction"]
         market_config = observed.get("market_config")
@@ -1424,6 +1480,7 @@ class LighterSdkClient:
 
     async def update_leverage_fraction(
         self, account_index: int, market_id: int, fraction: int, margin_mode: int = 0,
+        *, prepared_intent: Callable[[Mapping[str, Any]], None] | None = None,
     ) -> MutationReceipt:
         """Send one exact cross-margin setting transaction; never retry a send."""
         key_index = self.config.api_key_index
@@ -1433,36 +1490,81 @@ class LighterSdkClient:
                 or not 2500 <= fraction <= 10000):
             raise ContractError("leverage setting identity, mode or 1x..4x fraction is invalid")
         deadline = time.monotonic() + min(self.config.request_timeout_seconds, self.config.freshness_seconds)
-        async with self._preparation_lock_for(account_index, key_index):
-            signer = self._signer(account_index)
-            nonce = await self._next_nonce(signer, key_index, deadline=deadline)
-            self._assert_nonce_available(account_index, key_index, nonce)
-            signer_type = type(signer)
-            result = await self._bounded(
-                _await(signer.sign_update_leverage(
-                    market_index=market_id, fraction=fraction, margin_mode=margin_mode,
-                    skip_nonce=getattr(signer_type, "SKIP_NONCE_OFF", 0),
-                    nonce=nonce, api_key_index=key_index,
-                )), deadline, "leverage signing",
-            )
-            if not isinstance(result, tuple) or len(result) != 4:
-                raise ContractError("leverage signer returned an unsupported shape")
-            tx_type, tx_info, tx_hash, error = result
-            if error:
-                return MutationReceipt(False, None, _safe_text(tx_hash), "leverage signing rejected")
-            if time.monotonic() >= deadline:
-                raise TimeoutError("leverage signing crossed its mutation deadline")
-            # Once the nonce is consumed, a transport failure is ambiguous.
-            self._block_nonce(account_index, key_index, nonce)
+        try:
+            async with self._preparation_lock_for(account_index, key_index):
+                signer = self._signer(account_index)
+                nonce = await self._next_nonce(signer, key_index, deadline=deadline)
+                self._assert_nonce_available(account_index, key_index, nonce)
+                signer_type = type(signer)
+                result = await self._bounded(
+                    _await(signer.sign_update_leverage(
+                        market_index=market_id, fraction=fraction, margin_mode=margin_mode,
+                        skip_nonce=getattr(signer_type, "SKIP_NONCE_OFF", 0),
+                        nonce=nonce, api_key_index=key_index,
+                    )), deadline, "leverage signing",
+                )
+                if not isinstance(result, tuple) or len(result) != 4:
+                    raise ContractError("leverage signer returned an unsupported shape")
+                tx_type, tx_info, tx_hash, error = result
+                if error:
+                    return MutationReceipt(False, None, _leverage_tx_hash(tx_hash), "leverage signing rejected")
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("leverage signing crossed its mutation deadline")
+                if prepared_intent is not None:
+                    if tx_type != 20 or _leverage_tx_hash(tx_hash) is None:
+                        raise ContractError("leverage signer did not provide provable transaction identity")
+                    # Durable identity before the only transport attempt. Never
+                    # expose signed info or the credential through this callback.
+                    prepared_intent({
+                        "account_index": account_index, "market_id": market_id,
+                        "api_key_index": key_index, "fraction_bps": fraction,
+                        "margin_mode": margin_mode, "nonce": nonce,
+                        "tx_hash": tx_hash, "tx_type": tx_type,
+                    })
+                # Once transport starts, an error can no longer prove no send.
+                self._block_nonce(account_index, key_index, nonce)
+        except Exception as exc:
+            raise LeverageNotSent("leverage setting failed before transport") from exc
         response = await self._bounded(self._send_signed_tx(tx_type, tx_info), deadline, "leverage dispatch")
         code = _response_code(response)
         if code is None or code >= 500:
             raise RuntimeError("malformed or undecidable leverage sendTx response")
         return MutationReceipt(
             accepted=code == 200, order_id=None,
-            tx_hash=_safe_text(tx_hash) or _safe_text(_model_dict(response).get("tx_hash")),
+            tx_hash=_leverage_tx_hash(tx_hash) or _leverage_tx_hash(_model_dict(response).get("tx_hash")),
             error=None if code == 200 else f"send_tx response code {code}", response_code=code,
         )
+
+    async def read_leverage_transaction(self, tx_hash: str) -> dict[str, Any]:
+        """Read only the public transaction fields needed for later reconciliation."""
+
+        if _leverage_tx_hash(tx_hash) is None:
+            raise ContractError("leverage transaction hash is invalid")
+        module = self._lighter()
+        api = module.TransactionApi(self._generated_api_client(module))
+        response = await self._bounded(
+            _await(api.tx(by="hash", value=tx_hash,
+                          _request_timeout=self.config.request_timeout_seconds)),
+            time.monotonic() + self.config.request_timeout_seconds,
+            "leverage transaction read",
+        )
+        raw = _model_dict(response)
+        _require_success_code(raw, "transaction")
+        return _leverage_tx_diagnostic(raw, tx_hash, self._clock())
+
+    async def read_leverage_next_nonce(self, account_index: int, api_key_index: int) -> int:
+        if (account_index not in {self.source_account_index, self.receiver_account_index}
+                or api_key_index != self.config.api_key_index):
+            raise ContractError("nextNonce identity is invalid")
+        module = self._lighter()
+        api = module.TransactionApi(self._generated_api_client(module))
+        response = await self._bounded(
+            _await(api.next_nonce(account_index=account_index, api_key_index=api_key_index,
+                                  _request_timeout=self.config.request_timeout_seconds)),
+            time.monotonic() + self.config.request_timeout_seconds,
+            "nextNonce read",
+        )
+        return _leverage_next_nonce(_model_dict(response))
 
     async def cancel_order(self, account_index: int, market_id: int, order_id: str) -> MutationReceipt:
         deadline = self._pending_mutation_deadline

@@ -4,11 +4,43 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 import json
 import math
+import os
 from pathlib import Path
 
 from .journal import sanitize
 
 MSK = timezone(timedelta(hours=3))
+
+LAUNCH_FAILURE_CODES = frozenset({
+    'PRIOR_LEVERAGE_UNRESOLVED', 'PRIOR_ORDER_UNRESOLVED',
+    'CREDENTIAL_UNAVAILABLE', 'PREFLIGHT_REFUSED',
+    'PREPARATION_UNAVAILABLE',
+})
+
+
+def read_launch_failure(slot):
+    """Read a bounded, fixed-code refusal before any cycle journal existed."""
+    slot = Path(slot)
+    path = slot / 'launch-failure.json'
+    if slot.is_symlink() or path.is_symlink() or (slot / 'cycle.jsonl').exists():
+        return None
+    try:
+        if path.stat().st_size > 4096:
+            return None
+        value = json.loads(path.read_text(encoding='utf-8'))
+    except (OSError, ValueError, TypeError):
+        return None
+    stored_slot = value.get('cycle_dir') if isinstance(value, dict) else None
+    if (not isinstance(value, dict) or not isinstance(value.get('code'), str)
+            or not isinstance(stored_slot, str) or not Path(stored_slot).is_absolute()
+            or value.get('schema') != 'hcr-41-launch-failure-v1'
+            or os.path.abspath(stored_slot) != os.path.abspath(slot)
+            or value.get('code') not in LAUNCH_FAILURE_CODES
+            or value.get('inventory') != 'UNKNOWN'
+            or value.get('execution') != 'UNKNOWN'
+            or value.get('cycle_journal_present') is not False):
+        return None
+    return value['code']
 
 
 def clean(value, limit=120):
@@ -222,7 +254,8 @@ def execution_lines(result, *, phase, attempt=1):
         elif not leg.dispatched:
             lines.append(prefix + 'не отправлялся.')
         elif not leg.trades:
-            lines.append(prefix + 'исполнений нет; заявка завершена.')
+            status = clean(leg.order.status, 48) if leg.order is not None else 'неизвестен'
+            lines.append(prefix + f'исполнений нет; статус заявки: {status}.')
         else:
             external = sum((t.quantity for t in leg.trades if t.counterparty_account_index is not None
                             and peer is not None and t.counterparty_account_index != peer), Decimal(0))
@@ -347,6 +380,14 @@ def result_lines(report, *, detailed=False):
             state = value.get(f'{role}_state')
             if state in {'UNSENT', 'NO_FILL'}:
                 detail = ('не отправлялся.' if role == 'receiver' else 'не отправлялась.') if state == 'UNSENT' else 'ордер отправлен, исполнений нет; ордер завершён.'
+                if state == 'NO_FILL':
+                    terminal = [mapping(item) for item in report.get('terminal_orders', [])
+                                if mapping(item).get('phase') == value.get('phase')
+                                and mapping(item).get('leg') == role]
+                    if terminal:
+                        status = terminal[-1].get('status')
+                        if isinstance(status, str):
+                            detail = f'ордер отправлен, исполнений нет; статус: {clean(status, 48)}.'
                 lines.append(prefix + detail)
                 continue
             own = number(value.get('matched_quantity'))

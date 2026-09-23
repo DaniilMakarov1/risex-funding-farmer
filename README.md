@@ -4,6 +4,8 @@ The active tool runs one owner-requested two-account Robinhood Chain BTC cycle. 
 
 Read STATUS.md for accepted versions/results, SYSTEM_SPEC.md for behavior, NEXT_TASK.md for current work/authority and AGENTS.md for process/safety. Historical experiments remain in Git and immutable local evidence.
 
+HCR-41 corrections remain an undeployed, unaccepted candidate on an isolated branch. They improve residual-close preparation and timing, terminal reports, pre-journal failures and public-book diagnostics. The candidate budgets mark-based initial margin, evidenced fees and adverse entry loss for both accounts while preserving the original absolute 4x cap. An uncertain leverage setting can clear after exact terminal sequencer status, consumed nonce and fresh account-state proof; pending or incomplete evidence still blocks a new run. This is sequencer soft finality. Venue-specific reserved margin and final order admission remain unproved. See STATUS.md and NEXT_TASK.md.
+
 ## Setup
 
 Use Python 3.11 and pinned `lighter-sdk==1.1.2`. For a new installation:

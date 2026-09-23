@@ -31,11 +31,12 @@ from .local_attempt import (
     run_local_attempt,
 )
 from .offline_report import format_report, report_saved_paths, load_saved_cycle_report
-from .operator_view import read_lifecycle, lifecycle_lines, result_lines, read_execution_notices
+from .operator_view import read_lifecycle, lifecycle_lines, result_lines, read_execution_notices, read_launch_failure
 from .random_cycle import (
     MAX_PREPARATION_ATTEMPTS,
     RandomCycleConfig,
     RandomCycleEngine,
+    _atomic_launch_metadata,
     allocate_cycle_slot,
     select_random_route,
     run_random_cycle,
@@ -1397,6 +1398,31 @@ async def _run_simple(args: argparse.Namespace) -> int:
         return await _run_simple_confirmed(args, value, config_path, operator_dir)
 
 
+def _persist_prejournal_launch_failure(cycle_dir: Path, exc: BaseException) -> str | None:
+    """Persist only an allowlisted cause; never copy an exception or key text."""
+    if (cycle_dir / 'cycle.jsonl').exists():
+        return None
+    if isinstance(exc, PreflightBlocked) and 'leverage setting is unresolved' in str(exc):
+        code = 'PRIOR_LEVERAGE_UNRESOLVED'
+    elif isinstance(exc, PreflightBlocked) and 'previous order is unresolved' in str(exc):
+        code = 'PRIOR_ORDER_UNRESOLVED'
+    elif isinstance(exc, KeychainError):
+        code = 'CREDENTIAL_UNAVAILABLE'
+    elif isinstance(exc, PreflightBlocked):
+        code = 'PREFLIGHT_REFUSED'
+    else:
+        code = 'PREPARATION_UNAVAILABLE'
+    _atomic_launch_metadata(cycle_dir / 'launch-failure.json', {
+        'schema': 'hcr-41-launch-failure-v1',
+        'code': code,
+        'cycle_dir': str(cycle_dir),
+        'inventory': 'UNKNOWN',
+        'execution': 'UNKNOWN',
+        'cycle_journal_present': False,
+    })
+    return code
+
+
 async def _run_simple_confirmed(args, value, config_path, operator_dir) -> int:
     # Validation is local and secret-free.  The SDK distribution/import,
     # configuration and evidence must all be valid before the new slot can be
@@ -1486,6 +1512,10 @@ async def _run_simple_confirmed(args, value, config_path, operator_dir) -> int:
         return 2
     except BaseException as exc:
         reason = str(exc) if isinstance(exc, SystemExit) and str(exc) else sanitize_exception(exc)
+        try:
+            _persist_prejournal_launch_failure(cycle_dir, exc)
+        except PreflightBlocked:
+            print('Причину отказа не удалось сохранить; исход остаётся UNKNOWN.')
         (
             may_have_sent,
             source_text,
@@ -1716,10 +1746,21 @@ async def _run_offline_report(args: argparse.Namespace) -> int:
             "status": "COMPLETE" if all(item.get("status") == "COMPLETE" for item in reports) else "INCOMPLETE",
             "reports": reports,
         }
+    def human(item):
+        path = Path(item['input_path'])
+        slot = path.parent if path.name == 'cycle.jsonl' else path
+        code = read_launch_failure(slot)
+        suffix = '' if code is None else f'\nДо журнала цикла сохранён отказ запуска: {code}; исполнение и позиции UNKNOWN.'
+        return format_report(item, output_format='human') + suffix
+
     if len(reports) > 1 and output_format in {"human", "both"}:
-        print("\n\n".join(format_report(item, output_format="human") for item in reports))
+        print("\n\n".join(human(item) for item in reports))
         if output_format == "both":
             print(format_report(value, output_format="json"))
+    elif len(reports) == 1 and output_format in {"human", "both"}:
+        print(human(reports[0]))
+        if output_format == "both":
+            print(format_report(reports[0], output_format="json"))
     else:
         print(format_report(value, output_format=output_format))
     # The report itself carries the incomplete/unknown state.  A diagnostic

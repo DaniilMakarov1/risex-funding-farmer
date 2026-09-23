@@ -2,14 +2,16 @@
 import asyncio
 from dataclasses import replace
 from decimal import Decimal
+import hashlib
 import json
 from pathlib import Path
 
 import pytest
 
 from risex_spread_shadow.hood_handoff import operator_recovery as recovery
-from risex_spread_shadow.hood_handoff.contracts import OrderPlan, OrderSnapshot, PreflightBlocked
+from risex_spread_shadow.hood_handoff.contracts import AccountMarginEvidence, OrderPlan, OrderSnapshot, PreflightBlocked
 from risex_spread_shadow.hood_handoff.journal import DurableJournal
+from risex_spread_shadow.hood_handoff.operator_recovery import resolve_prior
 from risex_spread_shadow.hood_handoff.operator_view import execution_lines, read_execution_notices, close_result_lines
 from test_hood_handoff_random_cycle import (AdvancingClock, CycleClient, FixedRng, cycle_config,
     run_random_cycle, GuardCancellationFillClient, ExternalCloseClient)
@@ -62,6 +64,325 @@ def intent_journal(operator, *, complete=False, status='canceled', unknown=False
     finally:
         j.release_attempt()
     return slot
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('prepared', [True, False])
+async def test_uncertain_leverage_never_authorizes_new_run_without_finality_proof(
+    tmp_path, prepared,
+):
+    slot = tmp_path / 'cycle-001'
+    slot.mkdir(mode=0o700)
+    clock = AdvancingClock()
+    tx_hash = 'aA' * 40
+    journal = DurableJournal(slot / 'cycle.jsonl', clock=clock.now)
+    journal.acquire_attempt()
+    try:
+        journal.append('LEVERAGE_UPDATE_INTENT', {
+            'account_index': 11, 'market_id': 7, 'fraction_bps': 4166,
+            'margin_mode': 0, 'source_identity': 'cycle-account-11',
+        })
+        if prepared:
+            journal.append('LEVERAGE_TX_PREPARED', {
+                'account_index': 11, 'market_id': 7, 'fraction_bps': 4166,
+                'margin_mode': 0, 'api_key_index': 4, 'tx_type': 20,
+                'nonce': 41, 'tx_hash': tx_hash,
+            })
+    finally:
+        journal.release_attempt()
+
+    class TxClient(RecoveryClient):
+        async def read_leverage_transaction(self, value):
+            raise AssertionError('unproved transaction status must not authorize admission')
+
+    config = cycle_config(slot, api_key_index=4)
+    client = TxClient(clock)
+    with pytest.raises(PreflightBlocked, match='lacks provable transaction identity'):
+        await resolve_prior(config, client, tmp_path, clock=clock)
+    assert not (tmp_path / 'recovery-checks.jsonl').exists()
+
+
+@pytest.mark.asyncio
+async def test_old_leverage_checkpoint_and_later_different_setting_do_not_unlock(tmp_path):
+    clock = AdvancingClock()
+    tx_hash = 'aA' * 40
+    for cycle, fraction, confirmed in (('cycle-001', 4166, False), ('cycle-002', 5000, True)):
+        slot = tmp_path / cycle
+        slot.mkdir(mode=0o700)
+        journal = DurableJournal(slot / 'cycle.jsonl', clock=clock.now)
+        journal.acquire_attempt()
+        try:
+            journal.append('LEVERAGE_UPDATE_INTENT', {
+                'account_index': 11, 'market_id': 7, 'fraction_bps': fraction,
+                'margin_mode': 0, 'source_identity': 'cycle-account-11',
+            })
+            if cycle == 'cycle-001':
+                journal.append('LEVERAGE_TX_PREPARED', {
+                    'account_index': 11, 'market_id': 7, 'fraction_bps': fraction,
+                    'margin_mode': 0, 'api_key_index': 4, 'tx_type': 20,
+                    'nonce': 41, 'tx_hash': tx_hash,
+                })
+            if confirmed:
+                journal.append('LEVERAGE_UPDATE_CONFIRMED', {
+                    'account_index': 11, 'market_id': 7, 'fraction_bps': fraction,
+                })
+        finally:
+            journal.release_attempt()
+    # A well-formed checkpoint emitted by the unaccepted v3 candidate cannot
+    # certify finality or override a separately confirmed later setting.
+    original_path = tmp_path / 'cycle-001' / 'cycle.jsonl'
+    checkpoint = DurableJournal(tmp_path / 'recovery-checks.jsonl', clock=clock.now)
+    checkpoint.acquire_attempt()
+    try:
+        checkpoint.append('LEVERAGE_RESOLUTION_CHECKPOINT', {
+            'original_path': str(original_path),
+            'original_sha256': hashlib.sha256(original_path.read_bytes()).hexdigest(),
+            'account_index': 11, 'source_identity': 'cycle-account-11',
+            'fraction_bps': 4166, 'tx_hash': tx_hash, 'nonce': 41,
+            'api_key_index': 4, 'tx_type': 20, 'tx_status': 2,
+            'executed_at': 1000, 'verified_at': 1002,
+            'account_observed_at': 1003,
+        })
+    finally:
+        checkpoint.release_attempt()
+    with pytest.raises(PreflightBlocked, match='lacks provable transaction identity'):
+        await resolve_prior(cycle_config(tmp_path / 'cycle-003', api_key_index=4),
+                            RecoveryClient(clock), tmp_path, clock=clock)
+
+
+@pytest.mark.asyncio
+async def test_exact_executed_leverage_and_consumed_nonce_checkpoint_survive_later_setting(tmp_path):
+    clock = AdvancingClock()
+    clock.value = 1000.25  # Journal has subsecond precision; tx uses integer epoch seconds.
+    slot = tmp_path / 'cycle-001'
+    slot.mkdir(mode=0o700)
+    tx_hash = 'aA' * 40
+    journal = DurableJournal(slot / 'cycle.jsonl', clock=clock.now)
+    journal.acquire_attempt()
+    try:
+        journal.append('LEVERAGE_UPDATE_INTENT', {
+            'account_index': 11, 'market_id': 7, 'fraction_bps': 4166,
+            'margin_mode': 0, 'source_identity': 'cycle-account-11',
+        })
+        journal.append('LEVERAGE_TX_PREPARED', {
+            'account_index': 11, 'market_id': 7, 'fraction_bps': 4166,
+            'margin_mode': 0, 'api_key_index': 4, 'tx_type': 20,
+            'nonce': 41, 'tx_hash': tx_hash,
+        })
+    finally:
+        journal.release_attempt()
+
+    class TxClient(RecoveryClient):
+        fraction = '41.66'
+        tx_status = 2
+        next_nonce = 42
+        read_count = 0
+
+        async def account_snapshot(self, index, market_id):
+            snapshot = await super().account_snapshot(index, market_id)
+            margin = AccountMarginEvidence.from_response(
+                account_index=index, market_id=market_id,
+                source_identity=snapshot.source_identity, observed_at=snapshot.observed_at,
+                selected_position={'margin_mode': 0,
+                                   'initial_margin_fraction': self.fraction if index == 11 else '100.00'},
+                account={},
+            )
+            return replace(snapshot, margin_evidence=margin)
+
+        async def read_leverage_transaction(self, value):
+            assert value == tx_hash
+            self.read_count += 1
+            return {'hash': value, 'type': 20, 'status': self.tx_status,
+                    'account_index': 11, 'api_key_index': 4, 'nonce': 41,
+                    'executed_at': 1000, 'committed_at': 1000, 'verified_at': 1000}
+
+        async def read_leverage_next_nonce(self, account_index, api_key_index):
+            assert (account_index, api_key_index) == (11, 4)
+            return self.next_nonce
+
+    client = TxClient(clock)
+    config = cycle_config(slot, api_key_index=4)
+    result = await resolve_prior(config, client, tmp_path, clock=clock)
+    assert result['unresolved_leverage_settings'] == 0
+    assert client.read_count == 1
+    assert (tmp_path / 'recovery-checks.jsonl').exists()
+    # A later separately confirmed change may legitimately replace the fraction.
+    later = tmp_path / 'cycle-002'
+    later.mkdir(mode=0o700)
+    second = DurableJournal(later / 'cycle.jsonl', clock=clock.now)
+    second.acquire_attempt()
+    try:
+        second.append('LEVERAGE_UPDATE_INTENT', {
+            'account_index': 11, 'market_id': 7, 'fraction_bps': 5000,
+            'margin_mode': 0, 'source_identity': 'cycle-account-11',
+        })
+        second.append('LEVERAGE_UPDATE_CONFIRMED', {
+            'account_index': 11, 'market_id': 7, 'fraction_bps': 5000,
+        })
+    finally:
+        second.release_attempt()
+    client.fraction = '50.00'
+    again = await resolve_prior(config, client, tmp_path, clock=clock)
+    assert again['unresolved_leverage_settings'] == 0
+    assert client.read_count == 1  # checkpoint consumed across restart/later setting
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('status,next_nonce', [(1, 42), (3, 42), (0, 41), (2, 41)])
+async def test_unproved_leverage_outcomes_remain_blocked(tmp_path, status, next_nonce):
+    slot = tmp_path / 'cycle-001'
+    slot.mkdir(mode=0o700)
+    journal = DurableJournal(slot / 'cycle.jsonl', clock=lambda: 1000)
+    journal.acquire_attempt()
+    try:
+        journal.append('LEVERAGE_UPDATE_INTENT', {
+            'account_index': 11, 'market_id': 7, 'fraction_bps': 4166,
+            'margin_mode': 0, 'source_identity': 'cycle-account-11',
+        })
+        journal.append('LEVERAGE_TX_PREPARED', {
+            'account_index': 11, 'market_id': 7, 'fraction_bps': 4166,
+            'margin_mode': 0, 'api_key_index': 4, 'tx_type': 20,
+            'nonce': 41, 'tx_hash': 'aA' * 40,
+        })
+    finally:
+        journal.release_attempt()
+
+    class Client(RecoveryClient):
+        async def read_leverage_transaction(self, value):
+            return {'hash': value, 'type': 20, 'status': status,
+                    'account_index': 11, 'api_key_index': 4, 'nonce': 41,
+                    'executed_at': 1000, 'committed_at': 1000, 'verified_at': 1000}
+
+        async def read_leverage_next_nonce(self, account_index, api_key_index):
+            return next_nonce
+
+    with pytest.raises(PreflightBlocked):
+        await resolve_prior(cycle_config(slot, api_key_index=4), Client(AdvancingClock()),
+                            tmp_path, clock=AdvancingClock())
+    assert not (tmp_path / 'recovery-checks.jsonl').exists()
+
+
+@pytest.mark.asyncio
+async def test_exact_failed_leverage_with_consumed_nonce_recovers_without_claiming_setting(tmp_path):
+    slot = tmp_path / 'cycle-001'
+    slot.mkdir(mode=0o700)
+    journal = DurableJournal(slot / 'cycle.jsonl', clock=lambda: 1000)
+    journal.acquire_attempt()
+    try:
+        journal.append('LEVERAGE_UPDATE_INTENT', {
+            'account_index': 11, 'market_id': 7, 'fraction_bps': 4166,
+            'margin_mode': 0, 'source_identity': 'cycle-account-11',
+        })
+        journal.append('LEVERAGE_TX_PREPARED', {
+            'account_index': 11, 'market_id': 7, 'fraction_bps': 4166,
+            'margin_mode': 0, 'api_key_index': 4, 'tx_type': 20,
+            'nonce': 41, 'tx_hash': 'aA' * 40,
+        })
+    finally:
+        journal.release_attempt()
+
+    class FailedClient(RecoveryClient):
+        async def read_leverage_transaction(self, value):
+            return {'hash': value, 'type': 20, 'status': 0,
+                    'account_index': 11, 'api_key_index': 4, 'nonce': 41,
+                    'executed_at': 1000, 'committed_at': 1000, 'verified_at': 1000}
+
+        async def read_leverage_next_nonce(self, account_index, api_key_index):
+            assert (account_index, api_key_index) == (11, 4)
+            return 42
+
+    clock = AdvancingClock()
+    client = FailedClient(clock)
+    config = cycle_config(slot, api_key_index=4)
+    assert (await resolve_prior(config, client, tmp_path, clock=clock))['unresolved_leverage_settings'] == 0
+    checkpoint = list(recovery.journal_rows(tmp_path / 'recovery-checks.jsonl'))[0]['payload']
+    assert checkpoint['tx_status'] == 0
+    assert (await resolve_prior(config, client, tmp_path, clock=clock))['unresolved_leverage_settings'] == 0
+
+
+@pytest.mark.asyncio
+async def test_durable_proven_pre_send_failure_does_not_leave_permanent_setting_barrier(tmp_path):
+    slot = tmp_path / 'cycle-001'
+    slot.mkdir(mode=0o700)
+    journal = DurableJournal(slot / 'cycle.jsonl', clock=lambda: 1000)
+    journal.acquire_attempt()
+    try:
+        journal.append('LEVERAGE_UPDATE_INTENT', {
+            'account_index': 11, 'market_id': 7, 'fraction_bps': 4166,
+            'margin_mode': 0, 'source_identity': 'cycle-account-11',
+        })
+        journal.append('LEVERAGE_UPDATE_NOT_SENT', {
+            'account_index': 11, 'market_id': 7, 'fraction_bps': 4166,
+        })
+    finally:
+        journal.release_attempt()
+    clock = AdvancingClock()
+    proof = await resolve_prior(cycle_config(slot, api_key_index=4), RecoveryClient(clock),
+                                tmp_path, clock=clock)
+    assert proof['unresolved_leverage_settings'] == 0
+    assert not (tmp_path / 'recovery-checks.jsonl').exists()
+
+
+@pytest.mark.asyncio
+async def test_two_account_leverage_checkpoint_is_atomic_and_bound_to_each_identity(tmp_path):
+    slot = tmp_path / 'cycle-001'
+    slot.mkdir(mode=0o700)
+    journal = DurableJournal(slot / 'cycle.jsonl', clock=lambda: 1000)
+    journal.acquire_attempt()
+    try:
+        for index, fraction, tx_hash in ((11, 4166, 'aA' * 40), (22, 5000, 'bB' * 40)):
+            journal.append('LEVERAGE_UPDATE_INTENT', {
+                'account_index': index, 'market_id': 7, 'fraction_bps': fraction,
+                'margin_mode': 0, 'source_identity': f'cycle-account-{index}',
+            })
+            journal.append('LEVERAGE_TX_PREPARED', {
+                'account_index': index, 'market_id': 7, 'fraction_bps': fraction,
+                'margin_mode': 0, 'api_key_index': 4, 'tx_type': 20,
+                'nonce': 41, 'tx_hash': tx_hash,
+            })
+    finally:
+        journal.release_attempt()
+
+    class Client(RecoveryClient):
+        second_status = 1
+
+        async def account_snapshot(self, index, market_id):
+            snapshot = await super().account_snapshot(index, market_id)
+            fraction = '41.66' if index == 11 else '50.00'
+            margin = AccountMarginEvidence.from_response(
+                account_index=index, market_id=market_id,
+                source_identity=snapshot.source_identity, observed_at=snapshot.observed_at,
+                selected_position={'margin_mode': 0, 'initial_margin_fraction': fraction},
+                account={},
+            )
+            return replace(snapshot, margin_evidence=margin)
+
+        async def read_leverage_transaction(self, value):
+            index = 11 if value == 'aA' * 40 else 22
+            return {'hash': value, 'type': 20,
+                    'status': 2 if index == 11 else self.second_status,
+                    'account_index': index, 'api_key_index': 4, 'nonce': 41,
+                    'executed_at': 1000, 'committed_at': 1000, 'verified_at': 1000}
+
+        async def read_leverage_next_nonce(self, account_index, api_key_index):
+            return 42
+
+    clock = AdvancingClock()
+    client = Client(clock)
+    config = cycle_config(slot, api_key_index=4)
+    with pytest.raises(PreflightBlocked, match='pending'):
+        await resolve_prior(config, client, tmp_path, clock=clock)
+    assert not (tmp_path / 'recovery-checks.jsonl').exists()
+    client.second_status = 2
+    assert (await resolve_prior(config, client, tmp_path, clock=clock))['unresolved_leverage_settings'] == 0
+    assert (await resolve_prior(config, client, tmp_path, clock=clock))['unresolved_leverage_settings'] == 0
+    checkpoint = tmp_path / 'recovery-checks.jsonl'
+    lines = [json.loads(line) for line in checkpoint.read_text().splitlines()]
+    assert [row['payload']['account_index'] for row in lines] == [11, 22]
+    lines[0]['payload']['original_sha256'] = '0' * 64
+    checkpoint.write_text('\n'.join(json.dumps(row) for row in lines) + '\n')
+    with pytest.raises(PreflightBlocked, match='checkpoint conflicts'):
+        await resolve_prior(config, client, tmp_path, clock=clock)
 
 
 @pytest.mark.asyncio

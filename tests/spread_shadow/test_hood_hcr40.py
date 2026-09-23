@@ -7,7 +7,7 @@ import json
 
 import pytest
 
-from risex_spread_shadow.hood_handoff.contracts import AccountMarginEvidence, MutationReceipt, Outcome, PreflightBlocked
+from risex_spread_shadow.hood_handoff.contracts import AccountMarginEvidence, LeverageNotSent, MutationReceipt, Outcome, PreflightBlocked
 from risex_spread_shadow.hood_handoff.operator_recovery import allocate_close_slot, close_positions, inspect_current
 from risex_spread_shadow.hood_handoff.random_cycle import (
     minimal_sufficient_leverage_fraction, select_random_quantity,
@@ -57,7 +57,8 @@ class LeverageClient(CycleClient):
 
     async def market_metadata(self, market_id):
         return replace(await super().market_metadata(market_id),
-                       minimum_initial_margin_fraction=200, market_margin_mode=0)
+                       minimum_initial_margin_fraction=200, market_margin_mode=0,
+                       mark_price=Decimal('100.1'))
 
     async def account_snapshot(self, account_index, market_id):
         old = await super().account_snapshot(account_index, market_id)
@@ -90,7 +91,9 @@ async def test_quantity_first_then_minimal_fraction_for_unequal_accounts(tmp_pat
                                     clock=clock, rng=FixedRng(40, 20))
     assert result.outcome is Outcome.SUCCESS, result.reason
     assert result.selection.quantity == Decimal("0.40")
-    assert client.settings == [(11, 7, 4995, 0), (22, 7, 5994, 0)]
+    # Independent Decimal budget: 0.40 * 100.1 = 40.04 mark notional;
+    # published all-tier fee ceilings are 0.00012 maker / 0.00035 taker.
+    assert client.settings == [(11, 7, 4993, 0), (22, 7, 5990, 0)]
     assert len(client.submissions) > 0
     rows = [json.loads(line) for line in (tmp_path / "cycle-001" / "cycle.jsonl").read_text().splitlines()]
     assert [row["event"] for row in rows].count("LEVERAGE_UPDATE_CONFIRMED") == 2
@@ -102,8 +105,8 @@ async def test_second_setting_rejection_stops_before_orders_without_rollback(tmp
     result = await run_random_cycle(cycle_config(tmp_path / "cycle-001"), client,
                                     clock=clock, rng=FixedRng(40, 20))
     assert result.outcome is Outcome.FAILED_PREFLIGHT_BLOCKED
-    assert client.settings == [(11, 7, 4995, 0), (22, 7, 5994, 0)]
-    assert client.fractions == {11: 4995, 22: 10000}
+    assert client.settings == [(11, 7, 4993, 0), (22, 7, 5990, 0)]
+    assert client.fractions == {11: 4993, 22: 10000}
     assert not client.submissions
 
 
@@ -115,12 +118,35 @@ async def test_unknown_or_unproved_setting_blocks_next_run_but_allows_close(tmp_
                                     clock=clock, rng=FixedRng(40, 20))
     assert result.outcome is Outcome.UNKNOWN
     assert len(client.settings) == 1 and not client.submissions
-    with pytest.raises(PreflightBlocked, match="leverage setting is unresolved"):
+    with pytest.raises(PreflightBlocked, match="leverage setting lacks provable transaction identity"):
         await inspect_current(cycle_config(tmp_path / "cycle-002"), client, tmp_path,
                               require_flat=True, clock=clock)
     _, _, proof = await inspect_current(cycle_config(tmp_path / "cycle-002"), client, tmp_path,
                                         require_flat=False, clock=clock)
     assert proof["unresolved_leverage_settings"] == 1
+
+
+@pytest.mark.asyncio
+async def test_known_local_leverage_failure_is_journaled_as_no_send_and_next_run_can_check(tmp_path):
+    class LocalFailureClient(LeverageClient):
+        supports_leverage_prepared_intent = True
+
+        async def update_leverage_fraction(self, account_index, market_id, fraction,
+                                           margin_mode=0, *, prepared_intent):
+            self.settings.append((account_index, market_id, fraction, margin_mode))
+            raise LeverageNotSent('synthetic nonce read failed before transport')
+
+    clock = AdvancingClock()
+    client = LocalFailureClient(clock)
+    slot = tmp_path / 'cycle-001'
+    result = await run_random_cycle(cycle_config(slot), client,
+                                    clock=clock, rng=FixedRng(40, 20))
+    assert result.outcome is Outcome.FAILED_PREFLIGHT_BLOCKED
+    assert len(client.settings) == 1 and not client.submissions
+    assert 'LEVERAGE_UPDATE_NOT_SENT' in (slot / 'cycle.jsonl').read_text()
+    _, _, proof = await inspect_current(cycle_config(tmp_path / 'cycle-002'),
+                                        client, tmp_path, require_flat=True, clock=clock)
+    assert proof['unresolved_leverage_settings'] == 0
 
 
 class OccupiedMarginClient(RecoveryClient):

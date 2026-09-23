@@ -130,6 +130,10 @@ class PreflightBlocked(ContractError):
     """A required pre-mutation condition is not proven."""
 
 
+class LeverageNotSent(ContractError):
+    """The leverage adapter proved that transport was never entered."""
+
+
 def _decimal(value: Any, name: str) -> Decimal:
     if isinstance(value, bool):
         raise ContractError(f"{name} must be a finite decimal")
@@ -291,6 +295,7 @@ class MarketMetadata:
     venue: str = ""
     minimum_initial_margin_fraction: int | None = None
     market_margin_mode: int | None = None
+    mark_price: Decimal | None = None
 
     def __post_init__(self) -> None:
         _int(self.market_id, "market_id", minimum=0)
@@ -310,6 +315,8 @@ class MarketMetadata:
             _int(self.minimum_initial_margin_fraction, "minimum_initial_margin_fraction", minimum=1)
         if self.market_margin_mode is not None:
             _int(self.market_margin_mode, "market_margin_mode", minimum=0)
+        if self.mark_price is not None:
+            _positive(self.mark_price, "mark_price")
         market_type = _text(self.market_type, "market_type").lower()
         if market_type != "perp":
             raise ContractError("market_type must be perp")
@@ -368,6 +375,10 @@ class MarketMetadata:
             market_margin_mode=(
                 None if value.get("market_margin_mode") is None
                 else _int(value["market_margin_mode"], "market_margin_mode", minimum=0)
+            ),
+            mark_price=(
+                None if value.get("mark_price") is None
+                else _positive(value["mark_price"], "mark_price")
             ),
         )
 

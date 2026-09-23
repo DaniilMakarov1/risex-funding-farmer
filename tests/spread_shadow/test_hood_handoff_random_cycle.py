@@ -1504,6 +1504,8 @@ async def test_pre_receiver_priority_guard_cancels_zero_fill_and_retries_with_fr
     first_guard_payload = first_guard[0]["payload"]
     assert reason_fragment in first_guard_payload["priority_reason"]
     assert first_guard_payload["request_finished_at"] >= first_guard_payload["request_started_at"]
+    assert first_guard_payload["book_request_finished_at"] >= first_guard_payload["book_request_started_at"]
+    assert first_guard_payload["book_continuity"] == "UNPROVED_REST_SNAPSHOT"
     assert first_guard_payload["local_observed_at"] >= first_guard_payload["request_finished_at"]
     assert first_guard_payload["latency_seconds"] >= 0
     assert first_guard_payload["source_order"]["client_order_index"] == opening_plans[0].client_order_index
@@ -1557,6 +1559,8 @@ async def test_paired_closing_priority_guard_is_symmetric_and_retries_with_new_c
     first_rows = [json.loads(line) for line in (cycle_path / "closing.jsonl").read_text().splitlines()]
     first_guard = [row for row in first_rows if row["event"] == "PRE_RECEIVER_GUARD"]
     assert first_guard and first_guard[0]["payload"]["status"] == "LOST"
+    assert first_guard[0]["payload"]["book_request_finished_at"] >= first_guard[0]["payload"]["book_request_started_at"]
+    assert first_guard[0]["payload"]["book_continuity"] == "UNPROVED_REST_SNAPSHOT"
     assert not [row for row in first_rows if row["event"] == "RECEIVER_DISPATCH_INTENT"]
     second_rows = [
         json.loads(line)
@@ -4811,6 +4815,8 @@ async def test_guard_failure_then_fully_reconciled_source_fill_closes_known_resi
     assert phase.outcome is Outcome.PARTIAL
     assert not phase.receiver.dispatched
     assert phase.unknown_reasons[0].startswith('PAIR_GUARD_')
+    if missing_level:
+        assert phase.priority_guard['visibility_status'] == 'PRIVATE_EXACT_PUBLIC_ABSENT'
     assert not phase.retryable_pair
     assert result.inventory == 'CONFIRMED_FLAT'
     assert client.source_position == client.receiver_position == 0

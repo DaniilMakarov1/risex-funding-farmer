@@ -390,9 +390,14 @@ class HandoffEngine:
         if not callable(method):
             raise ContractError("paired operation client does not expose a public order-book reader")
         started = time.perf_counter()
+        request_started_at = self.clock.now()
         value = await self._bounded(method(config.market_id), "pre-receiver public order-book read")
+        request_finished_at = self.clock.now()
         duration = max(0.0, time.perf_counter() - started)
-        return _coerce_public_book(value, config, self.clock.now()), duration
+        book = _coerce_public_book(value, config, request_finished_at)
+        book["book_request_started_at"] = request_started_at
+        book["book_request_finished_at"] = request_finished_at
+        return book, duration
 
     async def _parallel_pre_receiver_checks(
         self,
@@ -1381,6 +1386,14 @@ class HandoffEngine:
                             "status": source_order.status,
                             "observed_at": source_order.observed_at,
                         }
+                        if (priority_guard.get("source_public_level") is None
+                                and source_order_id is not None
+                                and self._source_exact_resting(source_order, plan.source, source_order_id)):
+                            # Private exact visibility and public absence are
+                            # different evidence from a better-priced rival.
+                            priority_guard["visibility_status"] = "PRIVATE_EXACT_PUBLIC_ABSENT"
+                        elif priority_guard.get("source_public_level") is not None:
+                            priority_guard["visibility_status"] = "PUBLIC_EXACT_PRESENT"
                     priority_guard["source_recheck"] = self._account_observation_payload(source_recheck)
                     priority_guard["receiver_recheck"] = self._account_observation_payload(receiver_recheck)
                     priority_guard["source_recheck_transition"] = source_recheck_transition
@@ -2261,6 +2274,9 @@ class HandoffEngine:
             "source_price": format(plan.source.price, "f"),
             "source_order_id": None if source_order_id is None else str(source_order_id),
             "book_observed_at": None if public_book is None else public_book.get("observed_at"),
+            "book_request_started_at": None if public_book is None else public_book.get("book_request_started_at"),
+            "book_request_finished_at": None if public_book is None else public_book.get("book_request_finished_at"),
+            "book_continuity": "UNPROVED_REST_SNAPSHOT",
             "external_better_price_volume": "0",
             "better_price_evidence": [],
             "same_price_evidence": [],
@@ -2363,6 +2379,9 @@ class HandoffEngine:
             "source_price": format(source_price, "f"),
             "source_order_id": str(source_order_id),
             "book_observed_at": public_book["observed_at"],
+            "book_request_started_at": public_book.get("book_request_started_at"),
+            "book_request_finished_at": public_book.get("book_request_finished_at"),
+            "book_continuity": "UNPROVED_REST_SNAPSHOT",
             "external_better_price_volume": format(better_quantity, "f"),
             "better_price_evidence": better_price,
             "same_price_evidence": same_price,
