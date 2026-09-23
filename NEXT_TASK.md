@@ -8,6 +8,10 @@ Implement structured, secret-safe fresh margin-budget evidence for both accounts
 
 Build a per-attempt timing/evidence-age report from existing fields, distinguishing overlapping local durations, wall-clock observations and venue trade timestamps. Add only missing measurements. Examine a small offline-verified latency optimization only if exact order/account/quantity/priority/freshness proof survives; a Robinhood event stream is unverified and no migration is authorized. Test opening and paired closing, adverse races and margin boundaries, then run one final clean isolated Python 3.11 full suite with pinned SDK after source edits. Self-review the full diff; preserve owner-only versioned evidence outside Git and return a clean committed READY_FOR_REVIEW or an honest partial packet to the auditor task. No new numeric reserve default is accepted by the owner in this assignment.
 
+## Candidate return and remaining decisions
+
+Implementation source commit `0bde5403d48d7b724935a45550364ab5dded1c62` passed 311 relevant focused tests and a clean detached Python 3.11.5 / lighter-sdk 1.1.2 full suite (5145 passed, 3 skipped, two dependency warnings). The separate owner-only `spread-shadow-runs/hood-hcr42-margin-latency-20260923/chief-v1/` packet binds source, original hashes, tests, synthetic reserve options and per-attempt timing. The code records both fresh budgets, reports modeled shortfall, and offers an explicit reserve mechanism that is inactive in the operator path. The measured opening read path is already concurrent; no equivalent faster Robinhood proof was established, so no admission/transport optimization was made. This is READY_FOR_REVIEW, not accepted or deployed. The auditor must review the actual diff and packet. The owner must separately choose any numeric reserve policy and authorize later live validation; exact historical prevention counts, live speed improvement and reciprocal fills remain unproved.
+
 ## Historical HCR-41 release — completed
 
 ## Final release handoff — owner authorization
