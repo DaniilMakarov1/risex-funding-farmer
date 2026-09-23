@@ -1,4 +1,12 @@
-# HCR-42 reserve release — owner-selected opening margin policy
+# HCR-42 controller restart — owner authorization
+
+## Current finite operation
+
+On 2026-09-23 the owner explicitly requested a restart of the Telegram controller after the HCR-42 reserve release was published to remote main at `6d78ad237740a320ac928f7697d0d7a09a6c0882`. This supersedes the earlier no-restart restriction only for one controlled restart and the necessary local checkout/configuration/state-binding transition. The protected operator configuration must receive the already selected exact per-account opening reserve `0.10`/`0.02` quote from the reviewed owner-only proposal. Preserve the existing controller state, command offset, active intent, journals, slots, identities and no-replay barrier; do not clear or replay them. A narrow atomic binding migration may update only the config-derived binding after proving exact old/new config and evidence hashes, with all other state data byte-equivalent. The normal controller startup may perform its existing bounded read-only reconciliation of the preserved active intent. No `/run`, `/close`, order, cancellation, leverage-setting write, inventory adoption, force reset or unrelated account action is authorized by this request.
+
+Before stopping PID 66692, prove no trading child and no operator launch lock holder. Stop it gracefully, verify lock release, fast-forward the clean local runtime main checkout to the verified remote main, apply the exact owner-only operator configuration, migrate its binding without altering other state, and start one controller with the same owner/config/credential boundary. Verify actual Python/import/SDK version, process/locks, config/binding, startup outcome and absence of an automatically launched child. If a child or conflicting writer appears, do not interrupt it; preserve the prepared work and report the concrete obstacle. Record actual steps and hashes in a new owner-only packet. No periodic monitoring or automatic retry campaign.
+
+## Historical HCR-42 reserve release assignment
 
 ## Current finite release assignment
 
