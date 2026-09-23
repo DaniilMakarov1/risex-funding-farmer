@@ -2544,21 +2544,32 @@ class RandomCycleEngine:
                 "fraction_bps": targets[index], "margin_mode": 0,
                 "source_identity": original[index].source_identity,
             })
+            not_sent_recorded = False
+            def record_not_sent():
+                nonlocal not_sent_recorded
+                journal.append("LEVERAGE_UPDATE_NOT_SENT", {
+                    "account_index": index, "market_id": config.market_id,
+                    "fraction_bps": targets[index],
+                })
+                not_sent_recorded = True
             setting_call = (
                 setter(index, config.market_id, targets[index], 0,
-                       prepared_intent=lambda identity: journal.append("LEVERAGE_TX_PREPARED", identity))
+                       prepared_intent=lambda identity: journal.append("LEVERAGE_TX_PREPARED", identity),
+                       cancelled_before_transport=record_not_sent)
                 if getattr(self.client, "supports_leverage_prepared_intent", False)
                 else setter(index, config.market_id, targets[index], 0)
             )
             try:
                 receipt = await self._bounded(setting_call, config, "leverage setting")
             except LeverageNotSent as exc:
-                journal.append("LEVERAGE_UPDATE_NOT_SENT", {
-                    "account_index": index, "market_id": config.market_id,
-                    "fraction_bps": targets[index],
-                })
+                record_not_sent()
                 self._stage = "PREFLIGHT"
                 raise PreflightBlocked(f"account {index} leverage setting was not sent") from exc
+            except TimeoutError as exc:
+                if not_sent_recorded:
+                    self._stage = "PREFLIGHT"
+                    raise PreflightBlocked(f"account {index} leverage setting was not sent") from exc
+                raise
             if not isinstance(receipt, MutationReceipt):
                 raise PreflightBlocked(f"account {index} leverage setting response is undecidable")
             if not receipt.accepted:

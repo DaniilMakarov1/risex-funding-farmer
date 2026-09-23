@@ -1481,6 +1481,7 @@ class LighterSdkClient:
     async def update_leverage_fraction(
         self, account_index: int, market_id: int, fraction: int, margin_mode: int = 0,
         *, prepared_intent: Callable[[Mapping[str, Any]], None] | None = None,
+        cancelled_before_transport: Callable[[], None] | None = None,
     ) -> MutationReceipt:
         """Send one exact cross-margin setting transaction; never retry a send."""
         key_index = self.config.api_key_index
@@ -1521,10 +1522,23 @@ class LighterSdkClient:
                         "margin_mode": margin_mode, "nonce": nonce,
                         "tx_hash": tx_hash, "tx_type": tx_type,
                     })
-                # Once transport starts, an error can no longer prove no send.
-                self._block_nonce(account_index, key_index, nonce)
+            # A synchronous journal callback can request cancellation without
+            # an await at which asyncio would deliver it before sendTx.
+            task = asyncio.current_task()
+            if task is not None and task.cancelling():
+                raise asyncio.CancelledError()
+        except asyncio.CancelledError:
+            # Cancellation in this block has not entered sendTx. Persist that
+            # fact synchronously before propagating the caller's cancellation.
+            if cancelled_before_transport is not None:
+                cancelled_before_transport()
+            raise
         except Exception as exc:
             raise LeverageNotSent("leverage setting failed before transport") from exc
+        # No await separates lock release, nonce block and the one send entry.
+        # A cancellation while releasing the preparation lock is still a
+        # proved no-send and leaves this nonce reusable by the same adapter.
+        self._block_nonce(account_index, key_index, nonce)
         response = await self._bounded(self._send_signed_tx(tx_type, tx_info), deadline, "leverage dispatch")
         code = _response_code(response)
         if code is None or code >= 500:

@@ -132,7 +132,8 @@ async def test_known_local_leverage_failure_is_journaled_as_no_send_and_next_run
         supports_leverage_prepared_intent = True
 
         async def update_leverage_fraction(self, account_index, market_id, fraction,
-                                           margin_mode=0, *, prepared_intent):
+                                           margin_mode=0, *, prepared_intent,
+                                           cancelled_before_transport):
             self.settings.append((account_index, market_id, fraction, margin_mode))
             raise LeverageNotSent('synthetic nonce read failed before transport')
 
