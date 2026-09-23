@@ -192,3 +192,33 @@ def test_collection_gate_rejects_expanded_limits_before_socket(monkeypatch, tmp_
     with pytest.raises(ValueError):
         asyncio.run(collect_once(identity, tmp_path / "events.jsonl", object(),
                                  limits=ObserverLimits(max_frames=15001)))
+
+
+def test_transport_close_records_only_safe_code_not_reason(monkeypatch, tmp_path):
+    from websockets.exceptions import ConnectionClosedError
+    from websockets.frames import Close
+
+    async def fake_tokens(*_):
+        return {27331: "PRIVATE_TOKEN_1", 27337: "PRIVATE_TOKEN_2"}
+
+    class Socket:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_):
+            return None
+
+        async def send(self, _value):
+            return None
+
+        async def recv(self):
+            raise ConnectionClosedError(Close(1009, "PRIVATE_TOKEN_NEVER_SAVE"), None)
+
+    monkeypatch.setattr("risex_spread_shadow.hood_handoff.stream_measurement._auth_tokens", fake_tokens)
+    monkeypatch.setattr("websockets.asyncio.client.connect", lambda *_, **__: Socket())
+    output = tmp_path / "events.jsonl"
+    result = asyncio.run(collect_once(StreamIdentity.from_config(config()), output,
+                                      object(), limits=ObserverLimits(max_seconds=1)))
+    assert result["transport_error_class"] == "connection_closed"
+    assert result["transport_close_code"] == 1009
+    assert "PRIVATE_TOKEN" not in repr(result) + output.read_text()

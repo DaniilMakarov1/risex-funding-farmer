@@ -338,12 +338,12 @@ async def collect_once(identity: StreamIdentity, output: Path, provider: Keychai
             elif isinstance(exc, ConnectionClosed):
                 observer.transport_error_class = "connection_closed"
                 code = getattr(getattr(exc, "rcvd", None), "code", None)
-                if type(code) is int:
+                if isinstance(code, int) and not isinstance(code, bool):
                     observer.transport_close_code = code
             elif isinstance(exc, InvalidStatus):
                 observer.transport_error_class = "handshake_status"
                 code = getattr(getattr(exc, "response", None), "status_code", None)
-                if type(code) is int:
+                if isinstance(code, int) and not isinstance(code, bool):
                     observer.transport_close_code = code
             elif isinstance(exc, OSError):
                 observer.transport_error_class = "socket_error"
@@ -364,8 +364,13 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="One bounded read-only Robinhood BTC stream session")
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--max-seconds", type=float, default=570)
+    parser.add_argument("--max-frames", type=int, default=15000)
+    parser.add_argument("--max-bytes", type=int, default=20 * 1024 * 1024)
     args = parser.parse_args()
     try:
+        limits = ObserverLimits(max_seconds=args.max_seconds, max_frames=args.max_frames,
+                                max_bytes=args.max_bytes)
         if args.config.is_symlink() or not args.config.is_file():
             raise ValueError("protected config unavailable")
         value = json.loads(args.config.read_text())
@@ -379,9 +384,7 @@ def main() -> int:
             identity, identity.accounts,
             prompt=lambda _message: (_ for _ in ()).throw(RuntimeError("keychain record unavailable")))
         try:
-            # Leave time for handshake and close inside the owner's 10-minute cap.
-            summary = asyncio.run(collect_once(identity, args.output, provider,
-                                               limits=ObserverLimits(max_seconds=570)))
+            summary = asyncio.run(collect_once(identity, args.output, provider, limits=limits))
         finally:
             provider.close()
         summary_path = args.output.with_suffix(".summary.json")
