@@ -528,6 +528,30 @@ async def test_constant_api_nonce_has_one_owner_across_prepare_and_cancel(monkey
 
 
 @pytest.mark.asyncio
+async def test_source_nonce_still_stale_after_send_while_receiver_domain_is_independent(monkeypatch):
+    client = _constant_nonce_client(prefix="source-stale-receiver-independent")
+    monkeypatch.setattr(LighterSdkClient, "verify_sdk", staticmethod(lambda: None))
+    client._lighter = lambda: FakeModule
+    source = _sdk_plan(account_index=11)
+    receiver = _sdk_plan(account_index=22, order_type="MARKET", time_in_force="IOC")
+
+    prepared_source = await client.prepare_order(source)
+    assert (await client.submit_prepared_order(source, prepared_source)).accepted
+    prepared_receiver = await client.prepare_order(receiver)
+    assert prepared_receiver.account_index == 22
+    assert client._signers[22].sign_calls[-1]["nonce"] == 41
+
+    # A source cancel reservation attempted before the venue advances this
+    # account/key nonce would reuse the already-sent source-create nonce.
+    cancel = await client.cancel_order(11, 7, "99")
+    assert not cancel.accepted
+    assert cancel.error == "contract_error"
+    assert client._signers[11].cancel_calls == []
+    assert len(client._http.calls) == 1
+    await client.invalidate_prepared_order(prepared_receiver)
+
+
+@pytest.mark.asyncio
 async def test_ambiguous_constant_nonce_blocks_new_preparation(monkeypatch):
     client = _constant_nonce_client(
         prefix="constant-ambiguous",

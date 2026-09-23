@@ -1,5 +1,9 @@
 # Current status
 
+## HCR-43 observer correction — under verification
+
+Auditor v2 rejected chief-v2 HEAD `2280619779a5b9e36cf46aa9b46a32a6d27dee1f` for boolean/float inbound identity and epoch equality and regressing local receipt time. The rejected branch and chief-v2/auditor-v2 packets are preserved. A new isolated branch `codex/spread-v1-hcr43-observer-correction` starts at accepted main `d6ac3aa969dd6789ae7f747a84b3e46402df8fe4` and ports intended HCR-43 changes with strict integer identities/epoch and persistent monotonic receipt chronology. Offline tests, full clean verification and self-review are pending in a separate chief-v3 packet. No live collection, mutation, runtime change or main integration is authorized.
+
 ## HCR-43 offline low-latency candidate — in review
 
 Chief works alone on `codex/spread-v1-hcr43-low-latency` from accepted main `d6ac3aa969dd6789ae7f747a84b3e46402df8fe4`. HCR-43 authority is in the first section of NEXT_TASK. This candidate adds numeric local HTTP mutation and cancellation-stage diagnostics and removes one duplicate exact source lookup after receiver terminal observation before exact residual cancellation. It preserves the source/receiver proof gates and the paired closing route. Focused integration checks passed 209 tests; final clean full suite and self-review are pending at this status checkpoint. No live collection, protected-account read, order, cancellation, runtime change, main integration or publication was performed. Source-to-receiver live improvement, WS superiority, stream admission equivalence and improved mutual matching are NOT_RUN/unproved. The owner-only packet and final commit will bind complete verification results.
