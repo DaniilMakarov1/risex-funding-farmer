@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 
-_EVENT_KINDS = frozenset({"order", "order_conflict", "order_duplicate", "book_gap", "book_unanchored",
+_EVENT_KINDS = frozenset({"book_top", "order", "order_conflict", "order_duplicate", "book_gap", "book_unanchored",
                           "private_orders_snapshot", "transaction", "transaction_subscription"})
 _MILESTONES = frozenset({
     "prepare_done", "send_entered", "ack_parsed", "exact_rest_observed", "exact_ws_observed",
@@ -41,6 +41,23 @@ def _safe_projection(item: Mapping[str, object], context: Mapping[str, object] |
         if type(account) is not int or account < 0:
             return None
         row["account_index"] = account
+    if kind == "book_top":
+        for name in ("bid_price", "bid_quantity", "ask_price", "ask_quantity"):
+            value = item.get(name)
+            if not isinstance(value, str) or len(value) > 40:
+                return None
+            try:
+                parsed = Decimal(value)
+            except InvalidOperation:
+                return None
+            if not parsed.is_finite() or parsed <= 0:
+                return None
+            row[name] = value
+        index = item.get("trace_index")
+        if type(index) is not int or not 1 <= index <= 32:
+            return None
+        row.update(trace_index=index, trace_limit=32, trace_window_seconds=2.0,
+                   identity_or_fifo_proof=False)
     if kind == "transaction":
         tx_hash, status, nonce = item.get("tx_hash"), item.get("transaction_status"), item.get("nonce")
         if (not isinstance(tx_hash, str) or re.fullmatch(r"(?:0x)?[0-9a-fA-F]{8,128}", tx_hash) is None

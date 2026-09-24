@@ -33,6 +33,9 @@ def help_message():
             '<b>Запуск реальной торговли</b>\n'
             '<code>/run</code> — отправить команду на один Mainnet-цикл. '
             'Первый счёт и сторона лимитки выбираются случайно: четыре равновероятных варианта. Объём и время удержания — по текущей конфигурации.\n\n'
+            '<code>/run ws 5</code> — ждать WS, улучшение на 5 тиков.\n'
+            '<code>/run ack 5</code> — MARKET по ACK без ожидания LIMIT; проверка стакана остаётся.\n'
+            'Можно указать 1–5 тиков; параметры действуют только на этот цикл и его парное закрытие.\n\n'
             '<code>/close</code> — проверить оба счёта и закрыть текущие позиции настроенного рынка MARKET reduce-only.\n\n'
             '<i>После ошибки /run заново проверяет счета и старые ордера. '
             'После ручного закрытия постоянной блокировки нет. '
@@ -141,6 +144,10 @@ def saved_message(name, report, *, blocked=False, detailed=False):
     lines = [f'<b>📋 Результат цикла</b> · <code>{text(name, 32)}</code>']
     if report and report.get('binding', {}).get('receiver_admission') == 'ws_confirmed':
         lines.append('Режим: MARKET после WS-подтверждения лимитки. Приоритет перед чужими заявками не гарантирован.')
+    if report and report.get('binding', {}).get('receiver_admission') == 'ack':
+        lines.append('Режим ACK: MARKET без ожидания WS лимитки; наличие LIMIT перед отправкой не гарантировано. Проверка стакана сохранена.')
+    if report and report.get('binding', {}).get('price_improvement_ticks') is not None:
+        lines.append('Улучшение цены: ' + text(report['binding']['price_improvement_ticks'], 8) + ' тиков.')
     if blocked:
         lines.append('<b>⚠️ Прошлый исход требует сверки</b> · /run проверит готовность заново; /close — закрыть остаток.')
     lines.extend(text(line, 500) for line in result_lines(report, detailed=detailed))

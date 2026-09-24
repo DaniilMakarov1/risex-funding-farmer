@@ -56,6 +56,10 @@ class ReadStreamState:
     consumed_hint_versions: dict[tuple[int, int], int] = field(default_factory=dict)
     evidence: StreamEvidenceJournal | None = None
     order_contexts: dict[tuple[int, int], dict[str, object]] = field(default_factory=dict)
+    book_trace_context: dict[str, object] | None = None
+    book_trace_started: float = 0.0
+    book_trace_count: int = 0
+    book_trace_last: tuple | None = None
     _condition: asyncio.Condition = field(default_factory=asyncio.Condition, repr=False)
 
     def __post_init__(self) -> None:
@@ -105,6 +109,11 @@ class ReadStreamState:
             "run_id": run_id, "phase": phase, "role": role,
             **({"attempt_index": attempt_index} if attempt_index is not None else {}),
         }
+        if role == "source":
+            self.book_trace_context = self.order_contexts[(account, client)]
+            self.book_trace_started = time.monotonic()
+            self.book_trace_count = 0
+            self.book_trace_last = None
 
     async def feed(self, raw: bytes, received_at: float) -> list[dict[str, object]]:
         if not self.connected:
@@ -125,6 +134,21 @@ class ReadStreamState:
             kind = item.get("kind")
             if kind in {"book_snapshot", "book_update"}:
                 self.book_received_at = received_at
+                # Bounded changed BBO evidence around placement, never another read.
+                if (self.evidence is not None and self.book_trace_context is not None
+                        and self.book_trace_count < 32
+                        and 0 <= received_at - self.book_trace_started <= 2.0):
+                    book = self.reads.book(received_at, 0.5)
+                    if book is not None and book.bids and book.asks:
+                        best = (str(book.bids[0].price), str(book.bids[0].quantity),
+                                str(book.asks[0].price), str(book.asks[0].quantity))
+                        if best != self.book_trace_last:
+                            self.book_trace_last = best
+                            self.book_trace_count += 1
+                            self.evidence.offer({"kind": "book_top", "epoch": self.observer.epoch,
+                                "received_at": received_at, "bid_price": best[0], "bid_quantity": best[1],
+                                "ask_price": best[2], "ask_quantity": best[3],
+                                "trace_index": self.book_trace_count}, self.book_trace_context)
             elif kind in {"book_gap", "book_unanchored"}:
                 self.book_received_at = None
             elif kind == "private_orders_snapshot":

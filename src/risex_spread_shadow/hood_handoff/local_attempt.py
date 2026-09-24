@@ -981,6 +981,7 @@ def select_automatic_prices(
     book: OrderBookSnapshot | Mapping[str, Any],
     *,
     quantity: Decimal | None = None,
+    price_improvement_ticks: int | None = None,
     now: float | None = None,
     freshness_seconds: float = DEFAULT_FRESHNESS_SECONDS,
 ) -> AutomaticPriceProposal:
@@ -991,7 +992,8 @@ def select_automatic_prices(
     raised by one tick when that remains strictly below the best ask.  If the
     one-tick candidate would cross the opposite side, the original best quote
     is retained.  The receiver bound is always exactly the selected source
-    price.
+    price. An explicit price_improvement_ticks (1..5) instead requires that exact
+    offset and refuses a narrow spread; only omitted legacy configuration falls back.
     """
 
     try:
@@ -1019,14 +1021,19 @@ def select_automatic_prices(
     best_bid = current_book.bids[0].price
     best_ask = current_book.asks[0].price
     tick = Decimal(1).scaleb(-current.price_decimals)
+    if price_improvement_ticks is not None and (type(price_improvement_ticks) is not int or not 1 <= price_improvement_ticks <= 5):
+        raise LocalAttemptInputError("price_improvement_ticks must be an integer from 1 to 5")
+    offset = (1 if price_improvement_ticks is None else price_improvement_ticks) * tick
     if parsed_direction is Direction.LONG:
-        candidate = best_ask - tick
+        candidate = best_ask - offset
         selected = candidate if candidate > best_bid else best_ask
         used_tick = selected == candidate
     else:
-        candidate = best_bid + tick
+        candidate = best_bid + offset
         selected = candidate if candidate < best_ask else best_bid
         used_tick = selected == candidate
+    if price_improvement_ticks is not None and not used_tick:
+        raise ContractError("PRICE_OFFSET_NO_ROOM: spread cannot fit the requested tick improvement")
     # Validate the final choice explicitly even when the fallback best quote
     # was selected.  No guessed/off-grid fallback is accepted.
     decimal_to_integer(selected, current.price_decimals, "automatic source_limit_price")

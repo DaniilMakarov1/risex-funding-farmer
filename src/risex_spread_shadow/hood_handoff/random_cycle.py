@@ -329,13 +329,18 @@ class RandomCycleConfig:
     max_quote_age_seconds: float | None = None
     max_source_to_receiver_seconds: float | None = None
     receiver_admission: str = "strict"
+    price_improvement_ticks: int | None = None
     margin_reserve: OpeningMarginReserve | None = None
     confirmed_pilot: bool = False
     pilot_allow_leverage_update: bool = False
 
     def __post_init__(self) -> None:
-        if self.receiver_admission not in ("strict", "ws_confirmed"):
-            raise ContractError("receiver_admission must be strict or ws_confirmed")
+        if self.price_improvement_ticks is not None:
+            _int(self.price_improvement_ticks, "price_improvement_ticks", minimum=1)
+            if self.price_improvement_ticks > 5:
+                raise ContractError("price_improvement_ticks must be between 1 and 5")
+        if self.receiver_admission not in ("strict", "ws_confirmed", "ack"):
+            raise ContractError("receiver_admission must be strict, ws_confirmed or ack")
         object.__setattr__(self, "market_id", _int(self.market_id, "market_id"))
         object.__setattr__(self, "market_symbol", _text(self.market_symbol, "market_symbol").upper())
         try:
@@ -469,6 +474,7 @@ class RandomCycleConfig:
             "max_poll_count": self.max_poll_count,
             "source_order_lifetime_seconds": self.source_order_lifetime_seconds,
             "defer_incremental_margin_calculation": self.defer_incremental_margin_calculation,
+            **({"price_improvement_ticks": self.price_improvement_ticks} if self.price_improvement_ticks is not None else {}),
             **({"receiver_admission": self.receiver_admission} if self.receiver_admission != "strict" else {}),
             **({"confirmed_pilot": True} if self.confirmed_pilot else {}),
             **({"pilot_allow_leverage_update": True} if self.pilot_allow_leverage_update else {}),
@@ -2298,6 +2304,7 @@ class RandomCycleEngine:
             book,
             now=now,
             freshness_seconds=config.freshness_seconds,
+            price_improvement_ticks=config.price_improvement_ticks,
         )
         bounds = compute_quantity_bounds(metadata, source, receiver, proposal.source_limit_price,
                                          receiver_bound=proposal.receiver_worst_price, direction=config.direction,
@@ -3102,7 +3109,11 @@ class RandomCycleEngine:
         # late quote cannot make an older account snapshot silently admissible.
         _validate_account_fresh(config, source, "source", now)
         _validate_account_fresh(config, receiver, "receiver", now)
-        proposal = select_automatic_prices(config.direction, metadata, book, now=now, freshness_seconds=config.freshness_seconds)
+        proposal = select_automatic_prices(
+            config.direction, metadata, book, now=now,
+            freshness_seconds=config.freshness_seconds,
+            price_improvement_ticks=config.price_improvement_ticks,
+        )
         # Record both independent budgets before any one leg's margin result
         # can suppress the other. These are quote-currency planning bounds,
         # never observed execution fees or an admission guarantee from venue.
@@ -3445,6 +3456,7 @@ class RandomCycleEngine:
                         quantity=paired_quantity,
                         now=now,
                         freshness_seconds=config.freshness_seconds,
+                        price_improvement_ticks=config.price_improvement_ticks,
                     )
                     if config.confirmed_pilot:
                         self._pilot_notional_guard(paired_quantity, proposal.source_limit_price,

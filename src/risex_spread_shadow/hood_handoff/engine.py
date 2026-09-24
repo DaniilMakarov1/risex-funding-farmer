@@ -1044,9 +1044,10 @@ class HandoffEngine:
             self._stream_milestone("prepare_done", plan.receiver)
         if config.max_quote_age_seconds is not None and self.clock.now() - config.source_quote_observed_at > config.max_quote_age_seconds:
             unknown_reasons.append("source quote latency budget expired before dispatch")
-        ws_confirmed = paired_mode and config.receiver_admission == "ws_confirmed"
+        ack_admission = paired_mode and config.receiver_admission == "ack"
+        stream_admission = paired_mode and config.receiver_admission in ("ws_confirmed", "ack")
         ws_anchor = None
-        if ws_confirmed and not unknown_reasons:
+        if stream_admission and not unknown_reasons:
             try:
                 if not prepared_dispatch_enabled:
                     raise PreflightBlocked("WS admission requires both orders prepared before LIMIT")
@@ -1119,12 +1120,12 @@ class HandoffEngine:
             await self._invalidate_prepared(prepared_receiver)
 
         latency.update(_prepared_timing_values(prepared_source, "source"))
-        if source_receipt is not None:
+        if source_receipt is not None and not ack_admission:
             if not source_receipt.accepted:
                 unknown_reasons.append("source dispatch was rejected")
             source_visibility_started = time.perf_counter()
             try:
-                if ws_confirmed and source_receipt.accepted:
+                if stream_admission and source_receipt.accepted:
                     # No REST race or account/book reads in this admission mode.
                     source_order = await asyncio.wait_for(
                         self.client.wait_order_observation(
@@ -1158,7 +1159,7 @@ class HandoffEngine:
                     )
             except Exception as exc:
                 unknown_reasons.append(
-                    ("WS_ADMISSION_STOP: source observation unavailable: " if ws_confirmed
+                    ("WS_ADMISSION_STOP: source observation unavailable: " if stream_admission
                      else "pre-receiver state is unresolved: ") + sanitize_exception(exc)
                 )
             latency["source_visibility_seconds"] = max(0.0, time.perf_counter() - source_visibility_started)
@@ -1178,7 +1179,7 @@ class HandoffEngine:
                                 plan.source.client_order_index, source_order_id)
                 self._start_cancel_preparation(plan.source, source_order)
             if source_order is None:
-                unknown_reasons.append("WS_ADMISSION_STOP: source event absent" if ws_confirmed
+                unknown_reasons.append("WS_ADMISSION_STOP: source event absent" if stream_admission
                                        else "source order identity or status is unresolved")
             elif not self._order_matches(source_order, plan.source):
                 unknown_reasons.append("source order identity/parameters conflict with plan")
@@ -1224,19 +1225,28 @@ class HandoffEngine:
                     expected_order_id=source_order_id,
                 )
 
-        if ws_confirmed and not unknown_reasons and source_order is not None:
+        if ack_admission and source_receipt is not None:
+            source_order_id = source_receipt.order_id
+        if ack_admission and (source_receipt is None or not source_receipt.accepted
+                              or type(source_receipt.response_code) is not int or source_receipt.response_code != 200
+                              or source_receipt.error is not None):
+            unknown_reasons.append("ACK_ADMISSION_STOP: positive application ACK is not proved")
+        if stream_admission and not unknown_reasons and (source_order is not None or ack_admission):
             local_started = time.perf_counter()
             guard_request_started_at = self.clock.now()
             ws_evidence: dict[str, Any] = {}
             try:
                 source_order, local_book = self.client.ws_admission_view(ws_anchor, plan.source, source_order_id)
-                if source_order is None:
+                if source_order is None and not ack_admission:
                     raise PreflightBlocked("exact source event is missing/stale")
-                ws_evidence["source_order"] = self._order_observation_payload(source_order)
-                if not self._source_exact_resting(source_order, plan.source, source_order_id):
-                    raise PreflightBlocked("exact source is no longer fully resting")
-                if source_order.observed_at < source_dispatch_intent_at:
-                    raise PreflightBlocked("source observation predates dispatch")
+                if source_order is not None:
+                    ws_evidence["source_order"] = self._order_observation_payload(source_order)
+                    if not self._source_exact_resting(source_order, plan.source, source_order_id):
+                        raise PreflightBlocked("exact source is no longer fully resting")
+                    if source_order.observed_at < source_dispatch_intent_at:
+                        raise PreflightBlocked("source observation predates dispatch")
+                    source_order_id = source_order.order_id
+                ws_evidence["source_resting_confirmed"] = source_order is not None
                 now = self.clock.now()
                 if not all(self._snapshot_fresh(value, now, config.freshness_seconds) for value in (source, receiver)):
                     raise PreflightBlocked("pre-LIMIT account evidence expired")
@@ -1255,20 +1265,20 @@ class HandoffEngine:
                 if ws_reason is not None:
                     raise PreflightBlocked(ws_reason)
                 # The book is anonymous. This deliberately does not claim FIFO proof.
-                priority_guard = {"status": "WS_CONFIRMED", "priority_status": "UNPROVED",
-                                  "receiver_admission": "ws_confirmed", "priority_proof_admitted": False,
-                                  "priority_reason": "exact private source + fresh L2 veto; owner/FIFO not proved",
-                                  "source_order": self._order_observation_payload(source_order),
+                priority_guard = {"status": "ACK_ADMITTED" if ack_admission else "WS_CONFIRMED", "priority_status": "UNPROVED",
+                                  "receiver_admission": config.receiver_admission, "priority_proof_admitted": False,
+                                  "priority_reason": ("positive ACK + local L2 veto; source may be absent; owner/FIFO not proved" if ack_admission
+                                                      else "exact private source + fresh L2 veto; owner/FIFO not proved"),
                                   "source_account": self._account_observation_payload(source),
                                   "receiver_account": self._account_observation_payload(receiver),
                                   **ws_evidence,
                                   "account_evidence_basis": "pre-LIMIT snapshots"}
-                receiver_mutation_observations = (source, receiver, source_order, public_book, plan.metadata_observed_at)
+                receiver_mutation_observations = tuple(value for value in (source, receiver, source_order, public_book, plan.metadata_observed_at) if value is not None)
             except Exception as exc:
                 reason = str(exc) if isinstance(exc, PreflightBlocked) else sanitize_exception(exc)
                 unknown_reasons.append(f"WS_ADMISSION_STOP: {reason}")
-                priority_guard = {"status": "WS_REFUSED", "priority_status": "UNPROVED",
-                                  "receiver_admission": "ws_confirmed", "priority_proof_admitted": False,
+                priority_guard = {"status": "ACK_REFUSED" if ack_admission else "WS_REFUSED", "priority_status": "UNPROVED",
+                                  "receiver_admission": config.receiver_admission, "priority_proof_admitted": False,
                                   "priority_reason": unknown_reasons[-1], **ws_evidence}
             latency["source_to_receiver_decision_seconds"] = max(0.0, self.clock.now() - source_dispatch_intent_at)
             latency["pre_receiver_checks_seconds"] = time.perf_counter() - local_started
@@ -1280,12 +1290,13 @@ class HandoffEngine:
             self._stream_milestone("admission_decision", plan.source, source_order_id)
             guard_event_recorded = True
 
-        # A missing/rejected/partially-filled source can never authorize B.
+        # Strict admission requires a resting source; experimental ACK admission
+        # above may proceed without publication, but never against a known adverse event.
         # Account and public-book reads are independent, so they share one
         # bounded pre-receiver window.  The exact source lookup remains after
         # both reads and immediately before the guard decision.
         if (
-            not ws_confirmed
+            not stream_admission
             and not unknown_reasons
             and source_order is not None
             and self._source_is_resting(source_order, plan.source)
@@ -1833,6 +1844,14 @@ class HandoffEngine:
             elif not receiver_order.terminal:
                 unknown_reasons.append("receiver IOC did not prove terminal status")
 
+        # ACK can dispatch B without an A observation. Resolve exact A afterwards,
+        # including late publication/rejection; never leave a resting A just because
+        # admission deliberately skipped its first observation.
+        if ack_admission and source_order is None and source_dispatch_attempted:
+            source_order = await self._poll_order(plan.source, source_receipt.order_id if source_receipt else None,
+                                                  journal, run_id, require_terminal=False)
+            if source_order is not None:
+                source_order_id = source_order.order_id
         # Once B is terminal or uncertain, cancel only this identified A order.
         if source_order is not None:
             try:
@@ -2704,8 +2723,8 @@ class HandoffEngine:
         if priority_guard is None:
             return False
         ws_liquidity_veto = (
-            priority_guard.get("status") == "WS_REFUSED"
-            and priority_guard.get("receiver_admission") == "ws_confirmed"
+            (priority_guard.get("status"), priority_guard.get("receiver_admission"))
+            in {("WS_REFUSED", "ws_confirmed"), ("ACK_REFUSED", "ack")}
             and priority_guard.get("ws_l2_status") in {"BETTER_PRICE", "SAME_PRICE_EXTRA_VOLUME"}
         )
         if priority_guard.get("status") not in {"LOST", "UNKNOWN"} and not ws_liquidity_veto:

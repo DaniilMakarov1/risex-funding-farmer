@@ -152,6 +152,8 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="emit only machine-readable offline report JSON",
     )
+    parser.add_argument("--receiver-admission", choices=("ws_confirmed", "ack"), help="simple: MARKET after exact WS or experimental positive ACK")
+    parser.add_argument("--price-improvement-ticks", type=int, choices=range(1, 6), help="simple: exact improvement, skip when spread is too narrow")
     parser.add_argument("--config", type=Path, help="JSON operator configuration; all numerical bounds are required")
     parser.add_argument("--market-evidence", type=Path, help="JSON current orderBookDetails/fee/margin evidence")
     parser.add_argument("--source-account-index", type=int)
@@ -860,6 +862,9 @@ def _print_simple_summary(
     print(f"\n══ НОВЫЙ ЦИКЛ · {symbol} · Robinhood Chain Mainnet ══")
     print(f"Один реальный Robinhood Chain Mainnet цикл: {symbol}; первый счёт и сторона лимитки случайны.")
     print(f"Счета: {source} и {receiver}; каждый может первым выставить BUY или SELL (четыре равновероятных варианта).")
+    print(f"Улучшение цены: {value.get('price_improvement_ticks', '1 (старое правило)')} тиков.")
+    if value.get("receiver_admission") == "ack":
+        print("Режим ACK: MARKET без ожидания WS лимитки; LIMIT может отсутствовать или уже исполниться. Проверка стакана сохранена.")
     if value.get("receiver_admission") == "ws_confirmed":
         print("Режим: MARKET после WS-подтверждения лимитки; приоритет перед чужими заявками не гарантирован.")
     print("Для запуска требуется резерв на каждом счёте: 0.10 при выборе объёма и плеча, 0.02 перед ордерами (валюта баланса).")
@@ -1412,6 +1417,10 @@ async def _run_simple(args: argparse.Namespace) -> int:
         raise SystemExit("simple launcher accepts its single Enter confirmation instead of execution flags")
     config_path = _simple_config_path(args.config)
     value = _load_json(config_path, "simple launcher configuration")
+    for name in ("receiver_admission", "price_improvement_ticks"):
+        override = getattr(args, name, None)
+        if override is not None:
+            value[name] = override
     operator_dir = _simple_operator_dir(config_path)
     _print_simple_summary(
         value,
@@ -1937,6 +1946,8 @@ async def _run_readiness(args: argparse.Namespace) -> int:
 
 
 async def _run(args: argparse.Namespace) -> int:
+    if args.run != "simple" and any(getattr(args, name, None) is not None for name in ("receiver_admission", "price_improvement_ticks")):
+        raise SystemExit("admission/tick overrides are supported only by simple")
     if args.run in {"report", "offline-report"}:
         return await _run_offline_report(args)
     if args.run == "simple":

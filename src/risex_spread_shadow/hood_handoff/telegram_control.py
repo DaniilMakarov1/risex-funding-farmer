@@ -316,7 +316,8 @@ class Controller:
     async def run_one(self, action='run'):
         notices = asyncio.create_task(self.lifecycle_notices())
         try:
-            await (self.close() if action == 'close' else self.launch())
+            options = (self.store.data.get('active') or {}).get('launch_options', {})
+            await (self.close() if action == 'close' else self.launch(**options))
             self.finish()
         except Exception:
             self.store.data['last'] = {'status': 'BLOCKED', 'cycle': None}
@@ -340,7 +341,7 @@ class Controller:
         self.store.save()
         return True
 
-    async def admit(self, action, uid):
+    async def admit(self, action, uid, launch_options=None):
         self._checking = True
         try:
             if self.recovery is not None:
@@ -349,6 +350,8 @@ class Controller:
                 await self.notify(views.blocked_message())
                 return
             self.store.data['active'] = {'before': self.slots(action), 'update_id': uid, 'action': action}
+            if launch_options:
+                self.store.data['active']['launch_options'] = dict(launch_options)
             self.store.save()
         except Exception as exc:
             from .contracts import PreflightBlocked
@@ -390,6 +393,14 @@ class Controller:
         if not integer(date) or date < self.started or not 0 <= self.now() - date <= 120:
             return
         command = message.get('text')
+        launch_options = {}
+        if isinstance(command, str):
+            match = re.fullmatch(r'/run (ws|ack)(?: ([1-5]))?', command)
+            if match:
+                launch_options['receiver_admission'] = 'ws_confirmed' if match[1] == 'ws' else 'ack'
+                if match[2]:
+                    launch_options['price_improvement_ticks'] = int(match[2])
+                command = '/run'
         if command in ('/start', '/help'):
             await self.notify(views.help_message())
         elif command in ('/status', '/report'):
@@ -413,8 +424,18 @@ class Controller:
                 return
             self._runner_finished = False
             self._checking = True
-            self.task = asyncio.create_task(self.admit(command[1:], uid))
-            await self.notify(views.accepted_message(uid))
+            self.task = asyncio.create_task(self.admit(command[1:], uid, launch_options))
+            try:
+                selected = json.loads(self.config.read_text())
+                selected.update(launch_options)
+                mode = selected.get('receiver_admission', 'strict')
+                ticks = selected.get('price_improvement_ticks', '1 (старое правило)')
+                details = f"\nРежим: {mode}; улучшение цены: {ticks} тиков."
+                if mode == 'ack':
+                    details += " MARKET без ожидания WS лимитки; её наличие не подтверждено. Проверка стакана сохранена."
+            except Exception:
+                details = ''
+            await self.notify(views.accepted_message(uid) + (details if command == '/run' else ''))
         elif isinstance(command, str):
             await self.notify(views.unknown_message())
 
@@ -431,7 +452,7 @@ async def serve(args, store, lock_fd, token):
     evidence = _simple_evidence_path(_load_json(config, "controller config"), config.parent, None)
     initial_evidence = evidence.read_bytes()
 
-    async def launch(action='simple'):
+    async def launch(action='simple', *, receiver_admission=None, price_improvement_ticks=None):
         if config.read_bytes() != initial_config or evidence.read_bytes() != initial_evidence:
             raise RuntimeError('configuration changed; restart controller after local review')
         # Fixed executable/arguments, no shell and no user-supplied command text.
@@ -440,9 +461,18 @@ async def serve(args, store, lock_fd, token):
         env.pop('RISEX_HOOD_CONFIG', None)
         env['PYTHONPATH'] = str(root / 'src')
         env['RISEX_HOOD_OPERATOR_INTERFACE'] = 'telegram'
+        flags = []
+        if receiver_admission is not None:
+            if receiver_admission not in ('ws_confirmed', 'ack'):
+                raise RuntimeError('invalid receiver admission override')
+            flags += ['--receiver-admission', receiver_admission]
+        if price_improvement_ticks is not None:
+            if type(price_improvement_ticks) is not int or not 1 <= price_improvement_ticks <= 5:
+                raise RuntimeError('invalid tick override')
+            flags += ['--price-improvement-ticks', str(price_improvement_ticks)]
         process = await asyncio.create_subprocess_exec(
             str(python), '-m', 'risex_spread_shadow.hood_handoff.cli', action,
-            '--keychain', '--no-progress', '--config', str(config), cwd=str(root), env=env,
+            '--keychain', '--no-progress', '--config', str(config), *flags, cwd=str(root), env=env,
             stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.DEVNULL, start_new_session=True, pass_fds=(lock_fd,))
         # The owner's /run is the launcher confirmation. No credential bytes

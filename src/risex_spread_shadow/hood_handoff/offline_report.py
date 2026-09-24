@@ -108,7 +108,7 @@ _PROJECTED_KEYS = frozenset(
         "priority_guard",
         "ws_l2_status", "source_price", "source_quantity", "best_price", "best_quantity",
         "book_observed_at", "book_age_seconds",
-        "receiver_admission",
+        "receiver_admission", "price_improvement_ticks", "source_resting_confirmed",
         "account_evidence_basis",
         "priority_proof_admitted",
         "priority_reason",

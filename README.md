@@ -1,3 +1,11 @@
+## Price and receiver timing switches
+
+The configured default is shown before each cycle. Telegram: `/run ws 5` waits for exact private LIMIT state and improves price by five ticks; `/run ack 5` sends MARKET after a positive application ACK, without waiting for that state. `/run ws 1` and `/run ack 1` compare one tick. The tick argument is optional (uses configuration); overrides apply to this cycle and its paired closing only. `/run` uses saved defaults. These commands initiate real trading; `/close` retains its separate reduce-only behavior.
+
+Terminal: append `--receiver-admission ack --price-improvement-ticks 5` to the existing `python -m risex_spread_shadow.hood_handoff.cli simple --keychain --config ...` command; use `ws_confirmed` to restore the wait. JSON fields are `receiver_admission` and `price_improvement_ticks`. No restart is needed for per-run overrides; manual file edits still require the existing controller restart/binding procedure.
+
+ACK mode still checks the locally cached public book and known adverse private events. It does not prove LIMIT acceptance into the book: MARKET may fill externally while LIMIT is absent, rejected or already filled. Five ticks cannot cross the spread; insufficient room produces PRICE_OFFSET_NO_ROOM instead of quietly changing the offset. Normal recovery/reconciliation remains mandatory and may report unresolved residual inventory. Inspect /report and /accounts; no speed or own-fill improvement is promised before real measurements. A bounded `book_top` trace in stream-events.jsonl records up to32 changed best-price/volume snapshots for2s per source binding.
+
 ## Closing connection warmup
 
 Paired closing automatically warms its existing HTTP send pool with one public read during mandatory revalidation, before choosing the final quote. It adds no periodic background activity or order. Failure or an unfinished warmup does not block closing; reconnect remains possible if the peer closes the connection. CLOSING_PLAN_READY.http_warmup records its result. This moves potential connection setup before source exposure; it does not guarantee faster matching after a LIMIT rests. ACK-only MARKET dispatch is not enabled.
