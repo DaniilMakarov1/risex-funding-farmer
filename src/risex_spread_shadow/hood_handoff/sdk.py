@@ -658,6 +658,16 @@ class LighterSdkClient:
             return False
         return await state.wait_terminal_hint(account, client, order_id, timeout)
 
+    async def wait_order_observation(self, account: int, market: int, client: int,
+                                     order_id: str | None, timeout: float, *, terminal_only: bool):
+        state = self._read_stream_state
+        if state is None or not state.connected:
+            return None
+        await state.wait_order_observation(account, market, client, order_id, timeout,
+                                           terminal_only=terminal_only)
+        # Revalidate connection and cache after waking; never return a detached state.
+        return self.observed_order(account, market, client, order_id, terminal_only=terminal_only)
+
     def read_stream_ready(self) -> bool:
         state, task = self._read_stream_state, self._read_stream_task
         return bool(state is not None and task is not None and not task.done()
@@ -1953,8 +1963,13 @@ class LighterSdkClient:
             diagnostic_timings=timings,
         )
 
+    async def reserve_cancel_nonce(self, account_index: int) -> ReservedNonce:
+        """Read/reserve after accepted source ACK, before its exact ID is visible."""
+        return await self.reserve_order_nonce(account_index, deadline=time.monotonic() + min(
+            self.config.request_timeout_seconds, self.config.freshness_seconds))
+
     async def prepare_cancel_order(self, account_index: int, market_id: int,
-                                   order_id: str) -> PreparedMutation:
+                                   order_id: str, *, reserved_nonce: ReservedNonce | None = None) -> PreparedMutation:
         """Sign one identified cancel before the final exact-order decision.
 
         This reserves the source account/key nonce in the same registry as
@@ -1973,9 +1988,16 @@ class LighterSdkClient:
         async with self._preparation_lock_for(account_index, key):
             signer = self._signer(account_index)
             nonce_started = time.perf_counter()
-            nonce = await self._next_nonce(signer, key, deadline=deadline)
+            if reserved_nonce is None:
+                nonce = await self._next_nonce(signer, key, deadline=deadline)
+                self._assert_nonce_available(account_index, key, nonce)
+            else:
+                if (not self._owns_nonce(reserved_nonce) or reserved_nonce.account_index != account_index
+                        or reserved_nonce.api_key_index != key or time.monotonic() >= reserved_nonce.deadline):
+                    raise ContractError("cancel nonce reservation is invalid or expired")
+                deadline = min(deadline, reserved_nonce.deadline)
+                nonce = reserved_nonce._nonce
             nonce_finished = time.perf_counter()
-            self._assert_nonce_available(account_index, key, nonce)
             signer_type = type(signer)
             result = await self._bounded(
                 _await(signer.sign_cancel_order(
@@ -2003,6 +2025,11 @@ class LighterSdkClient:
                     "cancel_signing_seconds": signed_at - nonce_finished,
                 },
             )
+            if reserved_nonce is not None:
+                self._nonce_reservations.pop(self._nonce_key(account_index, key, nonce))
+                object.__setattr__(reserved_nonce, "_state", "CONSUMED")
+                prepared.diagnostic_timings["cancel_nonce_reserved_before_visibility"] = 1.0
+                prepared.diagnostic_timings["cancel_nonce_reservation_seconds"] = reserved_nonce.diagnostic_timings["nonce_acquisition_seconds"]
             self._register_prepared(prepared)
             return prepared
 

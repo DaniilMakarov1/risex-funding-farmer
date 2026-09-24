@@ -377,6 +377,7 @@ class HandoffEngine:
         self._preflight_context: HandoffPreflightContext | None = None
         self._source_dispatch_monotonic: float | None = None
         self._cancel_preparation_task: asyncio.Task[Any] | None = None
+        self._cancel_nonce_task: asyncio.Task | None = None
         self._prepared_cancel: Any | None = None
         self._cancel_preparation_order_id: str | None = None
 
@@ -385,6 +386,11 @@ class HandoffEngine:
         record = getattr(self.client, "record_read_stream_milestone", None)
         if callable(record):
             record(name, plan.account_index, plan.client_order_index, order_id)
+
+    def _start_cancel_nonce(self, plan: OrderPlan) -> None:
+        reserve = getattr(self.client, "reserve_cancel_nonce", None)
+        if callable(reserve) and self._cancel_nonce_task is None:
+            self._cancel_nonce_task = asyncio.create_task(reserve(plan.account_index))
 
     def _start_cancel_preparation(self, plan: OrderPlan, order: OrderSnapshot) -> None:
         prepare = getattr(self.client, "prepare_cancel_order", None)
@@ -396,7 +402,23 @@ class HandoffEngine:
             return
         self._cancel_preparation_order_id = order.order_id
         async def prepare_and_record():
-            prepared = await prepare(plan.account_index, plan.market_id, order.order_id)
+            nonce = None
+            if self._cancel_nonce_task is not None:
+                try:
+                    nonce = await self._cancel_nonce_task
+                except Exception:
+                    pass  # Read-only reservation failed; normal exact preparation remains available.
+            if nonce is None:
+                prepared = await prepare(plan.account_index, plan.market_id, order.order_id)
+            else:
+                try:
+                    prepared = await prepare(plan.account_index, plan.market_id, order.order_id,
+                                             reserved_nonce=nonce)
+                except BaseException:
+                    # Success transfers nonce ownership to the prepared mutation.
+                    # Failure leaves an unsent reservation that must be released.
+                    await self.client.invalidate_reserved_nonce(nonce)
+                    raise
             self._stream_milestone("cancel_prepare_done", plan, order.order_id)
             return prepared
         self._cancel_preparation_task = asyncio.create_task(prepare_and_record())
@@ -415,6 +437,14 @@ class HandoffEngine:
         invalidate = getattr(self.client, "invalidate_prepared_order", None)
         if prepared is not None and callable(invalidate):
             await invalidate(prepared)
+        nonce_task, self._cancel_nonce_task = self._cancel_nonce_task, None
+        if nonce_task is not None:
+            if not nonce_task.done():
+                nonce_task.cancel()
+            values = await asyncio.gather(nonce_task, return_exceptions=True)
+            release = getattr(self.client, "invalidate_reserved_nonce", None)
+            if values and not isinstance(values[0], BaseException) and callable(release):
+                await release(values[0])
 
     async def _read_public_book(
         self,
@@ -1054,6 +1084,8 @@ class HandoffEngine:
                 source_dispatch_ack_at = self.clock.now()
                 self._stream_milestone("ack_parsed", plan.source, source_receipt.order_id)
                 latency["source_dispatch_ack_at"] = source_dispatch_ack_at
+                if source_receipt.accepted:
+                    self._start_cancel_nonce(plan.source)
                 journal.append(
                     "SOURCE_DISPATCH_RESULT",
                     {
@@ -1323,7 +1355,11 @@ class HandoffEngine:
                     and not source_active_order_was_consumed_by_fill
                     and source_recheck_transition != "TEMPORALLY_SKEWED_EXACT_SOURCE_FILL"
                 ):
-                    unknown_reasons.append("source recheck contains an additional or conflicting active order")
+                    unknown_reasons.append(
+                        "source active order absent in pre-receiver account snapshot"
+                        if source_recheck_transition == "NO_ACTIVE_ORDER"
+                        else "source recheck contains an additional or conflicting active order"
+                    )
                 if receiver_recheck.signed_position != receiver.signed_position:
                     unknown_reasons.append("receiver position changed before receiver dispatch")
                 if not receiver_recheck.authorized or not receiver_recheck.ready:
@@ -2101,6 +2137,48 @@ class HandoffEngine:
         )
         return plan, source, receiver
 
+    async def _race_order_observation(self, plan: OrderPlan, order_id: str | None,
+                                      *, require_terminal: bool) -> OrderSnapshot | None:
+        wait = getattr(self.client, "wait_order_observation", None)
+        if not callable(wait):
+            return await self._lookup_order(plan, order_id, client_order_index=plan.client_order_index)
+        rest = asyncio.create_task(self._lookup_order(plan, order_id, client_order_index=plan.client_order_index))
+        stream = asyncio.create_task(wait(plan.account_index, plan.market_id, plan.client_order_index,
+                                          order_id, self._order_timeout, terminal_only=require_terminal))
+        tasks = {rest, stream}
+        try:
+            while tasks:
+                done, tasks = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+                # A completed conflicting REST identity must not be hidden by a WS winner.
+                if rest in done and not rest.cancelled() and rest.exception() is None:
+                    rest_value = rest.result()
+                    if rest_value is not None and (not self._order_matches(rest_value, plan) or (
+                        order_id is not None and rest_value.order_id != str(order_id)
+                    )):
+                        return rest_value
+                # Prefer a valid exact stream event when both complete in one turn.
+                for task in sorted(done, key=lambda t: t is rest):
+                    try:
+                        result = task.result()
+                    except Exception:
+                        if task is rest and not tasks:
+                            raise
+                        continue
+                    if result is not None and self._order_matches(result, plan) and (
+                        order_id is None or result.order_id == str(order_id)
+                    ) and self._time_fresh(result.observed_at, self.clock.now(), self._configured_freshness) and (
+                        result.terminal or (not require_terminal and result.active)
+                    ):
+                        return result
+                    if task is rest and result is not None:
+                        return result  # Preserve existing caller checks for conflicting REST evidence.
+            return None
+        finally:
+            for task in (rest, stream):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(rest, stream, return_exceptions=True)
+
     async def _poll_order(
         self,
         plan: OrderPlan,
@@ -2120,7 +2198,7 @@ class HandoffEngine:
                                   order_id, terminal_only=require_terminal)
                          if callable(observed) else None)
                 if order is None:
-                    order = await self._lookup_order(plan, order_id, client_order_index=plan.client_order_index)
+                    order = await self._race_order_observation(plan, order_id, require_terminal=require_terminal)
             except Exception as exc:
                 journal.append("ORDER_OBSERVATION_ERROR", {"leg": plan.side, "poll": poll, "reason": sanitize_exception(exc)}, run_id=run_id)
                 order = None
@@ -2634,6 +2712,11 @@ class HandoffEngine:
                     run_id=run_id,
                 )
                 return
+            self._stream_milestone("cancel_decision", plan, current.order_id)
+            preparation_wait_started = time.perf_counter()
+            prepared_ready = bool(self._cancel_preparation_task is not None
+                                  and self._cancel_preparation_order_id == current.order_id
+                                  and self._cancel_preparation_task.done())
             prepared_cancel = None
             if (self._cancel_preparation_task is not None
                     and self._cancel_preparation_order_id == current.order_id):
@@ -2651,11 +2734,11 @@ class HandoffEngine:
                     "account_index": plan.account_index,
                     "market_id": plan.market_id,
                     "order_id": current.order_id,
-                    "prepared_before_decision": prepared_cancel is not None,
+                    "prepared_before_decision": prepared_ready and prepared_cancel is not None,
+                    "preparation_wait_seconds": max(0.0, time.perf_counter() - preparation_wait_started),
                 },
                 run_id=run_id,
             )
-            self._stream_milestone("cancel_decision", plan, current.order_id)
             if prepared_cancel is not None:
                 submit_prepared = getattr(self.client, "submit_prepared_cancel_order")
                 receipt = _as_receipt(await self._bounded(
@@ -3322,6 +3405,7 @@ class HandoffEngine:
                     "source order disappeared during pre-receiver recheck",
                     "source fill or quantity change before receiver dispatch",
                     "source exact order is missing before receiver dispatch",
+                    "source active order absent in pre-receiver account snapshot",
                 }
             )
             # Admission uncertainty is distinct from execution uncertainty.
@@ -3381,6 +3465,7 @@ class HandoffEngine:
             "source order disappeared during pre-receiver recheck",
             "source fill or quantity change before receiver dispatch",
             "source exact order is missing before receiver dispatch",
+            "source active order absent in pre-receiver account snapshot",
         }
         def provisional(reason: str) -> bool:
             return reason in provisional_reasons or reason.startswith(

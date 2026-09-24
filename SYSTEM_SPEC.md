@@ -1,3 +1,9 @@
+## Cycle-075 correction candidate
+
+A missing active source in an early account snapshot is distinct from a conflicting active order. It still prevents receiver dispatch. Only a fully reconciled, terminal source-only execution with complete history, agreeing exact positions, no dispatched receiver and no mutation/identity uncertainty may classify this admission-only discrepancy as PARTIAL and enter existing reduce-only recovery. UNKNOWN mutation/history/identity barriers remain unchanged, including in paired closing.
+
+Initial/terminal order polling races a full validated WS observation against the bounded REST lookup, drains the losing read task and preserves simultaneous conflicting REST identity evidence. Final active-source and public owner/queue checks remain unchanged. Cancellation nonce acquisition starts after accepted source acknowledgement, before exact order visibility; the same account/key reservation registry transfers ownership exactly once to cancellation signing. Failed/unused reservations are released, and ambiguous cancellation is never replayed. Journals record readiness before cancel preparation wait and the wait duration; cancel_decision is recorded before this wait.
+
 # Current system specification
 
 ## WS read acceleration candidate (2026-09-24)

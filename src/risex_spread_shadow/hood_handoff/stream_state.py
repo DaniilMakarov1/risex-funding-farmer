@@ -188,6 +188,27 @@ class ReadStreamState:
                 except asyncio.TimeoutError:
                     return False
 
+    async def wait_order_observation(self, account: int, market: int, client: int,
+                                     order_id: str | None, timeout: float, *, terminal_only: bool):
+        if type(timeout) not in {int, float} or not math.isfinite(timeout) or timeout <= 0:
+            return None
+        deadline = time.monotonic() + timeout
+        async with self._condition:
+            while self.connected and self.observer.stopped_reason is None:
+                now = time.monotonic()
+                order = self.reads.order(account, market, client, order_id, now,
+                                         self.limits.max_fresh_age_seconds, terminal_only=terminal_only)
+                if order is not None:
+                    return order
+                remaining = deadline - now
+                if remaining <= 0:
+                    break
+                try:
+                    await asyncio.wait_for(self._condition.wait(), remaining)
+                except asyncio.TimeoutError:
+                    break
+        return None
+
     def exact_terminal_hint(self, account: int, client: int, order_id: str | None,
                             now: float) -> bool:
         """A recent exact private event can wake REST polling, not replace it."""

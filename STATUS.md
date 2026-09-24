@@ -1,3 +1,7 @@
+# Cycle-075 corrections — verification in progress
+
+Parent implements on codex/ws-cycle-recovery from local main 545a234. Added source-only residual recovery regression for the empty early account snapshot/external-fill race in both directions and opening/closing, WS/REST observation races, and earlier cancellation nonce reservation with expiry/ownership/replay tests. Final source check retained; no live order or runtime change yet. Full isolated suite pending. Earlier live activation and audit remain historical facts.
+
 # Current status
 
 ## WS version activated for owner-run Telegram tests — 2026-09-24
