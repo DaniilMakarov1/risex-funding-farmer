@@ -1,6 +1,8 @@
-# Attempt limits 6 / 15 — verified, activation pending
+# Attempt limits 6 / 15 — integrated and active
 
 Owner requested up to6 opening attempts and15 paired-closing attempts, including the first. Shared preparation/zero-fill budgets now differ by phase; confirmed pilot and separate residual recovery remain unchanged. Updated CLI limits and execution notices beyond attempt3. Tests cover exhaustion, unique order IDs, success at attempts6/15, preserved quantity/hold and final-attempt messages.317 targeted plus43 related checks passed. Final clean isolated Python3.11 full suite:5551 passed,3 skipped,2 dependency warnings,exit0. Self-review complete; no agent real trading. Evidence:spread-shadow-runs/hood-attempt-limits-20260924/solo-v1. Integrate identical tested source and activate an idle controller with config/state preserved.
+
+Activation verified on local main793af63, controllerPID24950: tested source identical, config/state byte-identical, no active child, no trading command. Remote publication not performed.
 
 # ACK cancellation/recovery fixes — integrated and active
 
