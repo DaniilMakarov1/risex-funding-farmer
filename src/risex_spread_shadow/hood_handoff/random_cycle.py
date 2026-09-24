@@ -329,6 +329,7 @@ class RandomCycleConfig:
     max_quote_age_seconds: float | None = None
     max_source_to_receiver_seconds: float | None = None
     margin_reserve: OpeningMarginReserve | None = None
+    confirmed_pilot: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "market_id", _int(self.market_id, "market_id"))
@@ -423,9 +424,15 @@ class RandomCycleConfig:
         )
         if self.auth_token_lifetime_seconds > 8 * 60 * 60:
             raise ContractError("auth_token_lifetime_seconds must not exceed the documented 8-hour lifetime")
-        for name in ("operator_execution_opt_in", "operator_plan_reviewed", "defer_incremental_margin_calculation"):
+        for name in ("operator_execution_opt_in", "operator_plan_reviewed", "defer_incremental_margin_calculation", "confirmed_pilot"):
             if not isinstance(getattr(self, name), bool):
                 raise ContractError(f"{name} must be bool")
+        if self.confirmed_pilot and (
+            self.market_id != 1 or self.market_symbol != "BTC"
+            or {self.source_account_index, self.receiver_account_index} != {27331, 27337}
+            or self.margin_reserve != OpeningMarginReserve(Decimal("0.10"), Decimal("0.02"))
+        ):
+            raise ContractError("confirmed pilot requires the authorized BTC accounts and reserve")
 
     @property
     def opening_journal_path(self) -> Path:
@@ -456,6 +463,7 @@ class RandomCycleConfig:
             "max_poll_count": self.max_poll_count,
             "source_order_lifetime_seconds": self.source_order_lifetime_seconds,
             "defer_incremental_margin_calculation": self.defer_incremental_margin_calculation,
+            **({"confirmed_pilot": True} if self.confirmed_pilot else {}),
             **({"margin_reserve": {
                 "initial_quote": format(self.margin_reserve.initial_quote, "f"),
                 "dispatch_quote": format(self.margin_reserve.dispatch_quote, "f"),
@@ -2078,6 +2086,13 @@ class RandomCycleEngine:
         if self._identity_barrier is None:
             self._identity_barrier = f"identity failure barrier: {reason}"
 
+    @staticmethod
+    def _pilot_notional_guard(quantity: Decimal, source_price: Decimal,
+                              receiver_bound: Decimal) -> None:
+        if (quantity <= 0 or source_price <= 0 or receiver_bound <= 0
+                or max(quantity * source_price, quantity * receiver_bound) > Decimal("40.00")):
+            raise PreflightBlocked("confirmed pilot exceeds 40.00 quote per account")
+
     async def execute(self, config: RandomCycleConfig) -> RandomCycleResult:
         self._stage = "PREFLIGHT"
         self._identity_barrier = None
@@ -2143,9 +2158,22 @@ class RandomCycleEngine:
                 journal_path=str(config.journal_path),
             )
         finally:
-            await self._release_preflight_nonces()
-            if journal is not None:
-                journal.release_attempt()
+            try:
+                await self._release_preflight_nonces()
+                if config.confirmed_pilot:
+                    stop_stream = getattr(self.client, "stop_read_stream", None)
+                    try:
+                        summary = getattr(self.client, "read_stream_summary", None)
+                        if journal is not None and callable(summary):
+                            value = summary()
+                            if value is not None:
+                                journal.append("PILOT_READ_STREAM_SUMMARY", value)
+                    finally:
+                        if callable(stop_stream):
+                            await stop_stream()
+            finally:
+                if journal is not None:
+                    journal.release_attempt()
 
     def _prepare_cycle_directory(
         self,
@@ -2246,7 +2274,23 @@ class RandomCycleEngine:
                                          receiver_bound=proposal.receiver_worst_price, direction=config.direction,
                                          initial_reserve_quote=(config.margin_reserve.initial_quote
                                                                 if config.margin_reserve else Decimal(0)))
-        quantity, quantity_tick, hold_seconds = select_random_quantity(bounds, self.rng)
+        if config.confirmed_pilot:
+            quantity = Decimal("0.00020")
+            ticks = quantity / bounds.size_step
+            if ticks != ticks.to_integral_value() or not bounds.lower_tick <= ticks <= bounds.upper_tick:
+                raise PreflightBlocked("confirmed pilot exact quantity is outside fresh legal bounds")
+            quantity_tick, hold_seconds = int(ticks), 20
+            self._pilot_notional_guard(quantity, proposal.source_limit_price, proposal.receiver_worst_price)
+            observed_rates = [rate for rate in (
+                metadata.source_fee_rate, metadata.receiver_fee_rate,
+                source.fee_rate, receiver.fee_rate,
+            ) if rate is not None]
+            fee_rate_bound = max(ROBINHOOD_MAKER_FEE_CAP, ROBINHOOD_TAKER_FEE_CAP,
+                                 *observed_rates)
+            if Decimal("240.00") * fee_rate_bound > Decimal("0.10"):
+                raise PreflightBlocked("confirmed pilot modeled paired and recovery fee ceiling exceeds 0.10 quote")
+        else:
+            quantity, quantity_tick, hold_seconds = select_random_quantity(bounds, self.rng)
         selection = RandomCycleSelection(
             quantity=quantity,
             quantity_tick=quantity_tick,
@@ -2267,8 +2311,12 @@ class RandomCycleEngine:
         source, receiver = await self._configure_leverage(
             config, journal, metadata, book, selection, source, receiver,
         )
+        if config.confirmed_pilot:
+            start_stream = getattr(self.client, "start_read_stream", None)
+            if not callable(start_stream) or not await start_stream(ready_timeout=5):
+                raise PreflightBlocked("confirmed pilot read-only stream is not ready")
 
-        pair_budget = _PairAttemptBudget()
+        pair_budget = _PairAttemptBudget(limit=1 if config.confirmed_pilot else MAX_PREPARATION_ATTEMPTS)
         initial_metadata = metadata
         initial_book = book
         initial_source = source
@@ -2290,6 +2338,10 @@ class RandomCycleEngine:
         opening_preparation_result: RandomCycleResult | None = None
         while True:
             attempt_index = pair_budget.used
+            if config.confirmed_pilot:
+                stream_ready = getattr(self.client, "read_stream_ready", None)
+                if not callable(stream_ready) or not stream_ready():
+                    raise PreflightBlocked("confirmed pilot read-only stream lost readiness before LIMIT")
             opening_path = _child_journal_path(config.opening_journal_path, attempt_index)
             opening_config = self._handoff_config(
                 config,
@@ -2534,6 +2586,8 @@ class RandomCycleEngine:
     ) -> tuple[AccountSnapshot, AccountSnapshot]:
         setter = getattr(self.client, "update_leverage_fraction", None)
         if not callable(setter):
+            if config.confirmed_pilot:
+                raise PreflightBlocked("confirmed pilot requires fresh leverage readback without a setting write")
             # Legacy synthetic clients have no venue margin surface. A client
             # supplying real margin evidence must support exact configuration.
             if source.margin_evidence is not None or receiver.margin_evidence is not None:
@@ -2601,6 +2655,8 @@ class RandomCycleEngine:
             "dispatch_reserve_quote": (None if config.margin_reserve is None
                                        else format(config.margin_reserve.dispatch_quote, "f")),
         })
+        if config.confirmed_pilot and any(current[index] != targets[index] for index in current):
+            raise PreflightBlocked("confirmed pilot forbids leverage or margin-setting changes")
         for index in (source.account_index, receiver.account_index):
             if current[index] == targets[index]:
                 continue
@@ -3163,6 +3219,9 @@ class RandomCycleEngine:
             raise PreflightBlocked("selected quantity no longer meets a fresh venue minimum")
         if not refreshed_bounds.lower_tick <= selection.quantity_tick <= refreshed_bounds.upper_tick:
             raise PreflightBlocked("fresh available balance no longer funds the selected quantity")
+        if config.confirmed_pilot:
+            self._pilot_notional_guard(selection.quantity, proposal.source_limit_price,
+                                       proposal.receiver_worst_price)
         if initial_source is not None and source.source_identity != initial_source.source_identity:
             self._mark_identity_failure("account identity changed before opening mutation")
             raise PreflightBlocked("account identity changed before opening mutation")
@@ -3279,7 +3338,7 @@ class RandomCycleEngine:
                 or opening_receiver.unknown_reasons
             ):
                 return blocked("opening reconciliation is incomplete for a dependent close")
-            budget = _PairAttemptBudget()
+            budget = _PairAttemptBudget(limit=1 if config.confirmed_pilot else MAX_PREPARATION_ATTEMPTS)
             while budget.available:
                 attempt_index = budget.consume()
                 preparation_started = time.perf_counter()
@@ -3327,6 +3386,9 @@ class RandomCycleEngine:
                         now=now,
                         freshness_seconds=config.freshness_seconds,
                     )
+                    if config.confirmed_pilot:
+                        self._pilot_notional_guard(paired_quantity, proposal.source_limit_price,
+                                                   proposal.receiver_worst_price)
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
@@ -3584,6 +3646,7 @@ class RandomCycleEngine:
         blocked: set[int] = set()
         ready_at = {account_index: _clock_monotonic(self.clock) for account_index in pending}
         attempt_ordinal = 0
+        pilot_attempts: dict[int, int] = {}
 
         async def fresh_accounts() -> tuple[AccountSnapshot, AccountSnapshot] | None:
             """Read both accounts after an attempt before any next mutation."""
@@ -3620,6 +3683,14 @@ class RandomCycleEngine:
                 return results, current[config.source_account_index].signed_position, current[config.receiver_account_index].signed_position
             if residual <= 0:
                 continue
+            if config.confirmed_pilot and pilot_attempts.get(account_index, 0) >= 1:
+                journal.append("PILOT_RECOVERY_LIMIT", {
+                    "account_index": account_index,
+                    "remaining_position": format(before.signed_position, "f"),
+                    "reason": "one exact reduce-only recovery attempt per account exhausted",
+                })
+                blocked.add(account_index)
+                continue
 
             # A terminal zero-fill IOC is retried only after the declared
             # polling interval.  A delayed account is rotated behind any
@@ -3645,6 +3716,8 @@ class RandomCycleEngine:
                 continue
 
             attempt_ordinal += 1
+            if config.confirmed_pilot:
+                pilot_attempts[account_index] = pilot_attempts.get(account_index, 0) + 1
             reserve = getattr(self.client, "reserve_order_nonce", None)
             invalidate = getattr(self.client, "invalidate_reserved_nonce", None)
             prepared_capable = (callable(reserve) and callable(invalidate)
@@ -4222,6 +4295,12 @@ class RandomCycleEngine:
                 )
             )
         bound = book.asks[0].price if side == "BUY" else book.bids[0].price
+        if config.confirmed_pilot and residual * bound > Decimal("40.00"):
+            return finish(FallbackResult(
+                before.account_index, side, residual, False, Outcome.PARTIAL,
+                reason="confirmed pilot residual exceeds 40.00 quote per account",
+                attempt=attempt_ordinal,
+            ))
         below_minimum = (
             residual < metadata.minimum_base_amount
             or residual * bound < metadata.minimum_quote_amount

@@ -2099,6 +2099,13 @@ class HandoffEngine:
                     except Exception:
                         hinted = False
                     if hinted is True:
+                        journal.append("PRIVATE_TERMINAL_HINT", {
+                            "account_index": plan.account_index,
+                            "market_id": plan.market_id,
+                            "client_order_index": plan.client_order_index,
+                            "order_id": order_id,
+                            "rest_proof_pending": True,
+                        }, run_id=run_id)
                         continue
                     unslept = delay - (time.monotonic() - wait_started)
                     if unslept > 0:

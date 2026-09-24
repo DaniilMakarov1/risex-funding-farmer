@@ -1,5 +1,9 @@
 # Current status
 
+## Confirmed single BTC pilot — guard candidate, live NOT_RUN
+
+On 2026-09-24 the owner confirmed the concrete single-cycle limits recorded at the top of NEXT_TASK. This branch is implementing a dedicated one-use pilot command with exact 0.00020 BTC, at most 40.00 quote per account, a proved 20-second hold, one paired attempt per phase, one exact residual recovery attempt per account, a modeled 0.10 quote fee ceiling, read-only stream readiness and no leverage-setting write. The ordinary Telegram controller and its protected configuration are unchanged. Focused adverse/integration checks are in progress; full isolated verification, source/config binding and current account preflight remain before any live action. No pilot order, cancellation, setting write or runtime activation has occurred.
+
 ## Owner-led five-part development — Chief owns implementation and integration
 
 The owner transferred ongoing project development, self-review and integration ownership to Chief task `01a0cf55-1311-7213-9d5a-905404eb46e1` on 2026-09-23. Parent auditor task `01a0c9cd-c8bc-75b0-92b3-04b75270a65e` is no longer a management or acceptance gate. The complete five-part objective, each current state, next action, result criterion and evidence path are at the top of NEXT_TASK. The accepted HCR-43 milestone and current HCR-44 connector remain development evidence, not proof of live mutual-fill improvement. Actual main/runtime identities must be checked before integration or activation; this handoff itself changed neither. System/tool and AGENTS safety boundaries remain in force.

@@ -304,7 +304,9 @@ def test_terminal_stream_hint_only_wakes_exact_rest_proof(rest_terminal):
         result = await engine._poll_order(plan, "123", journal, "run", require_terminal=True)
         assert len(lookups) == 2 and sleeps == []
         assert (result is not None) is rest_terminal
-        assert [name for name, _ in journal.events] == (["ORDER_OBSERVED"] if rest_terminal else [])
+        assert [name for name, _ in journal.events] == (
+            ["PRIVATE_TERMINAL_HINT", "ORDER_OBSERVED"] if rest_terminal
+            else ["PRIVATE_TERMINAL_HINT"])
 
     asyncio.run(scenario())
 
@@ -380,6 +382,13 @@ def test_sdk_opt_in_stream_lifecycle_is_warmed_once_and_closes(monkeypatch, tmp_
 
     async def scenario():
         assert await client.start_read_stream(ready_timeout=0.5)
+        summary = client.read_stream_summary()
+        assert summary["ready"] is True and summary["order_events"] == 1
+        assert set(summary) == {
+            "connected", "ready", "frames", "bytes", "book_gaps",
+            "private_subscription_controls", "order_events", "order_conflicts",
+            "malformed", "stopped_reason",
+        }
         assert not await client.start_read_stream(ready_timeout=0.5)
         assert await client.wait_terminal_hint(27337, 99, "123", 0.1)
         assert not await client.wait_terminal_hint(27337, 99, "123", 0.01)

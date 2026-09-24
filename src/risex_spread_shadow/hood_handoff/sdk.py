@@ -644,6 +644,29 @@ class LighterSdkClient:
             return False
         return await state.wait_terminal_hint(account, client, order_id, timeout)
 
+    def read_stream_ready(self) -> bool:
+        state, task = self._read_stream_state, self._read_stream_task
+        return bool(state is not None and task is not None and not task.done()
+                    and state.subscription_ready(time.monotonic()))
+
+    def read_stream_summary(self) -> dict[str, int | bool | str | None] | None:
+        state = self._read_stream_state
+        if state is None:
+            return None
+        observer = state.observer
+        return {
+            "connected": state.connected,
+            "ready": self.read_stream_ready(),
+            "frames": observer.frames,
+            "bytes": observer.bytes_seen,
+            "book_gaps": observer.book_gaps,
+            "private_subscription_controls": observer.private_subscription_controls,
+            "order_events": observer.order_events,
+            "order_conflicts": observer.order_conflicts,
+            "malformed": observer.malformed,
+            "stopped_reason": observer.stopped_reason,
+        }
+
     @staticmethod
     def verify_sdk() -> None:
         try:

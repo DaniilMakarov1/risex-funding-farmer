@@ -1,5 +1,7 @@
 # RISEx Spread Shadow
 
+The owner confirmed one bounded BTC pilot for the HCR-44 development branch. Its dedicated one-cycle CLI configuration fixes 0.00020 BTC, a 40.00 quote maximum per account, a 20-second proved hold, one paired attempt per phase and one exact residual recovery per account. It requires existing Keychain credentials, a fresh read-only stream, the shared operator lock and already-compatible leverage; it does not change leverage settings. A durable claim consumes the single authorization before credentials or network use. The protected Telegram controller configuration remains unchanged. The pilot has not been launched; see NEXT_TASK and STATUS for its current verification state.
+
 The active tool runs one owner-requested two-account Robinhood Chain BTC cycle. One account posts a limit and the other sends a price-bounded market order through the public book. Other participants can still trade first; matching our own accounts is proved afterward from exact receipts. Offline tests establish software behavior, not live execution probability.
 
 Read STATUS.md for accepted versions/results, SYSTEM_SPEC.md for behavior, NEXT_TASK.md for current work/authority and AGENTS.md for process/safety. Historical experiments remain in Git and immutable local evidence.

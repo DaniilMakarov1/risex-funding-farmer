@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from contextlib import nullcontext
 from decimal import Decimal, InvalidOperation
 import importlib
 import json
@@ -1462,6 +1463,8 @@ async def _run_simple_confirmed(args, value, config_path, operator_dir) -> int:
         evidence_path=evidence_path,
         defer_incremental_margin_calculation=args.defer_incremental_margin_calculation,
     )
+    if base_config.confirmed_pilot:
+        raise SystemExit("confirmed pilot uses the dedicated one-cycle command")
     _require_owner_opening_margin_reserve(base_config)
     _validate_simple_sdk()
     route = select_random_route(base_config)
@@ -1622,12 +1625,21 @@ async def _run_close_positions(args):
 def _prompt_random_cycle_launch(config: RandomCycleConfig) -> bool:
     """Require the one interactive launch boundary before any secret access."""
 
-    print(
-        "HCR-17 random-cycle pending LAUNCH: "
-        f"market={config.market_symbol} direction={config.direction.value} "
-        f"source={config.source_account_index} receiver={config.receiver_account_index}; "
-        "one random legal quantity tick, one hold in [20,300] seconds, then paired reduce-only close."
-    )
+    if config.confirmed_pilot:
+        print(
+            "Confirmed one-cycle BTC pilot pending LAUNCH: "
+            f"source={config.source_account_index} receiver={config.receiver_account_index} "
+            f"direction={config.direction.value}; exact 0.00020 BTC, at most 40.00 quote "
+            "per account, 20-second proved hold, one paired attempt per phase, "
+            "read-only stream required, no leverage-setting write."
+        )
+    else:
+        print(
+            "HCR-17 random-cycle pending LAUNCH: "
+            f"market={config.market_symbol} direction={config.direction.value} "
+            f"source={config.source_account_index} receiver={config.receiver_account_index}; "
+            "one random legal quantity tick, one hold in [20,300] seconds, then paired reduce-only close."
+        )
     try:
         response = input(f"Type {LAUNCH_TOKEN} to launch this one random cycle: ")
     except (EOFError, KeyboardInterrupt):
@@ -1637,6 +1649,34 @@ def _prompt_random_cycle_launch(config: RandomCycleConfig) -> bool:
         print("random-cycle cancelled before LAUNCH; no credentials or orders were used")
         return False
     return True
+
+
+def _claim_confirmed_pilot(config: RandomCycleConfig, config_path: Path) -> None:
+    """Consume this one owner authorization before credentials or network use."""
+    operator_dir = Path(config.cycle_dir).parent
+    if config_path.is_symlink() or config_path.parent.resolve() != operator_dir.resolve():
+        raise SystemExit("confirmed pilot config must be in the protected operator directory")
+    marker = operator_dir / ".confirmed-pilot-20260924.claim.json"
+    try:
+        fd = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    except FileExistsError:
+        raise SystemExit("confirmed pilot authorization was already consumed") from None
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as sink:
+            json.dump({"schema": "confirmed-pilot-20260924-v1", "cycle_dir": str(config.cycle_dir),
+                       "market_id": config.market_id,
+                       "accounts": [config.source_account_index, config.receiver_account_index]}, sink)
+            sink.write("\n")
+            sink.flush()
+            os.fsync(sink.fileno())
+        parent_fd = os.open(operator_dir, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(parent_fd)
+        finally:
+            os.close(parent_fd)
+    except BaseException:
+        # The exclusive claim remains even after a local failure: replay is unsafe.
+        raise
 
 
 async def _run_random_cycle(args: argparse.Namespace, value: Mapping[str, Any]) -> int:
@@ -1658,6 +1698,8 @@ async def _run_random_cycle(args: argparse.Namespace, value: Mapping[str, Any]) 
         plan_reviewed=args.confirm_plan,
         defer_incremental_margin_calculation=args.defer_incremental_margin_calculation,
     )
+    if args.execute and config.confirmed_pilot and (not args.keychain or args.keychain_replace):
+        raise SystemExit("confirmed pilot requires existing Keychain credentials without replacement")
     if args.execute:
         _require_owner_opening_margin_reserve(config)
     if not args.execute:
@@ -1692,9 +1734,18 @@ async def _run_random_cycle(args: argparse.Namespace, value: Mapping[str, Any]) 
                     "close_receiver_side": inverse.receiver_side,
                     "close_source_reduce_only": True,
                     "close_receiver_reduce_only": True,
-                    "quantity_policy": "uniform integer legal size tick after fresh metadata/book/accounts; capped by min available balance without leverage",
-                    "hold_policy": "uniform integer seconds in [20,300] after both opening legs are fully reconciled",
-                    "fallback_policy": "repeat reduce-only market attempts for each fresh confirmed residual until exact zero; reconcile, refresh the executable bound and use a unique attempt ID each time; no widening",
+                    "quantity_policy": ("exact 0.00020 BTC and at most 40.00 quote per account"
+                                        if config.confirmed_pilot else
+                                        "uniform integer legal size tick after fresh metadata/book/accounts"),
+                    "hold_policy": ("exact 20 seconds after proved mutual opening"
+                                    if config.confirmed_pilot else
+                                    "uniform integer seconds in [20,300] after both opening legs are fully reconciled"),
+                    "confirmed_pilot": config.confirmed_pilot,
+                    "fallback_policy": (
+                        "at most one exact reduce-only recovery attempt per account; preserve a proved residual"
+                        if config.confirmed_pilot else
+                        "repeat reduce-only market attempts for each fresh confirmed residual until exact zero; reconcile, refresh the executable bound and use a unique attempt ID each time; no widening"
+                    ),
                     "freshness_seconds": config.freshness_seconds,
                     "request_timeout_seconds": config.request_timeout_seconds,
                     "order_timeout_seconds": config.order_timeout_seconds,
@@ -1726,33 +1777,41 @@ async def _run_random_cycle(args: argparse.Namespace, value: Mapping[str, Any]) 
         raise SystemExit(f"random-cycle launch refused: {exc}") from None
     if not _prompt_random_cycle_launch(config):
         return 0
-    account_indices = (config.source_account_index, config.receiver_account_index)
-    if args.keychain or args.keychain_replace:
-        secrets: Any = _keychain_provider(config, account_indices, replace=args.keychain_replace)
+    from .operator_control import exclusive_lock
+    lock = (exclusive_lock(Path(config.cycle_dir).parent / '.operator-launch.lock')
+            if config.confirmed_pilot else nullcontext())
+    with lock:
+        if config.confirmed_pilot:
+            _claim_confirmed_pilot(config, Path(args.config))
+        account_indices = (config.source_account_index, config.receiver_account_index)
+        if args.keychain or args.keychain_replace:
+            secrets: Any = _keychain_provider(config, account_indices, replace=args.keychain_replace)
+            try:
+                _prime_keychain(secrets, account_indices)
+            except SystemExit:
+                secrets.close()
+                raise
+        else:
+            secrets = PromptSecretProvider(account_indices, config.api_key_index)
+        client: LighterSdkClient | None = None
         try:
-            _prime_keychain(secrets, account_indices)
-        except SystemExit:
+            # Pilot and ordinary cycle share the exact execution engine.
+            client = LighterSdkClient(
+                config,  # type: ignore[arg-type]
+                source_account_index=config.source_account_index,
+                receiver_account_index=config.receiver_account_index,
+                secrets=secrets,
+                market_evidence=evidence,
+            )
+            if config.confirmed_pilot:
+                from .operator_recovery import inspect_current
+                await inspect_current(config, client, Path(config.cycle_dir).parent,
+                                      require_flat=True)
+            result = await run_random_cycle(config, client)
+        finally:
+            if client is not None:
+                await client.aclose()
             secrets.close()
-            raise
-    else:
-        secrets = PromptSecretProvider(account_indices, config.api_key_index)
-    client: LighterSdkClient | None = None
-    try:
-        # LighterSdkClient consumes only the shared endpoint/timing/auth fields
-        # from RandomCycleConfig; the cycle engine supplies the actual sampled
-        # OrderPlan instances after its fresh post-LAUNCH observations.
-        client = LighterSdkClient(
-            config,  # type: ignore[arg-type]
-            source_account_index=config.source_account_index,
-            receiver_account_index=config.receiver_account_index,
-            secrets=secrets,
-            market_evidence=evidence,
-        )
-        result = await run_random_cycle(config, client)
-    finally:
-        if client is not None:
-            await client.aclose()
-        secrets.close()
     print(json.dumps(result.as_dict(), sort_keys=True, separators=(",", ":")))
     return 0 if result.outcome.value in {"SUCCESS", "PARTIAL", "PREVIEW"} else 2
 
