@@ -64,7 +64,8 @@ from .series import OrderBookSnapshot
 
 MIN_HOLD_SECONDS = 20
 MAX_HOLD_SECONDS = 180
-MAX_PREPARATION_ATTEMPTS = 3
+MAX_OPENING_ATTEMPTS = 6
+MAX_CLOSING_ATTEMPTS = 15
 CYCLE_JOURNAL_NAME = "cycle.jsonl"
 OPENING_JOURNAL_NAME = "opening.jsonl"
 CLOSING_JOURNAL_NAME = "closing.jsonl"
@@ -843,7 +844,7 @@ class _RetryablePreparationFailure(PreflightBlocked):
 class _PairAttemptBudget:
     """One shared lineage budget for preparation and source placements."""
 
-    limit: int = MAX_PREPARATION_ATTEMPTS
+    limit: int
     used: int = 0
 
     @property
@@ -2016,7 +2017,7 @@ def _exclusive_source_price_available(
     This is a pre-placement guard, so the source order is not present in the
     public book yet.  Any executable-side volume at the selected price or a
     better price would leave queue priority unproved; the caller retries
-    preparation within the existing three-attempt lineage budget.
+    preparation within the existing shared per-phase attempt budget.
     """
 
     levels = book.asks if direction is Direction.LONG else book.bids
@@ -2359,7 +2360,7 @@ class RandomCycleEngine:
                 raise PreflightBlocked("confirmed pilot read-only stream is not ready")
 
 
-        pair_budget = _PairAttemptBudget(limit=1 if config.confirmed_pilot else MAX_PREPARATION_ATTEMPTS)
+        pair_budget = _PairAttemptBudget(limit=1 if config.confirmed_pilot else MAX_OPENING_ATTEMPTS)
         initial_metadata = metadata
         initial_book = book
         initial_source = source
@@ -3415,7 +3416,7 @@ class RandomCycleEngine:
                 or opening_receiver.unknown_reasons
             ):
                 return blocked("opening reconciliation is incomplete for a dependent close")
-            budget = _PairAttemptBudget(limit=1 if config.confirmed_pilot else MAX_PREPARATION_ATTEMPTS)
+            budget = _PairAttemptBudget(limit=1 if config.confirmed_pilot else MAX_CLOSING_ATTEMPTS)
             while budget.available:
                 attempt_index = budget.consume()
                 preparation_started = time.perf_counter()

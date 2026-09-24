@@ -124,7 +124,7 @@ async def test_external_receiver_and_source_race_preserve_each_known_quantity(tm
 async def test_zero_fill_phase_and_unattempted_close_are_not_unknown_execution(tmp_path):
     clock = AdvancingClock()
     cfg = cycle_config(tmp_path / "no-fill")
-    await run_random_cycle(cfg, PostOnlyCancelClient(clock, cancel_count=3), clock=clock, rng=FixedRng(20, 20))
+    await run_random_cycle(cfg, PostOnlyCancelClient(clock, cancel_count=6), clock=clock, rng=FixedRng(20, 20))
     report = load_saved_cycle_report(cfg.cycle_dir)
     assert report["paired_execution"]["direct_counterparty_match"][0]["status"] == "NO_FILL"
     text = valid(saved_message("no-fill", report))

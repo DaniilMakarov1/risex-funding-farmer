@@ -96,7 +96,7 @@ async def test_persistent_veto_is_bounded_and_preserves_diagnostic_evidence(tmp_
     result = await run_random_cycle(cycle_config(tmp_path / 'cycle', receiver_admission='ws_confirmed'), client, clock=clock, rng=FixedRng(20, 20))
     assert result.inventory == 'CONFIRMED_FLAT', result.reason
     assert not any(p.order_type == 'MARKET' for p in client.submissions)
-    assert len(client.submissions) == (1 if scenario == 'smaller' else 3)
+    assert len(client.submissions) == (1 if scenario == 'smaller' else 6)
     guard = result.opening.priority_guard
     assert guard['ws_l2_status'] == expected
     assert Decimal(guard['source_quantity']) == Decimal('.20')

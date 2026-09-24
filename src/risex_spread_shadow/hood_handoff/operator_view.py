@@ -324,6 +324,7 @@ def execution_lines(result, *, phase, attempt=1):
 def read_execution_notices(path):
     """Bounded local child readback off the execution path, including short phases."""
     from .operator_recovery import journal_rows
+    from .random_cycle import MAX_OPENING_ATTEMPTS, MAX_CLOSING_ATTEMPTS
     import re
     path = Path(path)
     notices = []
@@ -333,7 +334,7 @@ def read_execution_notices(path):
             if not match:
                 continue
             phase, attempt = match[1], int(match[2] or 1)
-            if not 1 <= attempt <= 3:
+            if not 1 <= attempt <= (MAX_OPENING_ATTEMPTS if phase == 'opening' else MAX_CLOSING_ATTEMPTS):
                 continue
             plan = {}
             for row in journal_rows(child):

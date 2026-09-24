@@ -539,13 +539,13 @@ class ClosingPreparationTimeout(CycleClient):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('failures',[1,2,3])
-async def test_closing_preparation_timeout_retries_before_exposure_in_same_three_attempt_budget(tmp_path,failures):
+@pytest.mark.parametrize('failures',[1,2,14,15])
+async def test_closing_preparation_timeout_retries_within_fifteen_attempt_budget(tmp_path,failures):
     clock=AdvancingClock();client=ClosingPreparationTimeout(clock,failures)
     result=await run_random_cycle(cycle_config(tmp_path/'cycle'),client,clock=clock,rng=FixedRng(20,20))
     assert result.inventory=='CONFIRMED_FLAT'
     assert client.failed==failures
-    if failures<3:
+    if failures<15:
         assert result.closing.mutual_execution_proven
         assert result.closing.attempt_index==failures+1
         assert not result.fallbacks
@@ -555,7 +555,7 @@ async def test_closing_preparation_timeout_retries_before_exposure_in_same_three
         assert len(result.fallbacks)==2
         assert [p.order_type for p in client.submissions]==['LIMIT','MARKET','MARKET','MARKET']
     rows=[json.loads(x) for x in (tmp_path/'cycle/cycle.jsonl').read_text().splitlines()]
-    assert len([r for r in rows if r['event']=='CLOSING_PREPARATION_RETRY'])==min(failures,2)
+    assert len([r for r in rows if r['event']=='CLOSING_PREPARATION_RETRY'])==min(failures,14)
 
 
 @pytest.mark.asyncio

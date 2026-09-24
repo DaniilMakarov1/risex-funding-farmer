@@ -1422,7 +1422,7 @@ async def test_exclusive_price_admission_retries_open_and_close_before_source_ex
 
 
 @pytest.mark.asyncio
-async def test_exclusive_price_opening_retries_use_only_the_existing_three_attempt_budget(tmp_path):
+async def test_exclusive_price_opening_retries_use_six_attempt_budget(tmp_path):
     clock = AdvancingClock()
     client = ExclusivePriceSequenceClient(
         clock,
@@ -1441,12 +1441,12 @@ async def test_exclusive_price_opening_retries_use_only_the_existing_three_attem
     assert result.selection is not None
     assert result.selection.quantity == Decimal("0.20")
     assert result.selection.hold_seconds == 20
-    assert client.opening_bad_calls == 3
+    assert client.opening_bad_calls == 6
     assert not client.source_submissions
     rows = [json.loads(line) for line in (cycle_path / "cycle.jsonl").read_text().splitlines()]
-    assert len([row for row in rows if row["event"] == "PREPARATION_RETRY"]) == 2
+    assert len([row for row in rows if row["event"] == "PREPARATION_RETRY"]) == 5
     exhausted = [row for row in rows if row["event"] == "PREPARATION_EXHAUSTED"]
-    assert exhausted and exhausted[-1]["payload"]["maximum_attempts"] == 3
+    assert exhausted and exhausted[-1]["payload"]["maximum_attempts"] == 6
 
 
 @pytest.mark.asyncio
@@ -1575,8 +1575,8 @@ async def test_paired_closing_priority_guard_is_symmetric_and_retries_with_new_c
 @pytest.mark.asyncio
 async def test_shared_pair_attempt_budget_exhaustion_never_dispatches_receiver_or_reuses_identity(tmp_path):
     clock = AdvancingClock()
-    # Opening book calls: initial 1, preparation 2, then guard calls 3/5/7.
-    client = GuardSequenceClient(clock, {3, 5, 7})
+    # Opening book calls: initial 1, then alternating preparation and six guard reads.
+    client = GuardSequenceClient(clock, {3, 5, 7, 9, 11, 13})
     cycle_path = tmp_path / "guard-budget-exhausted"
     result = await run_random_cycle(
         cycle_config(cycle_path),
@@ -1588,15 +1588,15 @@ async def test_shared_pair_attempt_budget_exhaustion_never_dispatches_receiver_o
     assert result.outcome is Outcome.PARTIAL
     assert result.paired_execution == "FAILED"
     assert result.inventory == "CONFIRMED_FLAT"
-    assert result.opening is not None and result.opening.attempt_index == 3
+    assert result.opening is not None and result.opening.attempt_index == 6
     opening_sources = [plan for plan in client.submissions if plan.order_type == "LIMIT" and not plan.reduce_only]
-    assert len(opening_sources) == 3
-    assert len({plan.client_order_index for plan in opening_sources}) == 3
+    assert len(opening_sources) == 6
+    assert len({plan.client_order_index for plan in opening_sources}) == 6
     assert not [plan for plan in client.submissions if plan.order_type == "MARKET" and not plan.reduce_only]
     rows = [json.loads(line) for line in (cycle_path / "cycle.jsonl").read_text().splitlines()]
     exhausted = [row for row in rows if row["event"] == "PAIR_ATTEMPT_EXHAUSTED"]
     assert exhausted
-    assert exhausted[-1]["payload"]["maximum_attempts"] == 3
+    assert exhausted[-1]["payload"]["maximum_attempts"] == 6
 
 
 @pytest.mark.asyncio
@@ -1680,14 +1680,14 @@ async def test_closing_post_only_retry_exhaustion_reports_recovery_without_erasi
     assert result.outcome is Outcome.PARTIAL, result.as_dict()
     assert result.opening is not None and result.opening.receiver is not None
     assert result.opening.receiver.dispatched is True
-    assert result.closing is not None and result.closing.attempt_index == 3
+    assert result.closing is not None and result.closing.attempt_index == 15
     close_limits = [
         plan
         for plan in client.submissions
         if plan.order_type == "LIMIT" and plan.reduce_only
     ]
-    assert len(close_limits) == 3
-    assert len({plan.client_order_index for plan in close_limits}) == 3
+    assert len(close_limits) == 15
+    assert len({plan.client_order_index for plan in close_limits}) == 15
     assert len(client.fallback_plans) == 2
 
     facts = random_cycle_module.terminal_cycle_facts(result)
@@ -1718,14 +1718,14 @@ async def test_canceled_post_only_retry_budget_exhaustion_proves_no_trade_fees(t
     )
 
     assert result.outcome is Outcome.PARTIAL, result.as_dict()
-    assert result.opening is not None and result.opening.attempt_index == 3
+    assert result.opening is not None and result.opening.attempt_index == 6
     source_limits = [
         plan
         for plan in client.submissions
         if plan.order_type == "LIMIT" and not plan.reduce_only
     ]
-    assert len(source_limits) == 3
-    assert len({plan.client_order_index for plan in source_limits}) == 3
+    assert len(source_limits) == 6
+    assert len({plan.client_order_index for plan in source_limits}) == 6
     assert not [
         plan
         for plan in client.submissions
@@ -4135,10 +4135,10 @@ async def test_preparation_retry_exhaustion_returns_proved_selection_and_never_w
     assert result.selection.quantity == Decimal("0.25")
     assert result.selection.hold_seconds == 20
     assert not client.submissions
-    assert clock.sleeps == [0.001, 0.001]
+    assert clock.sleeps == [0.001] * 5
     rows = [json.loads(line) for line in (tmp_path / "retry-exhausted" / "cycle.jsonl").read_text().splitlines()]
-    assert [row["payload"]["attempt"] for row in rows if row["event"] == "PREPARATION_ATTEMPT"] == [1, 2, 3]
-    assert len([row for row in rows if row["event"] == "PREPARATION_RETRY"]) == 2
+    assert [row["payload"]["attempt"] for row in rows if row["event"] == "PREPARATION_ATTEMPT"] == [1, 2, 3, 4, 5, 6]
+    assert len([row for row in rows if row["event"] == "PREPARATION_RETRY"]) == 5
     assert rows[-2]["event"] == "CYCLE_PREFLIGHT_BLOCKED"
     assert rows[-1]["event"] == "CYCLE_COMPLETE"
     assert rows[-1]["payload"]["outcome"] == "FAILED_PREFLIGHT_BLOCKED"
@@ -4565,7 +4565,7 @@ async def test_simple_progress_is_printed_before_synthetic_terminal_return(tmp_p
         )
     ) == 0
     before_terminal = seen_before_terminal["text"]
-    assert "Подготовка: попытка 1/3." in before_terminal
+    assert "Подготовка: попытка 1/6." in before_terminal
     assert "Выбрано: 0.25 единиц, удержание 20 с." in before_terminal
     assert "Котировка обновлена: 100.1 → 101.1" in before_terminal
     assert "Граница первой записи пройдена" not in before_terminal
@@ -4861,3 +4861,26 @@ async def test_guard_fill_does_not_erase_execution_uncertainty(tmp_path, adverse
     assert result.outcome is Outcome.UNKNOWN
     assert not result.fallbacks
     assert len(client.submissions) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('closing,cancels,expected_attempt', [(False,5,6),(True,14,15)])
+async def test_last_allowed_pair_attempt_can_succeed_and_is_visible(tmp_path,closing,cancels,expected_attempt):
+    from risex_spread_shadow.hood_handoff.operator_view import read_execution_notices
+    clock=AdvancingClock();client=PostOnlyCancelClient(clock,closing=closing,cancel_count=cancels)
+    rng=FixedRng(20,20);slot=tmp_path/'last-attempt'
+    result=await run_random_cycle(cycle_config(slot),client,clock=clock,rng=rng)
+    phase=result.closing if closing else result.opening
+    assert result.outcome is Outcome.SUCCESS,result.reason
+    assert phase.attempt_index==expected_attempt
+    assert result.inventory=='CONFIRMED_FLAT'
+    limits=[p for p in client.submissions if p.order_type=='LIMIT' and p.reduce_only==closing]
+    assert len(limits)==expected_attempt
+    assert len({p.client_order_index for p in limits})==expected_attempt
+    assert {p.quantity for p in limits}=={Decimal('.20')}
+    assert rng.bounds==[(10,3996),(20,180)]
+    label='closing' if closing else 'opening'
+    notices=dict(read_execution_notices(slot/'cycle.jsonl'))
+    assert f'{label}-{expected_attempt}-accepted' in notices
+    assert f'{label}-{expected_attempt}-execution' in notices
+    assert f'{label}-{expected_attempt+1}-accepted' not in notices

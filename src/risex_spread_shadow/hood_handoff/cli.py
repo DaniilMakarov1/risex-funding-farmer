@@ -34,7 +34,7 @@ from .local_attempt import (
 from .offline_report import format_report, report_saved_paths, load_saved_cycle_report
 from .operator_view import read_lifecycle, lifecycle_lines, result_lines, read_execution_notices, read_launch_failure, opening_margin_refusal
 from .random_cycle import (
-    MAX_PREPARATION_ATTEMPTS,
+    MAX_OPENING_ATTEMPTS,
     OpeningMarginReserve,
     RandomCycleConfig,
     RandomCycleEngine,
@@ -931,7 +931,7 @@ def _simple_event_line(row: Mapping[str, Any]) -> str | None:
         if isinstance(selection, Mapping):
             return f"Выбрано: {selection.get('quantity')} единиц, удержание {selection.get('hold_seconds')} с."
     if event == "PREPARATION_ATTEMPT":
-        return f"Подготовка: попытка {attempt}/{MAX_PREPARATION_ATTEMPTS}."
+        return f"Подготовка: попытка {attempt}/{payload.get('maximum_attempts', MAX_OPENING_ATTEMPTS)}."
     if event == "PREPARATION_RETRY":
         return f"Подготовка не завершена; повтор через {payload.get('delay_seconds')} с."
     if event == "PREPARATION_FAILED":
@@ -939,7 +939,7 @@ def _simple_event_line(row: Mapping[str, Any]) -> str | None:
     if event == "PREPARATION_BLOCKED":
         return opening_margin_refusal(payload.get("reason")) or "Подготовка остановлена: безопасный повтор запрещён."
     if event == "PREPARATION_EXHAUSTED":
-        return "Подготовка остановлена: исчерпаны три попытки до записи."
+        return f"Подготовка остановлена: исчерпан лимит {payload.get('maximum_attempts', MAX_OPENING_ATTEMPTS)} попыток до отправки ордера."
     if event == "PAIR_ATTEMPT_RETRY":
         phase = payload.get("phase") or "paired"
         return f"Парная попытка {phase}: безопасная отмена подтверждена; следующая попытка использует свежие данные и новый identity."
