@@ -148,6 +148,13 @@ def saved_message(name, report, *, blocked=False, detailed=False):
     return '\n'.join(lines)
 
 
+def later_close_message(name, at, flat):
+    outcome = '✅ нулевые позиции подтверждены' if flat else '❔ итог закрытия не подтверждён'
+    return (f'\n<b>Отдельное закрытие после цикла</b> · <code>{text(name, 32)}</code>\n'
+            f'{outcome} по состоянию на {timestamp(at)}. Это сохранённый результат, не текущий снимок счетов. '
+            '/accounts — проверить сейчас.')
+
+
 def accounts_message(result):
     if result is None:
         return ('<b>❔ Счета недоступны</b>\n'
