@@ -50,7 +50,7 @@ async def test_untrusted_commands_never_launch(tmp_path, change):
     if change == 'forward': u['message']['forward_origin'] = {}
     if change == 'edited': u['edited_message'] = u.pop('message')
     if change == 'stale': u['message']['date'] = 800
-    if change == 'future': u['message']['date'] = 1001
+    if change == 'future': u['message']['date'] = 1006
     if change == 'args': u['message']['text'] = '/run ; arbitrary command'
     if change == 'bool_id': u['message']['from']['id'] = True
     if change == 'missing_date': del u['message']['date']
@@ -58,6 +58,65 @@ async def test_untrusted_commands_never_launch(tmp_path, change):
     await asyncio.sleep(0)
     assert not calls
     assert c.store.data['active'] is None
+
+
+@pytest.mark.parametrize('skew', [0, 1, 2, 5])
+async def test_small_telegram_clock_skew_answers_once_without_launch(tmp_path, skew):
+    calls = []
+    async def launch(): calls.append(True)
+    c = setup(tmp_path, launch)
+    message = update(text='/status')
+    message['message']['date'] = 1000 + skew
+    await c.handle(message)
+    assert len(c.transport.messages) == 1
+    assert 'время вне допустимого' not in c.transport.messages[0][1]
+    await c.handle(message)
+    assert len(c.transport.messages) == 1
+    assert not calls
+
+
+@pytest.mark.parametrize('date,started', [(1006, 1000), (879, 800), (999, 1000), (True, 1000)])
+async def test_invalid_owner_timestamp_is_explained_without_launch(tmp_path, date, started):
+    calls = []
+    async def launch(): calls.append(True)
+    c = setup(tmp_path, launch)
+    c.started = started
+    message = update()
+    message['message']['date'] = date
+    await c.handle(message)
+    assert 'время вне допустимого' in c.transport.messages[0][1]
+    assert not calls
+    assert c.task is None
+    assert c.store.data['offset'] == 2
+    await c.handle(message)
+    assert len(c.transport.messages) == 1
+
+
+async def test_failed_notification_is_visible_without_exception_secrets(tmp_path, capsys):
+    class SecretFailure:
+        async def send(self, *args):
+            raise RuntimeError('https://example.invalid/botSECRET')
+    c = setup(tmp_path, None, SecretFailure())
+    await c.handle(update(text='/status'))
+    error = capsys.readouterr().err
+    assert 'notification delivery failed' in error
+    assert 'SECRET' not in error
+
+
+async def test_clock_skew_close_keeps_recovery_check_and_deduplication(tmp_path):
+    calls = []
+    c = setup(tmp_path, None)
+    async def recovery(*, require_flat):
+        calls.append(('check', require_flat))
+        return {'status': 'CLOSE_READY'}
+    async def close(): calls.append(('close',))
+    c.recovery, c.close = recovery, close
+    message = update(text='/close')
+    message['message']['date'] = 1002
+    await c.handle(message)
+    await c.task
+    await c.handle(message)
+    assert calls == [('check', False), ('close',)]
 
 
 async def test_duplicate_and_parallel_run_have_one_durable_launch(tmp_path):

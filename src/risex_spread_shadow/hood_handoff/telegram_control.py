@@ -28,6 +28,8 @@ from .operator_view import read_lifecycle, read_execution_notices, read_launch_f
 from .operator_control import exclusive_lock
 from . import telegram_messages as views
 
+MAX_COMMAND_FUTURE_SKEW_SECONDS = 5
+
 
 @dataclass(frozen=True)
 class BotBinding:
@@ -284,7 +286,8 @@ class Controller:
         try:
             await self.transport.send(self.owner, text)
         except Exception:
-            pass  # Delivery failure never repeats or aborts a cycle.
+            # Never print exception text: a transport URL can contain the token.
+            print('Telegram notification delivery failed; command will not be replayed.', file=sys.stderr, flush=True)
 
     async def lifecycle_notices(self):
         """Finite stage and per-attempt execution notices, outside the child."""
@@ -390,7 +393,11 @@ class Controller:
             or any(k in message for k in ('forward_origin', 'forward_date', 'via_bot', 'sender_chat'))):
             return
         date = message.get('date')
-        if not integer(date) or date < self.started or not 0 <= self.now() - date <= 120:
+        if (not integer(date) or date < self.started
+                or not -MAX_COMMAND_FUTURE_SKEW_SECONDS <= self.now() - date <= 120):
+            print('Telegram owner command rejected: timestamp outside allowed window.', file=sys.stderr, flush=True)
+            await self.notify('Команда не выполнена: её время вне допустимого окна. '
+                              'Отправьте новую команду. Если отказ повторится, проверьте часы компьютера.')
             return
         command = message.get('text')
         launch_options = {}

@@ -1,3 +1,9 @@
+# Telegram timestamp handling — verified 2026-09-24
+
+Telegram API was reachable with no pending updates/webhook, but its HTTP Date led the host clock by about 2 seconds. The old owner-command gate silently consumed all future-dated messages. Fixed with a bounded 5-second allowance, explicit timestamp refusal and safe delivery-failure logging; identity, freshness, restart and no-replay checks remain. Historical discarded message dates are unavailable, so this is a reproduced defect consistent with the observed silence, not proof of every lost message.
+
+Self-review complete. All 49 focused controller checks and the final clean isolated Python 3.11.5 suite passed: 5566 passed, 3 skipped, 2 dependency warnings, exit 0. The installed source matches the workspace src/tests manifest. No live orders. Evidence: spread-shadow-runs/hood-telegram-clock-skew-20260924/solo-v1/.
+
 # Interrupted Telegram close recovery — active 2026-09-24
 
 Code integrated into local main at `61f666159c9cd7f31b4cb4127f8bd3a8cfaedc3d` now reconciles an inherited `/close` with the existing bounded `CLOSE_READY` check on startup. Controller PID 9097 is connected to Telegram and holds the instance lock; the operator lock is free and no trading child exists. Its administrative `active` marker is clear, while `close-011` remains historically `BLOCKED` because its journal has no terminal record. Fresh startup proof resolved all 428 prior creation intents (three by current exact read), found no active selected-market orders, and observed positions -0.00025 BTC on account 27331 and +0.00025 BTC on account 27337. The original cycle/close journals and configuration hashes are unchanged; no agent order, cancellation, setting or Telegram trading command was sent. `/run` remains correctly refused until a fresh check proves both positions exactly zero; the owner can send a new `/close` to attempt reduce-only closure.

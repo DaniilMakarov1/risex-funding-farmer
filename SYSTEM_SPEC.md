@@ -1,3 +1,7 @@
+# Telegram command time validation
+
+Authenticated private owner messages may lead the controller clock by at most 5 seconds, to tolerate small Telegram/host clock differences. The 120-second expiry, pre-start filter and durable update deduplication still apply. Invalid owner timestamps receive an explanatory refusal. Notification failures write a fixed credential-free diagnostic; they never replay commands or abort trading operations.
+
 # Interrupted Telegram /close startup recovery (2026-09-24)
 
 After proving the inherited child is gone, controller startup reconciles a historical `/close` using the same bounded `CLOSE_READY` read-only check used for a fresh `/close`. It clears only the administrative active marker when all prior creation intents are terminal and current account evidence is valid; an incomplete/unknown check retains the marker. Nonzero positions remain nonzero and `/run` still requires a separate fresh `READY` check with both positions exactly zero. Startup never sends an order, cancellation or setting change. The incomplete close journal remains incomplete.

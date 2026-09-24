@@ -1,3 +1,7 @@
+# Telegram responsiveness
+
+Small clock differences of up to 5 seconds ahead of the host no longer silently discard owner commands. Commands outside the permitted time window receive a refusal; send a new command rather than replaying old updates. Delivery errors appear in the private controller log without tokens or message contents.
+
 # Operator request timeout
 
 The working operator configuration `spread-shadow-runs/hood-cycle-race-latency-20260920/operator-v1/random-cycle.json` sets `request_timeout_seconds` to 15 seconds. This is an upper wait bound, not a mandatory delay. Other deadlines and freshness checks retain their own bounds. Configuration files omitting this field retain the code default.
