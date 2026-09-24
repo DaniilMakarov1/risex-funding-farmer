@@ -1,3 +1,9 @@
+# Controller activation — owner-authorized 2026-09-24
+
+Start the Telegram controller using the validated working configuration with request_timeout_seconds=15. Preserve saved command history and operation state; do not submit a trading command. Verify process health, instance lock ownership and startup output. This supersedes the previous instruction to leave the controller stopped.
+
+Controller started as PID 4416 with request_timeout_seconds=15. Process alive and instance lock held; configuration unchanged and startup log empty. No trading command sent. Verification: spread-shadow-runs/hood-request-timeout-15-20260924/activation-v1/verification.json.
+
 # Request timeout configuration — owner-authorized 2026-09-24
 
 Change the active operator configuration request_timeout_seconds from 5 to 15. Configuration-only work from main dd5c85d on codex/request-timeout-15; preserve other deadlines, trading logic, saved operation history and original journals. Validate with the actual local configuration parser, update the derived Telegram configuration binding under idle operator/instance locks, and preserve the stopped/running controller state. No real orders or new execution campaign.

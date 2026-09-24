@@ -1,3 +1,7 @@
+# Controller activation — 2026-09-24
+
+Controller started as PID 4416 with request_timeout_seconds=15. Process alive and instance lock held; configuration unchanged and startup log empty. No trading command sent. Verification: spread-shadow-runs/hood-request-timeout-15-20260924/activation-v1/verification.json.
+
 # Request timeout — configured 2026-09-24
 
 The working operator random-cycle.json now explicitly sets request_timeout_seconds=15 (previously 5). Actual local parser validation passed; all other config fields unchanged. Telegram binding updated under operator/instance locks, preserving saved history/offset/active state. Controller was not running and was not started. Applies to subsequent runs using this configuration; no source change, no financial action. This does not resolve the cycle 137 residual-close defect. Evidence: spread-shadow-runs/hood-request-timeout-15-20260924/solo-v1/verification.json.
