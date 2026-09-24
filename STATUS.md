@@ -1,6 +1,6 @@
-# Paired-close HTTP warmup — WIP_NOT_ACCEPTED
+# Paired-close HTTP warmup — verified, activation pending
 
-Sole implementation on codex/close-http-warmup from7eb5066. Seven focused regressions pass: warmup before close quote, errors/unfinished reads do not block close, cancellation drains reads, actual local HTTP connection reuse, server-forced closure without replay and selected-WS skip. No real trading. Full clean isolated Python3.11 suite pending. Evidence: spread-shadow-runs/hood-close-http-warmup-20260924/solo-v1. ACK remains request acceptance only; current ws_confirmed source-order gate remains unchanged.
+Sole implementation on codex/close-http-warmup from7eb5066. Seven focused regressions passed, including failures, cancellation, local HTTP pool reuse and server-forced reconnect without replay. Final clean isolated Python3.11 suite at3597f05:5467 passed,3 skipped,2 dependency warnings in154.10s, exit0. The unchanged paper runtime also printed a pending-task teardown diagnostic. Full diff self-review completed. A bounded pair of public Robinhood reads confirmed connection reuse; this is not a live order-speed measurement. No real trading. Evidence: spread-shadow-runs/hood-close-http-warmup-20260924/solo-v1. ACK remains request acceptance only; current ws_confirmed source-order gate remains unchanged.
 
 # Race latency verification — integrated and active (2026-09-24)
 
