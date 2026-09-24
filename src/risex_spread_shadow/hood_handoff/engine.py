@@ -984,7 +984,6 @@ class HandoffEngine:
         self._last_pre_visibility_original_checks = None
         receiver_mutation_observations: tuple[Any, ...] = (source, receiver, plan.metadata_observed_at)
         receiver_mutation_observation_now: float | None = None
-        ws_evidence_deadline: float | None = None
         prepared_source: Any | None = None
         prepared_receiver: Any | None = None
         prepared_source_plan: OrderPlan | None = None
@@ -1258,10 +1257,6 @@ class HandoffEngine:
                                   "public_book": public_book,
                                   "account_evidence_basis": "pre-LIMIT snapshots"}
                 receiver_mutation_observations = (source, receiver, source_order, public_book, plan.metadata_observed_at)
-                ws_evidence_deadline = self._evidence_deadline(
-                    observations=(source_order, public_book), observation_now=now,
-                    freshness_seconds=0.5, request_timeout_seconds=config.request_timeout_seconds,
-                )
             except Exception as exc:
                 reason = str(exc) if isinstance(exc, PreflightBlocked) else sanitize_exception(exc)
                 unknown_reasons.append(f"WS_ADMISSION_STOP: {reason}")
@@ -1754,8 +1749,6 @@ class HandoffEngine:
             )
             receiver_dispatch_plan = prepared_receiver_plan or receiver_admission_plan
             receiver_final_deadline = receiver_admission_plan.mutation_deadline_monotonic
-            if ws_evidence_deadline is not None:
-                receiver_final_deadline = min(receiver_final_deadline, ws_evidence_deadline)
             if prepared_receiver_plan is not None:
                 prepared_deadline = prepared_receiver_plan.mutation_deadline_monotonic
                 if (

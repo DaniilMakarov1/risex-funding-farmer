@@ -251,11 +251,11 @@ def test_cli_parses_explicit_admission_without_changing_default_binding(tmp_path
 
 
 @pytest.mark.asyncio
-async def test_ws_receiver_send_keeps_short_stream_deadline(tmp_path):
+async def test_ws_admission_does_not_shorten_ack_timeout_to_stream_age(tmp_path):
     class Deadline(WsCycleClient):
         async def submit_prepared_order(self, plan, prepared, *, deadline=None):
             if plan.order_type == 'MARKET':
-                assert 0 < deadline - time.monotonic() <= .5
+                assert .5 < deadline - time.monotonic() <= 10
             return await super().submit_prepared_order(plan, prepared, deadline=deadline)
 
     clock = AdvancingClock()
