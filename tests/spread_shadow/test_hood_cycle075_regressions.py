@@ -115,7 +115,7 @@ async def test_reserved_cancel_nonce_is_consumed_without_second_network_read():
     async def no_read(*args,**kwargs):raise AssertionError('late nonce request')
     c._next_nonce=no_read
     prepared=await c.prepare_cancel_order(11,c.config.market_id,'123',reserved_nonce=token)
-    assert prepared.diagnostic_timings['cancel_nonce_reserved_before_visibility']==1
+    assert prepared.diagnostic_timings['cancel_nonce_reserved_before_signing']==1
     assert token._state=='CONSUMED'
     with pytest.raises(ContractError):
         await c.prepare_cancel_order(11,c.config.market_id,'123',reserved_nonce=token)

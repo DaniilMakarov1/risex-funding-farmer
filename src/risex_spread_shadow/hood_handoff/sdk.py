@@ -2028,7 +2028,7 @@ class LighterSdkClient:
             if reserved_nonce is not None:
                 self._nonce_reservations.pop(self._nonce_key(account_index, key, nonce))
                 object.__setattr__(reserved_nonce, "_state", "CONSUMED")
-                prepared.diagnostic_timings["cancel_nonce_reserved_before_visibility"] = 1.0
+                prepared.diagnostic_timings["cancel_nonce_reserved_before_signing"] = 1.0
                 prepared.diagnostic_timings["cancel_nonce_reservation_seconds"] = reserved_nonce.diagnostic_timings["nonce_acquisition_seconds"]
             self._register_prepared(prepared)
             return prepared
