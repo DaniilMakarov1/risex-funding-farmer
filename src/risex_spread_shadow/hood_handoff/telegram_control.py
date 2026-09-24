@@ -516,7 +516,10 @@ async def serve(args, store, lock_fd, token):
         controller.finish()
         if store.data['active'] is not None:
             try:
-                await controller.reconcile_idle()
+                # An interrupted /close can be retried against proved residual
+                # inventory; /run still requires both accounts to be flat.
+                require_flat = store.data['active'].get('action', 'run') != 'close'
+                await controller.reconcile_idle(require_flat=require_flat)
             except Exception:
                 pass  # Fresh commands retry the check; no automatic order.
         latest = await api.call('getUpdates', offset=-1, timeout=0, allowed_updates=['message'])

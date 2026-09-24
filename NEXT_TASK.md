@@ -1,3 +1,7 @@
+# Interrupted Telegram close recovery — owner request 2026-09-24
+
+Diagnose and remove the current administrative Telegram barrier without submitting a trading command. Work alone from clean local main `28060731771500e8ed29dc792bf79e92e52d9879` on `codex/telegram-close-recovery-20260924`. The saved `close-011` lacks a terminal record after a proved zero-fill/slippage cancellation and a transient account-read retry. A current read-only check resolved all 428 historical creation intents and observed no active BTC orders, but found positions -0.00025/+0.00025 BTC. Preserve original journals, exact order/identity checks, and the flat-inventory requirement for `/run`. On restart, allow an interrupted `/close` marker to clear only after the existing `CLOSE_READY` reconciliation; an unknown check retains it. Do not submit `/run`, `/close`, orders, cancellations or settings. Test adverse startup and new-run refusal, run the final clean isolated Python 3.11 suite, self-review and activate only with no trading child. Record the tested source, saved state and recovery proof in owner-only evidence. Closing the remaining positions is a separate owner-triggered `/close` action.
+
 # Controller activation — owner-authorized 2026-09-24
 
 Start the Telegram controller using the validated working configuration with request_timeout_seconds=15. Preserve saved command history and operation state; do not submit a trading command. Verify process health, instance lock ownership and startup output. This supersedes the previous instruction to leave the controller stopped.

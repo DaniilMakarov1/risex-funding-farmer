@@ -272,6 +272,82 @@ async def test_server_discards_backlog_and_uses_fixed_detached_child(tmp_path, m
     assert store.data['offset'] == 12
 
 
+@pytest.mark.parametrize('action,proof_status,require_flat,cleared', [
+    ('close', 'CLOSE_READY', False, True),
+    ('close', 'UNKNOWN', False, False),
+    ('run', 'CLOSE_READY', True, False),
+    ('run', 'READY', True, True),
+])
+async def test_startup_reconciles_interrupted_action_without_dispatch(
+    tmp_path, monkeypatch, action, proof_status, require_flat, cleared,
+):
+    tmp_path.chmod(0o700)
+    config = tmp_path / 'random-cycle.json'
+    config.write_text('{}')
+    (tmp_path / 'market-contract.json').write_text('{}')
+    slot = tmp_path / ('close-001' if action == 'close' else 'cycle-001')
+    slot.mkdir()
+    store = bot.Store(tmp_path / '.telegram-control', 'binding')
+    store.data['active'] = {'before': [], 'update_id': 1, 'action': action}
+    store.save()
+    calls = []
+
+    class Stop(BaseException): pass
+    class API(Transport):
+        async def call(self, method, **payload):
+            assert method == 'getUpdates'
+            raise Stop()
+    class Session:
+        def __init__(self, **kwargs): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *args): pass
+    async def recover(*args, require_flat=True):
+        calls.append(require_flat)
+        return {'status': proof_status, 'at': 1000, 'previous_intents': 1}
+
+    from risex_spread_shadow.hood_handoff import cli, operator_recovery
+    monkeypatch.setattr(cli, '_validate_simple_local_inputs', lambda *a, **k: (object(), {}))
+    monkeypatch.setattr(operator_recovery, 'check_recovery', recover)
+    monkeypatch.setattr(bot, 'Telegram', lambda *args: API())
+    monkeypatch.setattr(bot.aiohttp, 'ClientSession', Session)
+    monkeypatch.setattr(bot.asyncio, 'create_subprocess_exec',
+                        lambda *args, **kwargs: pytest.fail('startup dispatched an order'))
+    original_is_file = Path.is_file
+    monkeypatch.setattr(Path, 'is_file',
+                        lambda p: True if str(p).endswith('.venv-hood/bin/python') else original_is_file(p))
+    with pytest.raises(Stop):
+        await bot.serve(SimpleNamespace(config=config, owner_id=42), store, 99, 'unused')
+    assert calls == [require_flat]
+    assert (store.data['active'] is None) is cleared
+    assert store.data['last'] == {'status': 'BLOCKED', 'cycle': slot.name}
+    assert json.loads(store.path.read_text())['active'] == store.data['active']
+
+
+async def test_nonflat_close_recovery_keeps_run_guard(tmp_path):
+    from risex_spread_shadow.hood_handoff.contracts import PreflightBlocked
+
+    launches = []
+    async def launch(): launches.append(True)
+    c = setup(tmp_path, launch)
+    c.store.data['active'] = {'before': [], 'update_id': 1, 'action': 'close'}
+    c.store.save()
+    calls = []
+    async def recover(*, require_flat=True):
+        calls.append(require_flat)
+        if require_flat:
+            raise PreflightBlocked('positions remain; use /close before /run')
+        return {'status': 'CLOSE_READY', 'at': 1000, 'previous_intents': 1}
+    c.recovery = recover
+
+    await c.reconcile_idle(require_flat=False)
+    await c.handle(update(2, '/run'))
+    await c.task
+    assert calls == [False, True]
+    assert launches == []
+    assert c.store.data['active'] is None
+    assert 'Есть открытые позиции' in c.transport.messages[-1][1]
+
+
 async def test_persistence_failure_prevents_dispatch(tmp_path, monkeypatch):
     calls = []
     async def launch(): calls.append(True)

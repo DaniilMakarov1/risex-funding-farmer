@@ -1,3 +1,7 @@
+# Interrupted Telegram /close startup recovery (2026-09-24)
+
+After proving the inherited child is gone, controller startup reconciles a historical `/close` using the same bounded `CLOSE_READY` read-only check used for a fresh `/close`. It clears only the administrative active marker when all prior creation intents are terminal and current account evidence is valid; an incomplete/unknown check retains the marker. Nonzero positions remain nonzero and `/run` still requires a separate fresh `READY` check with both positions exactly zero. Startup never sends an order, cancellation or setting change. The incomplete close journal remains incomplete.
+
 # ACK cancellation and recovery correction (2026-09-24)
 
 Cancellation binds any pre-reserved nonce to the exact source order even when ACK admission skipped private publication. Preparation failure releases its unsent reservation; ambiguous cancellation is never replayed. A provisional missing-source observation before cleanup is resolved only by an exact matching terminal source order, complete validated receipts and agreeing causal position; all unrelated uncertainties remain barriers. Residual closure refreshes lagging trade history and account positions within configured read/time bounds without resending the order. Duplicate/conflicting receipts, identity changes, active orders, incomplete evidence and exhausted propagation bounds remain explicit failures; missing fees remain unknown.
