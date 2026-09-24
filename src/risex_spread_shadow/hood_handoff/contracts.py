@@ -1205,8 +1205,11 @@ class HandoffConfig:
     source_quote_observed_at: float | None = None
     max_quote_age_seconds: float | None = None
     max_source_to_receiver_seconds: float | None = None
+    receiver_admission: str = "strict"
 
     def __post_init__(self) -> None:
+        if self.receiver_admission not in ("strict", "ws_confirmed"):
+            raise ContractError("receiver_admission must be strict or ws_confirmed")
         _int(self.market_id, "market_id", minimum=0)
         try:
             direction = self.direction if isinstance(self.direction, Direction) else Direction(self.direction)
@@ -1219,6 +1222,8 @@ class HandoffConfig:
             if operation_mode is not OperationMode.CLOSE_REOPEN and operation_mode is not mode_value:
                 raise ContractError("mode conflicts with operation_mode")
             operation_mode = mode_value
+        if self.receiver_admission == "ws_confirmed" and operation_mode not in (OperationMode.PAIRED_OPENING, OperationMode.PAIRED_CLOSING):
+            raise ContractError("ws_confirmed admission requires a paired operation")
         object.__setattr__(self, "operation_mode", operation_mode)
         if self.mode is not None:
             object.__setattr__(self, "mode", operation_mode)

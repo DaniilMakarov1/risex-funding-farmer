@@ -626,7 +626,7 @@ class LighterSdkClient:
         self._pending_mutation_deadline = value
 
     async def start_read_stream(self, *, ready_timeout: float = 5.0) -> bool:
-        """Warm one read-only stream; keep REST as every execution proof gate."""
+        """Warm one bounded read stream; final reconciliation remains authoritative."""
         if self._closed or self._read_stream_started:
             return False
         self._read_stream_started = True
@@ -720,6 +720,45 @@ class LighterSdkClient:
         state, task = self._read_stream_state, self._read_stream_task
         return bool(state is not None and task is not None and not task.done()
                     and state.subscription_ready(time.monotonic()))
+
+    def begin_ws_admission(self) -> dict[str, Any]:
+        """Anchor local stream health before source exposure, without network IO."""
+        state = self._read_stream_state
+        if state is None or not self.read_stream_ready():
+            raise ContractError("WS admission requires subscribed healthy stream")
+        if state.observer.malformed or state.observer.order_conflicts or state.reads.invalid_orders:
+            raise ContractError("WS admission stream contains invalid order evidence")
+        if state.reads.book(time.monotonic(), 0.5) is None:
+            raise ContractError("WS admission book is stale or unavailable")
+        if any(order.active for order, _ in state.reads.orders.values()):
+            raise ContractError("WS admission observed an active order before source dispatch")
+        return {"owner": self, "state": state, "epoch": state.observer.epoch,
+                "versions": dict(state.order_versions),
+                "malformed": state.observer.malformed, "conflicts": state.observer.order_conflicts}
+
+    def ws_admission_view(self, anchor: Mapping[str, Any], source: OrderPlan,
+                          order_id: str | None) -> tuple[OrderSnapshot | None, Any]:
+        """Local veto/observation, deliberately not complete account or FIFO proof."""
+        state = self._read_stream_state
+        if (anchor.get("owner") is not self or state is None or anchor.get("state") is not state
+                or anchor.get("epoch") != state.observer.epoch or not self.read_stream_ready()):
+            raise ContractError("WS admission connection changed or is unavailable")
+        if (state.observer.malformed != anchor["malformed"]
+                or state.observer.order_conflicts != anchor["conflicts"] or state.reads.invalid_orders):
+            raise ContractError("WS admission received invalid/conflicting events")
+        expected = (source.account_index, source.client_order_index)
+        if any(key != expected and version != anchor["versions"].get(key)
+               for key, version in state.order_versions.items()):
+            raise ContractError("WS admission observed an unexpected account order change")
+        if any(key != expected and order.active for key, (order, _) in state.reads.orders.items()):
+            raise ContractError("WS admission observed another active order")
+        now = time.monotonic()
+        book = state.reads.book(now, 0.5)
+        if book is None:
+            raise ContractError("WS admission book is stale or unavailable")
+        order = state.reads.order(source.account_index, source.market_id, source.client_order_index,
+                                  order_id, now, 0.5, terminal_only=False)
+        return order, book
 
     def http_read_summary(self) -> dict[str, Any]:
         # Bounded numeric diagnostics only, flushed outside the order path.

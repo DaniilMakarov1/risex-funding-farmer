@@ -328,11 +328,14 @@ class RandomCycleConfig:
     defer_incremental_margin_calculation: bool = False
     max_quote_age_seconds: float | None = None
     max_source_to_receiver_seconds: float | None = None
+    receiver_admission: str = "strict"
     margin_reserve: OpeningMarginReserve | None = None
     confirmed_pilot: bool = False
     pilot_allow_leverage_update: bool = False
 
     def __post_init__(self) -> None:
+        if self.receiver_admission not in ("strict", "ws_confirmed"):
+            raise ContractError("receiver_admission must be strict or ws_confirmed")
         object.__setattr__(self, "market_id", _int(self.market_id, "market_id"))
         object.__setattr__(self, "market_symbol", _text(self.market_symbol, "market_symbol").upper())
         try:
@@ -466,6 +469,7 @@ class RandomCycleConfig:
             "max_poll_count": self.max_poll_count,
             "source_order_lifetime_seconds": self.source_order_lifetime_seconds,
             "defer_incremental_margin_calculation": self.defer_incremental_margin_calculation,
+            **({"receiver_admission": self.receiver_admission} if self.receiver_admission != "strict" else {}),
             **({"confirmed_pilot": True} if self.confirmed_pilot else {}),
             **({"pilot_allow_leverage_update": True} if self.pilot_allow_leverage_update else {}),
             **({"margin_reserve": {
@@ -3321,6 +3325,7 @@ class RandomCycleEngine:
             source_quote_observed_at=source_quote_observed_at,
             max_quote_age_seconds=config.max_quote_age_seconds,
             max_source_to_receiver_seconds=config.max_source_to_receiver_seconds,
+            receiver_admission=config.receiver_admission,
             # A reduce-only close does not add exposure.  The existing config
             # gate therefore remains strict for the opening only; carrying the
             # opening deferral flag into a close would be an invalid policy

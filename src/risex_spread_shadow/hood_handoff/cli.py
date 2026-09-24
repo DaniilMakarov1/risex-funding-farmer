@@ -860,6 +860,8 @@ def _print_simple_summary(
     print(f"\n══ НОВЫЙ ЦИКЛ · {symbol} · Robinhood Chain Mainnet ══")
     print(f"Один реальный Robinhood Chain Mainnet цикл: {symbol}; первый счёт и сторона лимитки случайны.")
     print(f"Счета: {source} и {receiver}; каждый может первым выставить BUY или SELL (четыре равновероятных варианта).")
+    if value.get("receiver_admission") == "ws_confirmed":
+        print("Режим: MARKET после WS-подтверждения лимитки; приоритет перед чужими заявками не гарантирован.")
     print("Для запуска требуется резерв на каждом счёте: 0.10 при выборе объёма и плеча, 0.02 перед ордерами (валюта баланса).")
     print(f"После Enter будет использован {credential_route}; до Enter нет чтения рынка или доступа к ключам.")
     print(f"Конфигурация: {config_path}; каталог результатов: {operator_dir}.")

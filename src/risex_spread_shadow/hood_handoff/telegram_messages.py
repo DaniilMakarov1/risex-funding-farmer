@@ -139,6 +139,8 @@ def launch_failure_message(name, code, *, blocked=False):
 
 def saved_message(name, report, *, blocked=False, detailed=False):
     lines = [f'<b>📋 Результат цикла</b> · <code>{text(name, 32)}</code>']
+    if report and report.get('binding', {}).get('receiver_admission') == 'ws_confirmed':
+        lines.append('Режим: MARKET после WS-подтверждения лимитки. Приоритет перед чужими заявками не гарантирован.')
     if blocked:
         lines.append('<b>⚠️ Прошлый исход требует сверки</b> · /run проверит готовность заново; /close — закрыть остаток.')
     lines.extend(text(line, 500) for line in result_lines(report, detailed=detailed))

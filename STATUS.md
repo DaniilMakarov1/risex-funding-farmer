@@ -1,3 +1,9 @@
+# WS-confirmed admission — implementation under verification
+
+Candidate branch codex/ws-confirmed-admission from accepted main c52ff46. An explicit mode removes repeated REST account/book/final-source admission in paired opening and closing; exact fresh private WS plus local L2 veto replaces that admission. Strict remains the omitted default. Full account and owner/FIFO equivalence is deliberately not claimed. Transactions, authoritative final reconciliation, recovery and ambiguity/no-replay rules remain unchanged.
+
+Controlled offline comparison with identical injected delays and six opening/closing observations per arm: median LIMIT→MARKET 931.588ms strict versus 530.472ms ws_confirmed, 401.116ms/43.06% reduction (1.756x). This is a synthetic mechanism measurement, not real network/matching performance. The earlier failed expired-account cleanup test modeled old creation timestamps as fresh REST timestamps; corrected to actual SDK observation semantics and retained a negative stale-response control. A CLI fixture initially supplied an invalid null margin reserve; no product workaround was added. Final full suite and idle activation are pending; the running controller remains unchanged. Evidence: spread-shadow-runs/hood-ws-confirmed-20260924/solo-v1.
+
 ## Post-run correction — verified and active
 
 Integrated locally viaef44451; idle controller restarted asPID73820 with unchanged tested src/tests. Config/binding preserved; startup report reconciliation changed cycle081 BLOCKED→FINISHED and cleared its administrative active state through Controller.finish, with no manual reset/replay. Instance lock held, operator lock free, no child. No remote push or agent financial action.

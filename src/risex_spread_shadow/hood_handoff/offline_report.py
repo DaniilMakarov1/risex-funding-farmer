@@ -106,6 +106,8 @@ _PROJECTED_KEYS = frozenset(
         "position_before",
         "position_observed_at",
         "priority_guard",
+        "receiver_admission",
+        "account_evidence_basis",
         "priority_proof_admitted",
         "priority_reason",
         "priority_status",

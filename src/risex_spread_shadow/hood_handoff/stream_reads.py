@@ -1,7 +1,8 @@
 """Validated positive WS observations; absence never proves empty inventory.
 
-L2 depth is for price selection only, never public owner/queue admission.
-Active private observations are usable for discovery, not final admission.
+L2 depth never proves public owner/queue priority. The explicit ws_confirmed
+mode uses exact private observations and L2 vetoes for admission, accepting
+unobserved external changes; strict admission retains its REST proofs.
 """
 from __future__ import annotations
 
