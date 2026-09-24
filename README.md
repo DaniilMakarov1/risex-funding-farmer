@@ -1,3 +1,7 @@
+# Recovery correction — 2026-09-24
+
+ACK cancellation now consumes the already reserved nonce after locating the exact LIMIT, including a refusal before private WS publication. Residual closure waits within configured bounds for delayed trade history and position propagation; it never resends an uncertain order. Reports distinguish known external fills from overall UNKNOWN, record preflight refusals as completed refusals, and use the final cycle reason rather than an earlier retry. Trading modes, ticks, size, leverage and fees policy are unchanged. Activation and verification status are in STATUS.md.
+
 ## Price and receiver timing switches
 
 The configured default is shown before each cycle. Telegram: `/run ws 5` waits for exact private LIMIT state and improves price by five ticks; `/run ack 5` sends MARKET after a positive application ACK, without waiting for that state. `/run ws 1` and `/run ack 1` compare one tick. The tick argument is optional (uses configuration); overrides apply to this cycle and its paired closing only. `/run` uses saved defaults. These commands initiate real trading; `/close` retains its separate reduce-only behavior.

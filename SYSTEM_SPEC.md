@@ -1,3 +1,9 @@
+# ACK cancellation and recovery correction (2026-09-24)
+
+Cancellation binds any pre-reserved nonce to the exact source order even when ACK admission skipped private publication. Preparation failure releases its unsent reservation; ambiguous cancellation is never replayed. A provisional missing-source observation before cleanup is resolved only by an exact matching terminal source order, complete validated receipts and agreeing causal position; all unrelated uncertainties remain barriers. Residual closure refreshes lagging trade history and account positions within configured read/time bounds without resending the order. Duplicate/conflicting receipts, identity changes, active orders, incomplete evidence and exhausted propagation bounds remain explicit failures; missing fees remain unknown.
+
+Preflight refusals save a terminal cycle record without inventing flat inventory. Saved reports keep validated external counterparties even when the overall phase is UNKNOWN; that does not promote the cycle to complete or prove economics. The final cycle reason comes from the terminal cycle record, while earlier retry reasons remain historical evidence.
+
 # Configurable tick improvement and ACK admission (2026-09-24)
 
 RandomCycleConfig.price_improvement_ticks accepts explicit integers1..5. Every initial/revalidated opening and paired-close quote uses that exact offset: BUY=best bid+N ticks, SELL=best ask-N ticks. The candidate must remain strictly inside the spread. Otherwise PRICE_OFFSET_NO_ROOM stops that paired attempt before its LIMIT; existing residual recovery still applies after an opened position. Omitted configuration retains legacy one-tick/best-price fallback. No notional, leverage, fee or slippage bounds are widened.

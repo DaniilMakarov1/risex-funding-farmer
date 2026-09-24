@@ -403,6 +403,9 @@ def result_lines(report, *, detailed=False):
     economics, binding = mapping(report.get('economics')), mapping(report.get('binding'))
     fees, pnl = mapping(economics.get('fees')), mapping(economics.get('closed_execution_pnl'))
     lines = []
+    cycle = mapping(report.get('cycle'))
+    if cycle.get('outcome') == 'FAILED_PREFLIGHT_BLOCKED' and not report.get('dispatched_actions'):
+        lines.append('Запуск завершён до отправки торговых ордеров: ' + clean(cycle.get('reason'), 320))
     notice = ws_admission_notice(mapping(report.get('cycle')).get('reason'))
     if notice:
         lines.append(notice)

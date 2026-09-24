@@ -2164,7 +2164,7 @@ class RandomCycleEngine:
                     journal.append("CYCLE_PREFLIGHT_BLOCKED" if preflight else "CYCLE_EXECUTION_UNKNOWN", {"reason": reason})
                 except Exception:
                     pass
-            return RandomCycleResult(
+            result = RandomCycleResult(
                 outcome=Outcome.FAILED_PREFLIGHT_BLOCKED if preflight else Outcome.UNKNOWN,
                 phase=Phase.PREFLIGHT if preflight else Phase.RECONCILIATION,
                 run_id="" if journal is None else journal.run_id,
@@ -2172,6 +2172,11 @@ class RandomCycleEngine:
                 reason=reason,
                 journal_path=str(config.journal_path),
             )
+            if preflight and journal is not None:
+                # A completed refusal before paired orders is not an abandoned
+                # cycle. Do not infer flat inventory or erase setting intents.
+                journal.append("CYCLE_COMPLETE", result.as_dict())
+            return result
         finally:
             try:
                 await self._release_preflight_nonces()
@@ -2370,7 +2375,9 @@ class RandomCycleEngine:
             pair_budget,
         )
         if isinstance(prepared, RandomCycleResult):
-            return _with_cycle_classifications(prepared)
+            result = _with_cycle_classifications(prepared)
+            journal.append("CYCLE_COMPLETE", result.as_dict())
+            return result
         metadata, book, source, receiver, selection = prepared
         self._selection = selection
         opening_preparation_result: RandomCycleResult | None = None
@@ -4109,11 +4116,16 @@ class RandomCycleEngine:
         *,
         attempt_ordinal: int,
     ) -> tuple[list[TradeReceipt], list[Any], str | None]:
-        """Read all bounded history pages for one fallback order."""
+        """Read bounded pages/refreshes until receipts explain the terminal fill.
+
+        An empty complete page can precede publication of a filled order's
+        trades. Refresh reads only; never resubmit the closing order.
+        """
 
         trades: list[TradeReceipt] = []
         pages: list[Any] = []
         seen_trade_ids: set[str] = set()
+        observed_trades: dict[str, TradeReceipt] = {}
         cursor: str | None = None
         deadline = self.clock.now() + config.reconcile_timeout_seconds
         for page_number in range(1, config.max_poll_count + 1):
@@ -4160,13 +4172,30 @@ class RandomCycleEngine:
                         else trade.price >= plan.price
                     ):
                         raise ContractError("fallback trade violates the executable price bound")
-                    trades.append(trade)
+                    previous = observed_trades.get(trade.trade_id)
+                    if previous is not None:
+                        if replace(trade, observed_at=previous.observed_at) != previous:
+                            raise ContractError("fallback refreshed trade has conflicting receipt fields")
+                    else:
+                        observed_trades[trade.trade_id] = trade
+                        trades.append(trade)
             except Exception as exc:
                 return trades, pages, f"fallback trade reconciliation is unknown: {_cycle_exception_reason(exc)}"
             if not page.next_cursor:
                 if not page.complete:
                     return trades, pages, "fallback trade history is incomplete"
-                return trades, pages, None
+                total = sum((trade.quantity for trade in trades), Decimal(0))
+                if total == order.filled_quantity:
+                    return trades, pages, None
+                if total > order.filled_quantity:
+                    return trades, pages, "fallback trade receipt sum exceeds terminal fill"
+                remaining = deadline - self.clock.now()
+                if page_number == config.max_poll_count or remaining <= 0:
+                    return trades, pages, "fallback terminal fill history did not converge within configured bounds"
+                await self.clock.sleep(min(config.poll_interval_seconds, remaining))
+                cursor = None
+                seen_trade_ids.clear()
+                continue
             if page.next_cursor == cursor:
                 return trades, pages, "fallback trade history cursor repeated"
             cursor = page.next_cursor
@@ -4815,7 +4844,47 @@ class RandomCycleEngine:
             raise
         filled = sum((trade.quantity for trade in trades), Decimal(0))
         expected_after = before.signed_position + (-filled if side == "SELL" else filled)
-        if order.filled_quantity != filled or after.signed_position != expected_after:
+        # The account projection can lag the terminal order and its receipts.
+        # Refresh only the same bound account; never send another close while
+        # the causal position is unresolved.
+        position_deadline = self.clock.now() + config.reconcile_timeout_seconds
+        for _ in range(1, config.max_poll_count):
+            if after.signed_position == expected_after or after.active_orders:
+                break
+            remaining = position_deadline - self.clock.now()
+            if remaining <= 0:
+                break
+            try:
+                await self.clock.sleep(min(config.poll_interval_seconds, remaining))
+                refreshed = await self._read_account(config, before.account_index, "fallback position propagation read")
+                _validate_account_fresh(
+                    config, refreshed,
+                    "source" if before.account_index == config.source_account_index else "receiver",
+                    self.clock.now(),
+                )
+                if refreshed.source_identity != before.source_identity:
+                    raise _AccountIdentityFailure("fallback refreshed account identity changed")
+                after = refreshed
+            except asyncio.CancelledError:
+                finish(FallbackResult(
+                    before.account_index, side, residual, True, Outcome.UNKNOWN,
+                    order_id=order.order_id, filled_quantity=filled,
+                    reason="fallback position propagation was interrupted",
+                    attempt=attempt_ordinal,
+                ), reconciliation_event="FALLBACK_RECONCILIATION_UNKNOWN")
+                raise
+            except Exception as exc:
+                # Preserve the error instead of treating the preceding stale
+                # account projection as a successful close.
+                if isinstance(exc, _AccountIdentityFailure):
+                    self._mark_identity_failure("fallback refreshed account identity/read validation failed")
+                return finish(FallbackResult(
+                    before.account_index, side, residual, True, Outcome.UNKNOWN,
+                    order_id=order.order_id, filled_quantity=filled,
+                    reason=f"fallback position propagation unresolved: {_cycle_exception_reason(exc)}",
+                    attempt=attempt_ordinal,
+                ), reconciliation_event="FALLBACK_RECONCILIATION_UNKNOWN")
+        if order.filled_quantity != filled or after.signed_position != expected_after or after.active_orders:
             reason = "fallback order, receipts and position disagree"
             return finish(
                 FallbackResult(

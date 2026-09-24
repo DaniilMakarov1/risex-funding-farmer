@@ -928,8 +928,13 @@ def _execution_evidence(
             fail("UNRESOLVED_EXECUTION", "terminal leg has unknown execution or missing dispatch state")
         if not fallback and not isinstance(value.get("unknown_reasons"), list):
             fail("UNRESOLVED_EXECUTION", "terminal leg lacks explicit unknown-reasons state")
-        if (value.get("outcome", record.payload.get("outcome")) == "UNKNOWN"):
-            fail("UNRESOLVED_EXECUTION", "terminal execution is explicitly UNKNOWN")
+        overall_unknown = value.get("outcome", record.payload.get("outcome")) == "UNKNOWN"
+        if overall_unknown:
+            # Overall uncertainty does not invalidate otherwise exact leg
+            # receipts. Keep it as a completion/economics barrier while still
+            # reporting proven external counterparties below.
+            issues.append(_issue("UNRESOLVED_EXECUTION", "terminal execution is explicitly UNKNOWN",
+                                 data=data, record=record, phase=phase, leg=leg, attempt=attempt))
         if not fallback:
             intent_present = any(r.event == f"{leg.upper()}_DISPATCH_INTENT" for r in data.records)
             if intent_present != dispatched:
@@ -1005,7 +1010,7 @@ def _execution_evidence(
             "market_id": plan.get("market_id"), "plan": dict(plan),
             "filled_quantity": None if quantity is None else str(quantity),
             "fee_total": value.get("fee_total"), "history_complete": history,
-            "resolved": not invalid, "dispatched": dispatched,
+            "resolved": not invalid and not overall_unknown, "dispatched": dispatched,
             "outcome": value.get("outcome", record.payload.get("outcome")),
             "economic_status": value.get("economic_status", record.payload.get("economic_status")),
             "position_before": None if position_before is None else str(position_before),
@@ -1075,6 +1080,7 @@ def _execution_evidence(
         for execution in executions:
             if any(execution["source_file"] == fill["source_file"] and execution["leg"] == fill["leg"] for fill in group):
                 execution["resolved"] = False
+                execution["trades"] = []
     return executions, fills, issues
 
 
@@ -2027,7 +2033,7 @@ def _paired_execution(
                 else "NO_FILL"
             )
         phase_resolved = bool(legs) and all(e.get("resolved") for e in legs)
-        if phase_resolved and any((_decimal_value(quantities.get(f"external_{leg}_quantity")) or Decimal(0)) > 0
+        if any((_decimal_value(quantities.get(f"external_{leg}_quantity")) or Decimal(0)) > 0
                                   for leg in ("source", "receiver")):
             # External execution is conclusive even when the other leg was
             # never sent or its IOC filled zero. It needs no reciprocal fill.
@@ -2453,7 +2459,8 @@ def load_saved_cycle_report(path: str | Path) -> dict[str, Any]:
                 if record.event in {"FALLBACK_RECONCILIATION_UNKNOWN", "FALLBACK_STOPPED_STATE_CHANGED",
                                     "FALLBACK_BLOCKED_IDENTITY_BARRIER"}
             ), None),
-            "reason": None if not reasons else reasons[0],
+            "reason": (cycle_complete.payload.get("reason") if cycle_complete is not None
+                       else (None if not reasons else reasons[0])),
             "preflight_reason": (None if preflight_blocked is None
                                  else preflight_blocked.payload.get("reason")),
             "process_exit_ignored": True,

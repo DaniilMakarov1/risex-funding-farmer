@@ -4139,7 +4139,10 @@ async def test_preparation_retry_exhaustion_returns_proved_selection_and_never_w
     rows = [json.loads(line) for line in (tmp_path / "retry-exhausted" / "cycle.jsonl").read_text().splitlines()]
     assert [row["payload"]["attempt"] for row in rows if row["event"] == "PREPARATION_ATTEMPT"] == [1, 2, 3]
     assert len([row for row in rows if row["event"] == "PREPARATION_RETRY"]) == 2
-    assert rows[-1]["event"] == "CYCLE_PREFLIGHT_BLOCKED"
+    assert rows[-2]["event"] == "CYCLE_PREFLIGHT_BLOCKED"
+    assert rows[-1]["event"] == "CYCLE_COMPLETE"
+    assert rows[-1]["payload"]["outcome"] == "FAILED_PREFLIGHT_BLOCKED"
+    assert rows[-1]["payload"]["remaining_positions"] == {"source": None, "receiver": None}
 
 
 @pytest.mark.asyncio

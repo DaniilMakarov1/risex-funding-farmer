@@ -2860,6 +2860,11 @@ class HandoffEngine:
                 )
                 return
             self._stream_milestone("cancel_decision", plan, current.order_id)
+            # ACK admission may skip the private-observation branch which
+            # normally binds the reserved nonce to an exact cancellation.
+            # Transfer that reservation now, before any ordinary cancel can
+            # request the same nonce again. This is outside receiver admission.
+            self._start_cancel_preparation(plan, current)
             preparation_wait_started = time.perf_counter()
             prepared_ready = bool(self._cancel_preparation_task is not None
                                   and self._cancel_preparation_order_id == current.order_id
@@ -3438,6 +3443,27 @@ class HandoffEngine:
         latency: Mapping[str, Any] | None = None,
         priority_guard: Mapping[str, Any] | None = None,
     ) -> HandoffResult:
+        provisional = "source order disappeared before cancellation reconciliation"
+        if (
+            provisional in unknown_reasons
+            and source.dispatched and source.history_complete
+            and not source.unknown_reasons
+            and source.order is not None and source.order.terminal
+            and self._order_matches(source.order, plan.source)
+            and source.order_id == source.order.order_id
+            and source.order.filled_quantity == source.filled_quantity
+            and source.position_after == source.position_before + (
+                source.filled_quantity if plan.source.side == "BUY" else -source.filled_quantity
+            )
+        ):
+            # Resolve only this transient read absence, not send ambiguity,
+            # identity conflicts or incomplete execution on either account.
+            journal.append("SOURCE_OBSERVATION_RESOLVED", {
+                "reason": provisional, "order_id": source.order_id,
+                "status": source.order.status,
+                "filled_quantity": str(source.filled_quantity),
+            }, run_id=run_id)
+            unknown_reasons = [r for r in unknown_reasons if r != provisional]
         joint_status, joint_quantity, joint_reasons = _joint_trade_match(source, receiver, plan.quantity)
         economic_status, economic_findings = _economic_findings(source, receiver)
         findings = tuple(dict.fromkeys((*joint_reasons, *economic_findings)))
