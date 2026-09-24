@@ -4,6 +4,8 @@ Owner requests audit, error correction and real-run measurements for cycles086â€
 
 Verification complete at9041a3c:391 focused and final clean full5432 passed/3 skipped/2 dependency warnings. Initial harness umask failure and its independent diagnosis are preserved in the packet. Integrate unchanged tested src/tests and activate only under idle operator/instance locks; no config/state reset or trading commands.
 
+Activation complete via local main9b29a39/controllerPID84493; tested source9041a3c unchanged. Config/state/history/offset preserved, no active operation or agent trading. Owner may continue sequential tests; new candidate real execution remains NOT_RUN.
+
 # WS-confirmed receiver admission â€” owner-authorized 2026-09-24
 
 The owner accepted the event-driven proposal. Parent works alone from main c52ff46 on codex/ws-confirmed-admission. Implement an explicit ws_confirmed admission mode for paired opening and closing: preflight accounts/margin/positions and prepare both orders before LIMIT; after accepted LIMIT wait for the exact private WS order, then use local fresh stream state to dispatch MARKET without REST account/book/final-source rechecks. This supersedes the old requirement to preserve those checks ONLY in this selected mode. Public L2 is a veto, not an owner/FIFO proof; public counterparty exclusivity is not guaranteed. Account risk uses bounded fresh pre-LIMIT snapshots; unseen external account changes remain a consciously accepted risk, not proven absence. Strict mode remains available and default for omitted configurations.
