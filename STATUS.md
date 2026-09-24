@@ -1,8 +1,10 @@
-# ACK cancellation/recovery fixes — verified, activation pending
+# ACK cancellation/recovery fixes — integrated and active
 
 Owner-run audit112–126 identified an ACK cancellation nonce reservation conflict, sticky provisional source absence, delayed residual-close receipts/positions and misleading terminal reporting. Sole implementation on codex/ack-recovery-fixes from accepted main5e557f1 corrects these paths without changing pricing, admission modes, quantity, leverage or ambiguous-write policy.22 new adverse regressions cover actual SDK nonce ownership, signing failure, ambiguous cancel without replay, both cycle phases, delayed/missing/contradictory histories, account identity and reporting. Saved-journal replay preserves54 original files and now reports119's external accounts18227/2302 while retaining its historical UNKNOWN;122 retains SUCCESS without an old retry reason.
 
 Final clean isolated Python3.11.5/lighter-sdk1.1.2 suite:5548 passed,3 skipped,2 dependency warnings in136.91s, exit0. The unchanged frozen paper runtime emitted its known pending-task teardown diagnostic.39 targeted isolation/regression checks passed. Initial failures and their test-harness/contract diagnoses are retained, not hidden; no unrelated frozen code changed. Self-review complete. Evidence:spread-shadow-runs/hood-ack-recovery-fixes-20260924/solo-v1. Integrate identical tested source and activate only under idle operator/instance locks, preserving config/state. No agent real trading; live recovery effectiveness remains to be observed in owner runs.
+
+Activation verified at local main537a6d0, controllerPID22651: operator/instance locks checked, no active child, tested source identical, config and saved controller state byte-identical before/after restart. Historical offsets and journals were preserved; no trading command was sent. Remote publication was not performed.
 
 # Tick/ACK switch — integrated and active
 
