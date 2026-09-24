@@ -4,6 +4,8 @@ Owner authorizes the parent to implement the three findings from cycles076–081
 
 Verification complete at05bbcf5: final clean suite5368 passed/3 skipped/2 dependency warnings. Integrate unchanged tested code and activate idle controller under operator/instance locks; preserve saved state/config, no real command/replay. Source and accepted public measurement results are recorded in STATUS and owner-only evidence.
 
+Activation completed viaef44451, controllerPID73820, source identical to tested05bbcf5. Last081 is FINISHED; no active operation. Config/binding/history unchanged. Owner may initiate sequential Telegram tests; no one-test quota. Live end-to-end acceleration remains NOT_MEASURED on this source.
+
 # Telegram close WS journal fix — 2026-09-24
 
 Owner reports /close unavailable and requests a fix. Reproduced offline on actual historical inputs: prior_intents parses stream-events.jsonl using DurableJournal schema and raises historical journal identity/time invalid before any current account read. On codex/ws-close-journal-fix from main 80a9ef2, exclude only the reserved diagnostic stream filename from mutation-event parsing, retain its provenance hash and strict authoritative-journal validation. Add direct and actual controller-to-recovery-to-close synthetic regressions, run final clean Python3.11 suite, self-review and activate in idle controller without clearing state/config or sending any real trading command. Existing history is immutable. One bounded read-only close-admission check against the existing configured BTC accounts/Keychain is part of this diagnosis: at most 30 seconds, existing recovery lock, no order/cancel/setting methods, save only status/counts/current position summary and normal recovery checkpoint.

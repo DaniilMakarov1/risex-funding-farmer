@@ -1,4 +1,6 @@
-## Post-run correction — verified, awaiting idle activation
+## Post-run correction — verified and active
+
+Integrated locally viaef44451; idle controller restarted asPID73820 with unchanged tested src/tests. Config/binding preserved; startup report reconciliation changed cycle081 BLOCKED→FINISHED and cleared its administrative active state through Controller.finish, with no manual reset/replay. Instance lock held, operator lock free, no child. No remote push or agent financial action.
 
 From accepted main35f0a9d on codex/postrun-report-latency: fix stream diagnostic trailers that invalidated every saved cycle report; extend narrow terminal source-only classification to proved canceled zero-fill; avoid redundant REST start when a validated exact WS observation is already ready; add bounded redacted numeric GET diagnostics to both actual transports. Focused399 tests passed. Historical076/077/078/079/081 now report COMPLETE/CONFIRMED_FLAT with original files unchanged;080 retains its historical explicit UNKNOWN, while new synthetic reproductions in both directions/opening/closing resolve safely. Final clean isolated Python3.11.5 / lighter-sdk1.1.2 suite at05bbcf5:5368 passed,3 skipped,2 dependency warnings in140.35s. Initial full run exposed3 early-admission diagnostic regressions; fixed before acceptance,46 focused regressions passed. Self-review completed; no independent review claimed.
 
