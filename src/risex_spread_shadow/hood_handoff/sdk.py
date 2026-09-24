@@ -10,6 +10,7 @@ close/reopen semantics.
 from __future__ import annotations
 
 import asyncio
+from collections import deque
 from dataclasses import dataclass, field
 import importlib
 from importlib import metadata as importlib_metadata
@@ -355,12 +356,13 @@ class PlainAioHttp:
     def __init__(self, base_url: str, *, timeout_seconds: float) -> None:
         self.base_url = base_url.rstrip("/")
         self.timeout_seconds = float(timeout_seconds)
+        self._read_timings = deque(maxlen=256)
         self._session: Any | None = None
         self._session_lock = asyncio.Lock()
         self._closed = False
 
     @staticmethod
-    def _timing_trace() -> Any:
+    def _timing_trace(read_records=None) -> Any:
         """Observe aiohttp milestones without recording request or response data."""
         import aiohttp
 
@@ -383,6 +385,51 @@ class PlainAioHttp:
             async def observer(session: Any, context: Any, params: Any, *, _name: str = name) -> None:
                 await mark(_name, session, context, params)
             signal.append(observer)
+        if read_records is not None:
+            async def read_start(_session, context, params):
+                if params.method != "GET":
+                    return
+                context.read_started = time.perf_counter()
+                context.trace_request_ctx = {}
+                path = params.url.path
+                allowed = {"/api/v1/accountOrders", "/api/v1/orderBookOrders",
+                           "/api/v1/account", "/api/v1/accountActiveOrders",
+                           "/api/v1/trades", "/api/v1/orderBookDetails"}
+                context.read_row = {"endpoint": path if path in allowed else "other",
+                                    "started_monotonic": context.read_started}
+                read_records.append(context.read_row)
+
+            async def read_end(_session, context, params):
+                row = getattr(context, "read_row", None)
+                if row is None:
+                    return
+                now = time.perf_counter()
+                row["response_headers_seconds"] = now - context.read_started
+                row["status"] = params.response.status
+                times = context.trace_request_ctx
+                for name in ("headers_signal", "connection_reused"):
+                    if name in times:
+                        row[name + "_seconds"] = times[name] - context.read_started
+                for name, start, end in (("queue_seconds", "queue_start", "queue_end"),
+                                         ("connection_seconds", "connection_start", "connection_end")):
+                    if start in times and end in times:
+                        row[name] = times[end] - times[start]
+
+            async def read_body(_session, context, _params):
+                row = getattr(context, "read_row", None)
+                if row is not None:
+                    row["body_complete_seconds"] = time.perf_counter() - context.read_started
+
+            async def read_error(_session, context, params):
+                row = getattr(context, "read_row", None)
+                if row is not None:
+                    row["failed_after_seconds"] = time.perf_counter() - context.read_started
+                    row["cancelled"] = isinstance(params.exception, asyncio.CancelledError)
+
+            trace.on_request_start.append(read_start)
+            trace.on_request_end.append(read_end)
+            trace.on_response_chunk_received.append(read_body)
+            trace.on_request_exception.append(read_error)
         return trace
 
     async def _session_for_request(self) -> Any:
@@ -401,7 +448,7 @@ class PlainAioHttp:
             session = self._session
             if session is None or bool(getattr(session, "closed", False)):
                 timeout = aiohttp.ClientTimeout(total=self.timeout_seconds)
-                session = aiohttp.ClientSession(timeout=timeout, trace_configs=[self._timing_trace()])
+                session = aiohttp.ClientSession(timeout=timeout, trace_configs=[self._timing_trace(self._read_timings)])
                 self._session = session
             return session
 
@@ -540,6 +587,7 @@ class LighterSdkClient:
         self._apis: dict[int, Any] = {}
         self._tokens: dict[int, _CachedToken] = {}
         self._api_client: Any | None = None
+        self._sdk_read_timings = deque(maxlen=256)
         self._pending_mutation_deadline: float | None = None
         # Nonce acquisition and signing are serialized per account/key.  A
         # paired source/receiver preparation may therefore overlap when the
@@ -673,6 +721,12 @@ class LighterSdkClient:
         return bool(state is not None and task is not None and not task.done()
                     and state.subscription_ready(time.monotonic()))
 
+    def http_read_summary(self) -> dict[str, Any]:
+        # Bounded numeric diagnostics only, flushed outside the order path.
+        return {"capacity_per_transport": 256,
+                "plain": list(getattr(self._http, "_read_timings", ())),
+                "sdk": list(self._sdk_read_timings)}
+
     def read_stream_summary(self) -> dict[str, int | bool | str | None] | None:
         state = self._read_stream_state
         if state is None:
@@ -792,6 +846,14 @@ class LighterSdkClient:
             retries=None,
         )
         self._api_client = module.ApiClient(configuration)
+        # The pinned SDK owns an aiohttp session. Add frozen observer callbacks
+        # before its first request; no retry/session/transport policy changes.
+        pool = getattr(getattr(self._api_client, "rest_client", None), "pool_manager", None)
+        traces = getattr(pool, "trace_configs", None)
+        if isinstance(traces, list):
+            trace = PlainAioHttp._timing_trace(self._sdk_read_timings)
+            trace.freeze()
+            traces.append(trace)
         return self._api_client
 
     async def _authorization(self, account_index: int) -> str:

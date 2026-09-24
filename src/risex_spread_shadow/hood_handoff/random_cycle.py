@@ -2188,6 +2188,9 @@ class RandomCycleEngine:
                                 journal.append("PILOT_STREAM_TIMELINE_UNKNOWN", {
                                     "reason": "saved stream evidence is absent or invalid"
                                 })
+                read_summary = getattr(self.client, "http_read_summary", None)
+                if journal is not None and callable(read_summary):
+                    journal.append("HTTP_READ_TIMINGS", read_summary())
             finally:
                 if journal is not None:
                     journal.release_attempt()

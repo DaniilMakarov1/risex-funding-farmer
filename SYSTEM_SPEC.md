@@ -1,3 +1,11 @@
+## Post-run report and read diagnostics correction
+
+Cycle cleanup may append only the allowlisted diagnostic trailers PILOT_READ_STREAM_SUMMARY, PILOT_STREAM_TIMELINE, PILOT_STREAM_TIMELINE_UNKNOWN and HTTP_READ_TIMINGS after CYCLE_COMPLETE without invalidating completion. They provide no execution or flatness proof; additional trading/unknown records and duplicate terminal records still invalidate the report. Historical UNKNOWN execution remains UNKNOWN.
+
+A provisional missing active-source observation may resolve to a known zero-fill failure only after exact terminal cancellation, zero remaining quantity, no trades, complete histories, unchanged exact positions and no receiver dispatch or execution/identity uncertainty. It never counts as successful mutual execution. This extends the existing positive source-only residual classification.
+
+Initial/terminal polling first checks an already-present exact fresh WS observation, avoiding an unnecessary REST request and cancellation. If absent/ineligible, the existing WS/REST race applies. Final active-source and public owner/queue checks remain unchanged. HTTP read diagnostics retain at most the latest256 numeric records per transport (plain and pinned SDK), with endpoint allowlisting and no query/auth/body data. Queue/connection/reuse/headers/body/failure times are local observations; missing fields are unknown, not zero. They flush at cycle cleanup outside LIMIT-to-MARKET. No diagnostic changes execution proof or retries.
+
 ## Recovery journal classification
 
 Historical recovery parses every authoritative trading JSONL with the strict DurableJournal schema. The reserved `stream-events.jsonl` file contains diagnostic WS projections: retain its SHA256 in input provenance but do not parse it as mutation intents or treat its observations as terminal-order proof. Its absence, truncation or missing session end cannot invalidate otherwise complete trading journals or resolve an ambiguous transaction. Symlink checks still apply; all other journal filenames keep strict validation.

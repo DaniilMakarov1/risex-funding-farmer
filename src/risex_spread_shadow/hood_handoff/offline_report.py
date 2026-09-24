@@ -2360,7 +2360,14 @@ def load_saved_cycle_report(path: str | Path) -> dict[str, Any]:
 
     if not terminal:
         issues.append(_issue("CYCLE_TERMINAL_MISSING", "cycle has no durable completion"))
-    if cycle and _last_record(cycle, "CYCLE_COMPLETE") is not None and cycle.records[-1].event != "CYCLE_COMPLETE":
+    # Stream cleanup emits diagnostics after completion. They cannot establish
+    # execution, but must not invalidate already complete trading evidence.
+    diagnostic_trailers = {"PILOT_READ_STREAM_SUMMARY", "PILOT_STREAM_TIMELINE",
+                           "PILOT_STREAM_TIMELINE_UNKNOWN", "HTTP_READ_TIMINGS"}
+    terminal_index = next((i for i, r in enumerate(cycle.records) if r.event == "CYCLE_COMPLETE"), None) if cycle else None
+    if terminal_index is not None and any(
+        r.event not in diagnostic_trailers for r in cycle.records[terminal_index + 1:]
+    ):
         issues.append(_issue("POST_TERMINAL_RECORD", "cycle contains evidence after its terminal record", data=cycle))
     if cycle and len(_records(cycle, "CYCLE_COMPLETE")) > 1:
         issues.append(_issue("CONFLICTING_TERMINAL", "cycle has multiple terminal records", data=cycle))

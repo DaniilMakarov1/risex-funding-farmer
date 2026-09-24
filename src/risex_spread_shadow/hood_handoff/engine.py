@@ -2139,6 +2139,18 @@ class HandoffEngine:
 
     async def _race_order_observation(self, plan: OrderPlan, order_id: str | None,
                                       *, require_terminal: bool) -> OrderSnapshot | None:
+        # An already available exact stream observation needs no REST race.
+        # Starting and cancelling a redundant GET can discard a warm socket.
+        observe = getattr(self.client, "observed_order", None)
+        if callable(observe):
+            cached = observe(plan.account_index, plan.market_id, plan.client_order_index,
+                             order_id, terminal_only=require_terminal)
+            if cached is not None and self._order_matches(cached, plan) and (
+                order_id is None or cached.order_id == str(order_id)
+            ) and self._time_fresh(cached.observed_at, self.clock.now(), self._configured_freshness) and (
+                cached.terminal or (not require_terminal and cached.active)
+            ):
+                return cached
         wait = getattr(self.client, "wait_order_observation", None)
         if not callable(wait):
             return await self._lookup_order(plan, order_id, client_order_index=plan.client_order_index)
@@ -3448,13 +3460,14 @@ class HandoffEngine:
         receiver: LegReconciliation,
         unknown_reasons: Sequence[str],
     ) -> bool:
-        """Prove a narrow pre-receiver source observation is a known residual.
+        """Prove a narrow pre-receiver observation has a known terminal outcome.
 
         A source order can disappear, or become filled/canceled, between the
         two bounded account reads and the required final exact-order lookup.
         The observation remains a stop reason, while a later terminal order,
         complete trade history and agreeing final position can prove the
-        source leg independently.  All other unknowns remain barriers,
+        source leg independently, including a canceled zero-fill with unchanged
+        inventory. All other unknowns remain barriers,
         including a missing/conflicting final order, identity drift,
         incomplete history or a dispatched receiver.
         """
@@ -3486,9 +3499,14 @@ class HandoffEngine:
             return False
         if receiver.position_after != receiver.position_before:
             return False
-        if source.filled_quantity <= 0 or source.filled_quantity > plan.quantity:
+        if source.filled_quantity < 0 or source.filled_quantity > plan.quantity:
             return False
         if source.order.filled_quantity != source.filled_quantity:
+            return False
+        if source.filled_quantity == 0 and (
+            source.trades or source.order.remaining_quantity != 0
+            or not source.order.status.lower().startswith("canceled")
+        ):
             return False
         expected_source = plan.source_position_before - plan.quantity * plan.direction.sign
         expected_source += (plan.quantity - source.filled_quantity) * plan.direction.sign
