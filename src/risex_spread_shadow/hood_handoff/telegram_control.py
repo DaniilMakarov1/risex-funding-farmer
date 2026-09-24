@@ -10,6 +10,7 @@ import asyncio
 from dataclasses import dataclass
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -17,6 +18,7 @@ import stat
 import sys
 import time
 import uuid
+from decimal import Decimal, InvalidOperation
 
 import aiohttp
 
@@ -161,6 +163,60 @@ class Controller:
         except Exception:
             return None  # No raw exception/credential-bearing payload in chat.
 
+    def later_close(self, report):
+        """Return the latest same-market close started after this cycle's terminal event."""
+        from .operator_recovery import journal_rows
+        cycle = report.get('cycle', {})
+        binding = report.get('binding', {})
+        terminal = cycle.get('terminal_at') if isinstance(cycle, dict) else None
+        if (report.get('status') != 'COMPLETE' or isinstance(terminal, bool)
+                or not isinstance(terminal, (int, float)) or not math.isfinite(terminal)
+                or not isinstance(binding, dict)):
+            return None
+        accounts = (binding.get('source_account_index'), binding.get('receiver_account_index'))
+        if not all(type(index) is int for index in accounts) or accounts[0] == accounts[1]:
+            return None
+        selected = None
+        for name in self.slots('close'):
+            slot = self.operator / name
+            if slot.is_symlink():
+                continue
+            first = last_row = None
+            try:
+                for row in journal_rows(slot / 'close.jsonl'):
+                    if first is None:
+                        first = row
+                    last_row = row
+            except Exception:
+                continue
+            if first is None or first['event'] != 'CLOSE_STARTED':
+                continue
+            close_binding = first['payload'].get('binding')
+            if (not isinstance(close_binding, dict)
+                    or close_binding.get('market_id') != binding.get('market_id')
+                    or close_binding.get('market_symbol') != binding.get('market_symbol')
+                    or type(close_binding.get('source_account_index')) is not int
+                    or type(close_binding.get('receiver_account_index')) is not int
+                    or {close_binding['source_account_index'], close_binding['receiver_account_index']} != set(accounts)):
+                continue
+            started = first['at']
+            if started <= terminal or selected is not None and started <= selected[0]:
+                continue
+            result = last_row['payload'] if last_row['event'] == 'CLOSE_COMPLETE' else None
+            flat = False
+            if isinstance(result, dict) and result.get('status') == 'CONFIRMED_FLAT' and result.get('symbol') == binding.get('market_symbol'):
+                positions = result.get('positions')
+                if isinstance(positions, list) and len(positions) == 2:
+                    try:
+                        values = {row['account_index']: Decimal(row['position']) for row in positions
+                                  if isinstance(row, dict) and type(row.get('account_index')) is int}
+                        flat = set(values) == set(accounts) and len(values) == 2 and all(
+                            value.is_finite() and value == 0 for value in values.values())
+                    except (KeyError, TypeError, ValueError, InvalidOperation):
+                        pass
+            selected = (started, name, last_row['at'], flat)
+        return selected
+
     def finish(self):
         active = self.store.data['active']
         if active is None:
@@ -218,7 +274,11 @@ class Controller:
         if report is None:
             return views.unavailable_message(blocked, last.get('status') == 'NOT_LAUNCHED')
         checkpoint = views.recovery_checkpoint(self.store.data.get('last_recovery')) if not blocked else ''
-        return checkpoint + views.saved_message(last['cycle'], report, blocked=blocked, detailed=detailed)
+        message = checkpoint + views.saved_message(last['cycle'], report, blocked=blocked, detailed=detailed)
+        later = self.later_close(report)
+        if later is not None:
+            message += views.later_close_message(later[1], later[2], later[3])
+        return message
 
     async def notify(self, text):
         try:

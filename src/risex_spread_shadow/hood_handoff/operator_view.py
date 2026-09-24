@@ -415,7 +415,8 @@ def result_lines(report, *, detailed=False):
                      f'Второй счёт: {clean(binding.get("receiver_account_index"), 24)} (B).')
     lines += [
         'Парное исполнение: ' + {'SUCCESS': '✅ подтверждено', 'FAILED': '⚠️ не состоялось', 'PARTIAL': '⚠️ выполнено частично'}.get(pair.get('status'), '❔ не доказано'),
-        'Историческая позиция: ' + {'CONFIRMED_FLAT': '✅ закрытие подтверждено', 'PARTIAL': '⚠️ есть остаток'}.get(inventory.get('status'), '❔ неизвестна'),
+        'Историческая позиция: ' + {'CONFIRMED_FLAT': '✅ закрытие подтверждено', 'PARTIAL': '⚠️ есть остаток',
+                                    'OPEN_INVENTORY': '⚠️ открыт остаток'}.get(inventory.get('status'), '❔ неизвестна'),
     ]
     matches = pair.get('direct_counterparty_match')
     for value in matches[:2] if isinstance(matches, list) else ():
