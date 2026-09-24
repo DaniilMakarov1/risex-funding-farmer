@@ -6,6 +6,7 @@ Active private observations are usable for discovery, not final admission.
 from __future__ import annotations
 
 from decimal import Decimal, InvalidOperation
+from dataclasses import replace
 import math
 import heapq
 from typing import Any
@@ -94,6 +95,7 @@ class StreamReads:
                 self.orders = {k: v for k, v in self.orders.items() if k[0] != account}
                 return
             conflicts = {(p.get("account_index"), p.get("client_order_index")) for p in projections if p.get("kind") == "order_conflict"}
+            accepted = {(p.get("account_index"), p.get("client_order_index")) for p in projections if p.get("kind") == "order"}
             seen: set[int] = set()
             for item in values:
                 if not isinstance(item, dict) or type(item.get("client_order_index")) is not int:
@@ -114,8 +116,18 @@ class StreamReads:
                         raise ValueError("missing flags")
                     # Require full venue fields; never infer missing quantities or side.
                     selected = {k: item[k] for k in ("owner_account_index", "market_index", "order_id", "client_order_index", "status", "type", "time_in_force", "reduce_only", "initial_base_amount", "remaining_base_amount", "filled_base_amount", "price")}
+                    oid = selected["order_id"]
+                    if not isinstance(oid, str) or not oid.isascii() or not oid.isdecimal() or len(oid) > 20:
+                        raise ValueError("invalid order ID")
+                    for name in ("initial_base_amount", "remaining_base_amount", "filled_base_amount", "price"):
+                        amount(selected[name], positive=name in {"initial_base_amount", "price"})
                     selected.update(side="SELL" if item["is_ask"] else "BUY", observed_at=wall)
                     parsed = OrderSnapshot.from_mapping(selected)
+                    if key not in accepted:
+                        if prior and replace(parsed, observed_at=prior[0].observed_at) == prior[0]:
+                            self.orders[key] = prior  # Duplicate must not renew observation age.
+                            continue
+                        raise ValueError("no accepted private event")
                     if parsed.status not in {"open", "filled", "canceled"} and not parsed.terminal:
                         raise ValueError("non-resting event")
                     if parsed.terminal and parsed.remaining_quantity != 0:

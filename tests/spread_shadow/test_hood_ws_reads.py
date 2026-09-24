@@ -193,3 +193,18 @@ def test_ordinary_cycle_price_route_prefers_stream_interface():
         async def price_book(self,market):return ('ws',market)
         async def order_book(self,market):raise AssertionError('price route used owner-proof REST')
     assert asyncio.run(RandomCycleEngine(Client())._order_book(1))==('ws',1)
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('bad', [{'order_id':'not-an-order'}, {'price':100.0}, {'status':'unsupported'}, {'filled_base_amount':.2}])
+async def test_unaccepted_raw_private_payload_cannot_bypass_projection_validation(bad):
+    s=ReadStreamState(identity());await s.connected_now();o=order('filled');o.update(bad)
+    await put_order(s,o)
+    assert s.reads.order(11,1,77,None,time.monotonic(),2,terminal_only=True) is None
+
+
+@pytest.mark.asyncio
+async def test_duplicate_private_event_keeps_original_observation_age():
+    s=ReadStreamState(identity());await s.connected_now();await put_order(s,order('filled'))
+    original=s.reads.orders[(11,77)]
+    await asyncio.sleep(.001);await put_order(s,order('filled'))
+    assert s.reads.orders[(11,77)]==original

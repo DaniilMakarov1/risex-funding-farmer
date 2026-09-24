@@ -2099,6 +2099,7 @@ class RandomCycleEngine:
 
     async def execute(self, config: RandomCycleConfig) -> RandomCycleResult:
         self._stage = "PREFLIGHT"
+        self._read_stream_attempted = False
         self._identity_barrier = None
         self._selection = None
         self._leverage_fractions: dict[int, int] = {}
@@ -2164,7 +2165,7 @@ class RandomCycleEngine:
         finally:
             try:
                 await self._release_preflight_nonces()
-                if callable(getattr(self.client, "stop_read_stream", None)):
+                if self._read_stream_attempted:
                     stop_stream = getattr(self.client, "stop_read_stream", None)
                     try:
                         if callable(stop_stream):
@@ -2270,6 +2271,7 @@ class RandomCycleEngine:
         self._stage = "PREFLIGHT"
         start_stream = getattr(self.client, "start_read_stream", None)
         if callable(start_stream) and not config.confirmed_pilot:
+            self._read_stream_attempted = True
             await start_stream(ready_timeout=5)
         metadata = _as_market(
             await self._bounded(self.client.market_metadata(config.market_id), config, "market metadata read")
@@ -2332,6 +2334,7 @@ class RandomCycleEngine:
         )
         if config.confirmed_pilot:
             start_stream = getattr(self.client, "start_read_stream", None)
+            self._read_stream_attempted = callable(start_stream)
             if not callable(start_stream) or not await start_stream(ready_timeout=5):
                 raise PreflightBlocked("confirmed pilot read-only stream is not ready")
 
