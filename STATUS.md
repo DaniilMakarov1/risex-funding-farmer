@@ -1,3 +1,9 @@
+# Receipt time reconciliation — verified
+
+Cycle 138 filled both 0.00029 BTC legs, but an early clock-ahead receipt error remained sticky after a valid exact reread. Candidate tracks unresolved exact future receipts within existing read bounds, independently of order/position/fee checks. The same defect in close-013 is addressed in residual-history reconciliation. No timestamps are relaxed or rewritten, no mutation replay or new trading settings. 55 focused checks passed. Prior engine-only full snapshot was superseded when the fallback defect was found; final clean Python 3.11 combined run passed. Evidence: spread-shadow-runs/hood-receipt-time-20260924/solo-v1/.
+
+Self-review complete: 55 focused checks passed. The final combined clean isolated Python 3.11.5 suite passed 5577 tests, 3 skipped, 2 dependency warnings, exit 0. Source/tests match the final-v2 installed snapshot and original cycle138 inputs are unchanged. Base reproduction failed the two repaired cases as expected. No real orders or automatic startup configuration.
+
 # Telegram timestamp handling — verified 2026-09-24
 
 Telegram API was reachable with no pending updates/webhook, but its HTTP Date led the host clock by about 2 seconds. The old owner-command gate silently consumed all future-dated messages. Fixed with a bounded 5-second allowance, explicit timestamp refusal and safe delivery-failure logging; identity, freshness, restart and no-replay checks remain. Historical discarded message dates are unavailable, so this is a reproduced defect consistent with the observed silence, not proof of every lost message.

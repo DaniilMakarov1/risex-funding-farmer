@@ -4127,6 +4127,7 @@ class RandomCycleEngine:
         pages: list[Any] = []
         seen_trade_ids: set[str] = set()
         observed_trades: dict[str, TradeReceipt] = {}
+        pending_future_receipts: set[TradeReceipt] = set()
         cursor: str | None = None
         deadline = self.clock.now() + config.reconcile_timeout_seconds
         for page_number in range(1, config.max_poll_count + 1):
@@ -4163,8 +4164,6 @@ class RandomCycleEngine:
                     if trade.trade_id in seen_trade_ids:
                         raise ContractError("fallback trade history contains a duplicate receipt")
                     seen_trade_ids.add(trade.trade_id)
-                    if trade.observed_at > now:
-                        raise ContractError("fallback trade receipt is from the future")
                     if trade.side.upper() != plan.side:
                         raise ContractError("fallback trade side conflicts with the plan")
                     if not (
@@ -4173,6 +4172,10 @@ class RandomCycleEngine:
                         else trade.price >= plan.price
                     ):
                         raise ContractError("fallback trade violates the executable price bound")
+                    if trade.observed_at > now:
+                        pending_future_receipts.add(trade)
+                        continue
+                    pending_future_receipts.discard(trade)
                     previous = observed_trades.get(trade.trade_id)
                     if previous is not None:
                         if replace(trade, observed_at=previous.observed_at) != previous:
@@ -4186,12 +4189,14 @@ class RandomCycleEngine:
                 if not page.complete:
                     return trades, pages, "fallback trade history is incomplete"
                 total = sum((trade.quantity for trade in trades), Decimal(0))
-                if total == order.filled_quantity:
+                if total == order.filled_quantity and not pending_future_receipts:
                     return trades, pages, None
                 if total > order.filled_quantity:
                     return trades, pages, "fallback trade receipt sum exceeds terminal fill"
                 remaining = deadline - self.clock.now()
                 if page_number == config.max_poll_count or remaining <= 0:
+                    if pending_future_receipts:
+                        return trades, pages, "fallback trade receipt is from the future or lacks an exact valid reread"
                     return trades, pages, "fallback terminal fill history did not converge within configured bounds"
                 await self.clock.sleep(min(config.poll_interval_seconds, remaining))
                 cursor = None

@@ -1,3 +1,7 @@
+# Trade timestamp reconciliation
+
+A future-dated receipt is provisional during bounded history reconciliation. It is not counted until a reread has a valid local timestamp; any earlier future receipt must be matched by the same complete receipt, including its original timestamp. Pending future receipts prevent success. This applies to ordinary leg reconciliation and reduce-only residual closure. Existing deadlines, pagination bounds, duplicate/conflict checks and mutation no-replay rules remain. No future-time tolerance is introduced for trade receipts.
+
 # Telegram command time validation
 
 Authenticated private owner messages may lead the controller clock by at most 5 seconds, to tolerate small Telegram/host clock differences. The 120-second expiry, pre-start filter and durable update deduplication still apply. Invalid owner timestamps receive an explanatory refusal. Notification failures write a fixed credential-free diagnostic; they never replay commands or abort trading operations.

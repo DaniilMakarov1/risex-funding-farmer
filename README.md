@@ -1,3 +1,9 @@
+# Receipt reconciliation and controller restarts
+
+A briefly future-dated trade receipt is reread within the existing reconciliation bounds; only an exact reread at a valid time resolves that observation. The same rule applies to residual closing, without resending an uncertain order. Historical cycle journals remain unchanged.
+
+The current manually started Telegram controller does not survive a laptop reboot. Start it again with the existing controller command after login. Startup does not replay queued trading commands or automatically open positions; inspect `/status` and `/accounts` first.
+
 # Telegram responsiveness
 
 Small clock differences of up to 5 seconds ahead of the host no longer silently discard owner commands. Commands outside the permitted time window receive a refusal; send a new command rather than replaying old updates. Delivery errors appear in the private controller log without tokens or message contents.

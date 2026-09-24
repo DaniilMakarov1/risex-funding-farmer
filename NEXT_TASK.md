@@ -1,3 +1,11 @@
+# Receipt timestamp reconciliation — owner request 2026-09-24
+
+Work alone from main 1f542a9. Audit cycle 138 and fix the sticky future-receipt error: a transient future observation must remain unresolved until the same complete receipt (including timestamp) is read again at a valid local time, within existing read bounds. Do not relax future-time checks, rewrite historical evidence, change matching/admission logic, or send real orders. Preserve identity/quantity/price/position and replay barriers. Add adverse reconciliation tests and a clean isolated Python 3.11 full suite; activate idle controller after verification. Check reboot/process evidence; do not enable new unattended trading or automatic command replay.
+
+The same exact-reread treatment also applies to residual-close history after observing close-013. 55 focused checks passed; final combined evidence is spread-shadow-runs/hood-receipt-time-20260924/solo-v1/final-v2/.
+
+Self-review complete: 55 focused checks passed. The final combined clean isolated Python 3.11.5 suite passed 5577 tests, 3 skipped, 2 dependency warnings, exit 0. Source/tests match the final-v2 installed snapshot and original cycle138 inputs are unchanged. Base reproduction failed the two repaired cases as expected. No real orders or automatic startup configuration.
+
 # Telegram command timestamp repair — owner request 2026-09-24
 
 Diagnose silent command handling and restore bot responsiveness. Work alone from main 129d1c7. Telegram HTTP Date was about 2 seconds ahead of local time; current strict future-date gate silently drops such owner messages. Allow at most 5 seconds future skew, retain 120-second expiry, pre-start filtering, durable update deduplication and owner/private checks. Explain rejected trusted-owner timestamps and record credential-free notification failures. No trading logic or account barriers change; no real order command. Test adverse timestamps and replay, inspect full diff, run a clean isolated Python 3.11 suite and activate idle controller preserving config/state.

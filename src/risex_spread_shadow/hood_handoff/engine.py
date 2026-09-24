@@ -3027,6 +3027,7 @@ class HandoffEngine:
         last_account_error: str | None = None
         last_order_error: str | None = None
         read_validation_barrier = False
+        pending_future_receipts: set[TradeReceipt] = set()
         after: AccountSnapshot | None = None
         order: OrderSnapshot | None = None
 
@@ -3039,7 +3040,7 @@ class HandoffEngine:
                 add_local_unknown("trade history contains foreign account/market")
                 return
             if trade.observed_at > self.clock.now():
-                add_local_unknown("trade receipt is from the future")
+                pending_future_receipts.add(trade)
                 return
             if order_id is not None and trade.order_id != order_id:
                 add_local_unknown("trade receipt order identity conflicts with requested order")
@@ -3058,6 +3059,9 @@ class HandoffEngine:
                     add_local_unknown("market trade price violates the directional worst-price bound")
                     return
             economic_key = _trade_economic_key(trade)
+            # A clock-ahead observation is provisional, not a permanent error.
+            # Resolve it only on an exact reread after local time catches up.
+            pending_future_receipts.discard(trade)
             previous = seen.get(economic_key)
             if previous is not None:
                 # Observation timestamps can change between pages; the
@@ -3296,6 +3300,7 @@ class HandoffEngine:
                 history_requested
                 and (
                     not complete
+                    or bool(pending_future_receipts)
                     or order_not_terminal
                     or order_fill_mismatch
                     or after is None
@@ -3312,6 +3317,8 @@ class HandoffEngine:
                 break
             await self._sleep(min(self._poll_interval, remaining))
 
+        if pending_future_receipts:
+            add_local_unknown("trade receipt is from the future")
         if deadline_exceeded:
             add_local_unknown("reconciliation deadline exceeded")
             complete = False
