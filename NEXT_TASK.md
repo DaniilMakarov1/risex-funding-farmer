@@ -6,6 +6,8 @@ The same exact-reread treatment also applies to residual-close history after obs
 
 Self-review complete: 55 focused checks passed. The final combined clean isolated Python 3.11.5 suite passed 5577 tests, 3 skipped, 2 dependency warnings, exit 0. Source/tests match the final-v2 installed snapshot and original cycle138 inputs are unchanged. Base reproduction failed the two repaired cases as expected. No real orders or automatic startup configuration.
 
+Integrated unchanged tested source a2d6175 into local main and activated controller PID13598 under idle locks. Config unchanged, including 15s request timeout; instance lock held, no child and no startup errors. Saved operation state was preserved; historical journals were not rewritten. No financial command or remote push. Activation proof: spread-shadow-runs/hood-receipt-time-20260924/solo-v1/final-v2/activation.json.
+
 # Telegram command timestamp repair — owner request 2026-09-24
 
 Diagnose silent command handling and restore bot responsiveness. Work alone from main 129d1c7. Telegram HTTP Date was about 2 seconds ahead of local time; current strict future-date gate silently drops such owner messages. Allow at most 5 seconds future skew, retain 120-second expiry, pre-start filtering, durable update deduplication and owner/private checks. Explain rejected trusted-owner timestamps and record credential-free notification failures. No trading logic or account barriers change; no real order command. Test adverse timestamps and replay, inspect full diff, run a clean isolated Python 3.11 suite and activate idle controller preserving config/state.

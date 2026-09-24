@@ -4,6 +4,8 @@ Cycle 138 filled both 0.00029 BTC legs, but an early clock-ahead receipt error r
 
 Self-review complete: 55 focused checks passed. The final combined clean isolated Python 3.11.5 suite passed 5577 tests, 3 skipped, 2 dependency warnings, exit 0. Source/tests match the final-v2 installed snapshot and original cycle138 inputs are unchanged. Base reproduction failed the two repaired cases as expected. No real orders or automatic startup configuration.
 
+Integrated unchanged tested source a2d6175 into local main and activated controller PID13598 under idle locks. Config unchanged, including 15s request timeout; instance lock held, no child and no startup errors. Saved operation state was preserved; historical journals were not rewritten. No financial command or remote push. Activation proof: spread-shadow-runs/hood-receipt-time-20260924/solo-v1/final-v2/activation.json.
+
 # Telegram timestamp handling — verified 2026-09-24
 
 Telegram API was reachable with no pending updates/webhook, but its HTTP Date led the host clock by about 2 seconds. The old owner-command gate silently consumed all future-dated messages. Fixed with a bounded 5-second allowance, explicit timestamp refusal and safe delivery-failure logging; identity, freshness, restart and no-replay checks remain. Historical discarded message dates are unavailable, so this is a reproduced defect consistent with the observed silence, not proof of every lost message.
