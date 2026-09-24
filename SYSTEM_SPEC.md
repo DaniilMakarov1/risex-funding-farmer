@@ -1,5 +1,18 @@
 # Current system specification
 
+## WS read acceleration candidate (2026-09-24)
+
+Ordinary terminal/Telegram random cycles warm a bounded read stream before initial price selection and stop it in the cycle cleanup. Confirmed pilots retain their explicit readiness gate after fee/leverage preflight. A connection failure in ordinary cycles falls back to existing REST; disconnect, gaps, invalid fields and age expiry invalidate affected cached data. The stream has a finite 570-second/15000-frame/20MiB lifetime (8MiB maximum frame); expiry degrades to REST, never to fabricated freshness. Initial subscription startup is outside the LIMIT-to-MARKET window. Application ping is answered as well as transport heartbeat.
+
+Price selection/revalidation, paired closing quotes and residual-recovery quotes use validated WS L2 snapshots/deltas when available, otherwise REST. The local book retains bounded exact decimal levels and returns the best 250 price levels per side; zero-size updates remove levels. This data deliberately carries no order owner identity. The paired public owner/queue guard continues to use orderBookOrders REST: anonymous price/size levels cannot replace it. The final active source recheck remains REST, as the owner requested.
+
+First order discovery can consume a full exact private WS observation. Exact immutable terminal observations can replace accountOrders reads and terminal polling; all required order identity, flags, price and initial/filled/remaining fields must be present, internally consistent and fresh. Pending/incomplete/conflicting/missing events fall back to REST; absence never proves no order, no fill or flat. Terminal observations do not supply trade counterparties, fee completeness, positions, or margin. Those REST reconciliation reads remain. Cache access preserves the observation timestamp; it never renews age. Account/risk and active-order-list REST remain because private per-order events do not prove a complete synchronized account state.
+
+The source cancel is prepared after first exact eligible source discovery while the other checks may still run. Account/key nonce ownership, exact source identity, expiry, single send, final observation and unknown-send reconciliation remain required. An unsent stale preparation may fall back; a possibly sent cancellation is never replayed. Both paired opening and closing use this engine. Cancel preparation completion is recorded when it actually finishes.
+
+A bounded owner-only stream-events.jsonl records allowlisted monotonic order transitions and local milestones. WS and REST observations are labeled separately; missing terminal/overflow/flush failure denotes incomplete evidence. The inherited transaction WS sender remains inactive in ordinary entrypoints pending actual Robinhood response-contract validation; outbound signed mutations still use warmed HTTP. No claim of live mutual-fill improvement follows from read-only latency measurements.
+
+
 SYSTEM_SPEC_VERSION = 5.7-candidate
 SPEC_STATUS = OPERATOR_ROBINHOOD_CYCLE
 

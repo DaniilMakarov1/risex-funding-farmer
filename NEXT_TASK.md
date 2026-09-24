@@ -1,3 +1,11 @@
+# Parent-owned WS read acceleration — 2026-09-24
+
+The owner explicitly stopped Chief and assigned the parent sole implementation, self-review and integration ownership: maximize replacement of REST by WebSocket, measure latency, explain every retained REST operation. Chief confirmed stopped writes and handed over WIP at 44472ce on codex/spread-v1-stream-evidence-cancel-ws. Preserve that worktree and its uncommitted work. Current branch codex/ws-read-acceleration is an isolated copy; owner-only evidence is hood-ws-read-acceleration-20260924/solo-v1. No delegates.
+
+Implement usable continuous L2 for price selection, validated positive private order observations for initial visibility and immutable terminal results, lifecycle in ordinary cycle entrypoints, causal evidence and safe fallbacks. Preserve the final active source recheck and owner/queue proof; no unconfirmed MARKET. Complete and verify inherited prepared-cancel/evidence changes, keeping unverified WS transaction submission inactive. Remaining REST must have specific contract reasons. Observe actual snapshot/update schemas and timing with bounded read-only requests using existing protected credentials; a measurement session is authorized by this new owner request. Limit collection to configured BTC/two accounts, 60 seconds, 15000 frames/20MiB, 8MiB per frame; up to five serial REST comparison reads per endpoint per pass, at most two passes (before and after the local depth-materialization optimization). Persist only allowed schema/identity/numeric milestones. No orders/settings are needed for this read-path benchmark and none are planned. Report live read timings separately from fixture execution timing; do not invent a live fill gain. Preserve historical evidence and no replay/flat/fees semantics. Full adverse/integration and one final clean Python3.11 suite; self-review full combined changes. Update SYSTEM_SPEC/STATUS/README to actual behavior.
+
+## Preserved predecessor assignment (historical responsibility)
+
 # Current owner-led development authority and five-part plan
 
 ## Current assignment: causal stream evidence, prepared cancellation, transaction transport — 2026-09-24

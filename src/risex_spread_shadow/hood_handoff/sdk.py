@@ -18,6 +18,7 @@ import json
 import math
 import re
 import time
+from pathlib import Path
 from typing import Any, Callable, Mapping, Protocol
 
 from .contracts import (
@@ -556,6 +557,11 @@ class LighterSdkClient:
         self._read_stream_task: asyncio.Task[str] | None = None
         self._read_stream_stop: asyncio.Event | None = None
         self._read_stream_started = False
+        self._ws_read_counts = {"price_book": 0, "order_observation": 0}
+        self._last_read_stream_summary: dict[str, int | bool | str | None] | None = None
+        self._cancel_client_by_order: dict[tuple[int, str], int] = {}
+        self._warmed_ws_sender: Any | None = None
+        self._mutation_transport_chosen = False
         self._closed = False
         self.sdk_version = REQUIRED_LIGHTER_SDK_VERSION
         self._http = (http_factory or PlainAioHttp)(config.api_base_url, timeout_seconds=config.request_timeout_seconds)
@@ -578,6 +584,7 @@ class LighterSdkClient:
         self._read_stream_started = True
         from .stream_measurement import StreamIdentity
         from .stream_state import ReadStreamSession, ReadStreamState
+        from .stream_evidence import StreamEvidenceJournal
 
         try:
             identity = StreamIdentity.from_config({
@@ -594,6 +601,11 @@ class LighterSdkClient:
                     or not math.isfinite(ready_timeout) or not 0 < ready_timeout <= 5):
                 return False
             state = ReadStreamState(identity)
+            if getattr(self.config, "cycle_dir", None) is not None:
+                state.evidence = StreamEvidenceJournal(
+                    Path(self.config.cycle_dir) / "stream-events.jsonl",
+                    market_id=identity.market_id, accounts=identity.accounts,
+                )
             stop = asyncio.Event()
             task = asyncio.create_task(ReadStreamSession(state).run(self.secrets, stop))
             self._read_stream_state = state
@@ -635,6 +647,8 @@ class LighterSdkClient:
                     task.cancel()
                     await asyncio.gather(task, return_exceptions=True)
         finally:
+            if self._read_stream_state is not None:
+                self._last_read_stream_summary = self.read_stream_summary()
             self._read_stream_state = None
 
     async def wait_terminal_hint(self, account: int, client: int,
@@ -652,9 +666,11 @@ class LighterSdkClient:
     def read_stream_summary(self) -> dict[str, int | bool | str | None] | None:
         state = self._read_stream_state
         if state is None:
-            return None
+            return self._last_read_stream_summary
         observer = state.observer
         return {
+            "ws_price_reads": self._ws_read_counts["price_book"],
+            "ws_order_reads": self._ws_read_counts["order_observation"],
             "connected": state.connected,
             "ready": self.read_stream_ready(),
             "frames": observer.frames,
@@ -665,7 +681,44 @@ class LighterSdkClient:
             "order_conflicts": observer.order_conflicts,
             "malformed": observer.malformed,
             "stopped_reason": observer.stopped_reason,
+            **({} if state.evidence is None else {
+                "evidence_accepted": state.evidence.accepted,
+                "evidence_dropped": state.evidence.dropped,
+                "evidence_write_failed": state.evidence.failed,
+            }),
         }
+
+    def bind_read_stream_order(self, account: int, market: int, client: int,
+                               *, run_id: str, phase: str, role: str,
+                               attempt_index: int | None) -> None:
+        state = self._read_stream_state
+        if state is not None:
+            state.bind_order(account, market, client, run_id=run_id,
+                             phase=phase, role=role, attempt_index=attempt_index)
+
+    def record_read_stream_milestone(self, milestone: str, account: int,
+                                     client: int, order_id: str | None = None) -> None:
+        state = self._read_stream_state
+        if state is not None and state.evidence is not None:
+            state.evidence.offer_milestone(
+                milestone, account=account, client=client, order_id=order_id,
+                at=time.monotonic(), context=state.order_contexts.get((account, client)),
+            )
+
+    def bind_read_stream_cancel(self, account: int, market: int,
+                                client: int, order_id: str) -> None:
+        if (self._read_stream_state is not None and type(account) is int
+                and account in {self.source_account_index, self.receiver_account_index}
+                and type(market) is int and market == self.config.market_id
+                and type(client) is int and client >= 0
+                and isinstance(order_id, str) and order_id.isascii()
+                and order_id.isdecimal() and len(order_id) <= 20):
+            self._cancel_client_by_order[(account, order_id)] = client
+
+    def _record_cancel_send(self, account: int, order_id: str) -> None:
+        client = self._cancel_client_by_order.get((account, order_id))
+        if client is not None:
+            self.record_read_stream_milestone("cancel_send_entered", account, client, order_id)
 
     @staticmethod
     def verify_sdk() -> None:
@@ -921,6 +974,28 @@ class LighterSdkClient:
 
         return await self.resolve_market(symbol)
 
+    async def price_book(self, market_id: int) -> Any:
+        """L2 for price calculation only; order_book retains exact owner proof."""
+        state = self._read_stream_state
+        if state is not None and state.connected and market_id == self.config.market_id:
+            book = state.reads.book(time.monotonic(), state.limits.max_fresh_age_seconds)
+            if book is not None:
+                self._ws_read_counts["price_book"] += 1
+                return book
+        return await self.order_book(market_id)
+
+    def observed_order(self, account: int, market: int, client: int,
+                       order_id: str | None = None, *, terminal_only: bool = False) -> OrderSnapshot | None:
+        state = self._read_stream_state
+        if state is None or not state.connected:
+            return None
+        result = state.reads.order(account, market, client, order_id, time.monotonic(),
+                                  state.limits.max_fresh_age_seconds, terminal_only=terminal_only)
+        if result is not None:
+            self._ws_read_counts["order_observation"] += 1
+            self.record_read_stream_milestone("exact_ws_observed", account, client, result.order_id)
+        return result
+
     async def order_book(self, market_id: int) -> Any:
         """Read one official public orderBookOrders snapshot.
 
@@ -1125,6 +1200,9 @@ class LighterSdkClient:
     ) -> OrderSnapshot | None:
         if order_id is None and client_order_index is None:
             raise ContractError("lookup_order requires order_id or client_order_index")
+        cached = self.observed_order(account_index, market_id, client_order_index, order_id, terminal_only=True)
+        if cached is not None:
+            return cached
         token = await self._authorization(account_index)
         params: dict[str, Any] = {"account_index": account_index}
         if client_order_index is None:
@@ -1149,6 +1227,8 @@ class LighterSdkClient:
                 continue
             if client_order_index is not None and str(parsed.client_order_index) != str(client_order_index):
                 continue
+            self.record_read_stream_milestone("exact_rest_observed", account_index,
+                                              client_order_index, parsed.order_id)
             return parsed
         if payload.get("next_cursor"):
             raise ContractError("accountOrders history is paginated beyond the requested page")
@@ -1279,6 +1359,9 @@ class LighterSdkClient:
             return
         self._closed = True
         await self.stop_read_stream()
+        if self._warmed_ws_sender is not None:
+            await self._warmed_ws_sender.close()
+            self._warmed_ws_sender = None
         seen: set[int] = set()
         self._tokens.clear()
 
@@ -1413,9 +1496,31 @@ class LighterSdkClient:
         if was_ready:
             self._release_prepared_reservation(prepared)
 
-    async def _send_signed_tx(self, tx_type: Any, tx_info: Any) -> Mapping[str, Any]:
+    async def enable_warmed_ws_sender(self, sender: Any | None = None) -> None:
+        """Select WS for this client before preparing or sending any mutation.
+
+        The ordinary terminal and Telegram paths never call this method.
+        """
+        if (self._closed or self._mutation_transport_chosen or self._prepared_registry
+                or self._nonce_reservations or self._warmed_ws_sender is not None):
+            raise ContractError("transaction transport choice is already bound")
+        if sender is None:
+            from .ws_sender import WarmTxSender
+            sender = WarmTxSender()
+        await sender.start()
+        self._warmed_ws_sender = sender
+
+    async def _send_signed_tx(self, tx_type: Any, tx_info: Any,
+                              *, tx_hash: str | None = None,
+                              deadline: float | None = None) -> Mapping[str, Any]:
         if isinstance(tx_type, bool) or not isinstance(tx_type, int) or not isinstance(tx_info, str) or not tx_info:
             raise ContractError("lighter-sdk signer returned malformed transaction data")
+        self._mutation_transport_chosen = True
+        if self._warmed_ws_sender is not None:
+            if tx_hash is None or deadline is None:
+                raise ContractError("WS sender requires prepared transaction identity and deadline")
+            return await self._warmed_ws_sender.send(tx_type, tx_info, tx_hash,
+                                                     deadline=deadline)
         # PlainAioHttp performs exactly one POST to the documented sendTx form
         # endpoint.  The signed tx body is never journaled or included in errors.
         return await self._http.post_form(
@@ -1604,7 +1709,9 @@ class LighterSdkClient:
         transport_started = time.perf_counter()
         try:
             response = await self._bounded(
-                self._send_signed_tx(prepared._tx_type, prepared._tx_info),
+                self._send_signed_tx(prepared._tx_type, prepared._tx_info,
+                                     tx_hash=prepared._tx_hash,
+                                     deadline=dispatch_deadline),
                 dispatch_deadline,
                 "order dispatch",
             )
@@ -1617,7 +1724,8 @@ class LighterSdkClient:
                             "http_first_body_byte_seconds", "http_full_body_seconds",
                             "http_parse_seconds", "http_headers_signal_seconds",
                             "http_body_signal_seconds", "http_queue_seconds",
-                            "http_connection_setup_seconds", "http_connection_reused"):
+                            "http_connection_setup_seconds", "http_connection_reused",
+                            "ws_write_seconds", "ws_ack_wait_seconds", "ws_total_seconds"):
                     value = trace.get(key)
                     if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value >= 0:
                         prepared.diagnostic_timings[key] = float(value)
@@ -1711,7 +1819,10 @@ class LighterSdkClient:
         # A cancellation while releasing the preparation lock is still a
         # proved no-send and leaves this nonce reusable by the same adapter.
         self._block_nonce(account_index, key_index, nonce)
-        response = await self._bounded(self._send_signed_tx(tx_type, tx_info), deadline, "leverage dispatch")
+        response = await self._bounded(self._send_signed_tx(tx_type, tx_info,
+                                                            tx_hash=_safe_text(tx_hash),
+                                                            deadline=deadline), deadline,
+                                       "leverage dispatch")
         code = _response_code(response)
         if code is None or code >= 500:
             raise RuntimeError("malformed or undecidable leverage sendTx response")
@@ -1812,8 +1923,10 @@ class LighterSdkClient:
         except Exception as exc:
             return MutationReceipt(False, order_id, None, sanitize_exception(exc), diagnostic_timings=timings)
         transport_started = time.perf_counter()
+        self._record_cancel_send(account_index, order_id)
         response = await self._bounded(
-            self._send_signed_tx(tx_type, tx_info),
+            self._send_signed_tx(tx_type, tx_info, tx_hash=_safe_text(tx_hash),
+                                 deadline=deadline),
             deadline,
             "cancel dispatch",
         )
@@ -1838,6 +1951,107 @@ class LighterSdkClient:
             error=None if code == 200 else f"send_tx response code {code}",
             response_code=code,
             diagnostic_timings=timings,
+        )
+
+    async def prepare_cancel_order(self, account_index: int, market_id: int,
+                                   order_id: str) -> PreparedMutation:
+        """Sign one identified cancel before the final exact-order decision.
+
+        This reserves the source account/key nonce in the same registry as
+        prepared orders.  It does not authorize dispatch or infer an order fill.
+        """
+        key = self.config.api_key_index
+        if (key is None or type(account_index) is not int
+                or account_index not in {self.source_account_index, self.receiver_account_index}
+                or type(market_id) is not int or market_id != self.config.market_id
+                or not isinstance(order_id, str) or not order_id.isascii()
+                or not order_id.isdecimal() or len(order_id) > 20):
+            raise ContractError("prepared cancel identity is invalid")
+        deadline = time.monotonic() + min(self.config.request_timeout_seconds,
+                                          self.config.freshness_seconds)
+        started = time.perf_counter()
+        async with self._preparation_lock_for(account_index, key):
+            signer = self._signer(account_index)
+            nonce_started = time.perf_counter()
+            nonce = await self._next_nonce(signer, key, deadline=deadline)
+            nonce_finished = time.perf_counter()
+            self._assert_nonce_available(account_index, key, nonce)
+            signer_type = type(signer)
+            result = await self._bounded(
+                _await(signer.sign_cancel_order(
+                    market_index=market_id, order_index=int(order_id),
+                    skip_nonce=getattr(signer_type, "SKIP_NONCE_OFF", 0),
+                    nonce=nonce, api_key_index=key,
+                )), deadline, "prepared cancel signing",
+            )
+            signed_at = time.perf_counter()
+            if not isinstance(result, tuple) or len(result) != 4:
+                raise ContractError("cancel signer returned an unsupported shape")
+            tx_type, tx_info, tx_hash, error = result
+            if (error or type(tx_type) is not int or not isinstance(tx_info, str)
+                    or not tx_info or time.monotonic() >= deadline):
+                raise ContractError("prepared cancel signing was rejected or expired")
+            prepared = PreparedMutation(
+                account_index=account_index, api_key_index=key,
+                plan_binding=("CANCEL", account_index, market_id, order_id),
+                deadline=deadline, _tx_type=tx_type, _tx_info=tx_info,
+                _tx_hash=_safe_text(tx_hash), _owner=self._prepared_owner,
+                _nonce=nonce,
+                diagnostic_timings={
+                    "cancel_preparation_seconds": signed_at - started,
+                    "cancel_nonce_seconds": nonce_finished - nonce_started,
+                    "cancel_signing_seconds": signed_at - nonce_finished,
+                },
+            )
+            self._register_prepared(prepared)
+            return prepared
+
+    async def submit_prepared_cancel_order(self, account_index: int, market_id: int,
+                                           order_id: str, prepared: PreparedMutation,
+                                           *, deadline: float) -> MutationReceipt:
+        """Consume a prepared cancel once, after the engine's fresh exact proof."""
+        self._pending_mutation_deadline = None
+        key = self.config.api_key_index
+        if key is None or not isinstance(prepared, PreparedMutation):
+            return MutationReceipt(False, order_id, None, "prepared cancel not sent",
+                                   diagnostic_timings={"cancel_not_sent": 1.0})
+        async with self._preparation_lock_for(account_index, key):
+            if (not self._is_owned_prepared(prepared) or prepared._state != "READY"
+                    or prepared.plan_binding != ("CANCEL", account_index, market_id, order_id)
+                    or prepared.api_key_index != key or type(deadline) not in {int, float}
+                    or not math.isfinite(deadline) or time.monotonic() >= min(deadline, prepared.deadline)):
+                self._invalidate_owned(prepared)
+                return MutationReceipt(False, order_id, None, "prepared cancel not sent",
+                                       diagnostic_timings={"cancel_not_sent": 1.0})
+            self._consume_prepared_for_send(prepared)
+        timings = dict(prepared.diagnostic_timings)
+        timings["cancel_prepared_before_dispatch"] = 1.0
+        started = time.perf_counter()
+        self._record_cancel_send(account_index, order_id)
+        response = await self._bounded(
+            self._send_signed_tx(prepared._tx_type, prepared._tx_info,
+                                 tx_hash=prepared._tx_hash,
+                                 deadline=min(deadline, prepared.deadline)),
+            min(deadline, prepared.deadline), "prepared cancel dispatch",
+        )
+        timings["cancel_transport_roundtrip_seconds"] = time.perf_counter() - started
+        if isinstance(response, Mapping) and isinstance(response.get("_transport_timing"), Mapping):
+            for name, value in response["_transport_timing"].items():
+                if (name in {"ws_write_seconds", "ws_ack_wait_seconds", "ws_total_seconds",
+                             "http_session_ready_seconds", "http_response_headers_seconds",
+                             "http_first_body_byte_seconds", "http_full_body_seconds",
+                             "http_parse_seconds", "http_headers_signal_seconds", "http_body_signal_seconds",
+                             "http_queue_seconds", "http_connection_setup_seconds", "http_connection_reused"}
+                        and type(value) in {int, float} and math.isfinite(value) and value >= 0):
+                    timings[name] = float(value)
+        code = _response_code(response)
+        if code is None:
+            raise RuntimeError("malformed or undecidable prepared cancel response")
+        return MutationReceipt(
+            accepted=code == 200, order_id=order_id,
+            tx_hash=prepared._tx_hash or _safe_text(_model_dict(response).get("tx_hash")),
+            error=None if code == 200 else f"send_tx response code {code}",
+            response_code=code, diagnostic_timings=timings,
         )
 
 def _response_code(value: Any) -> int | None:

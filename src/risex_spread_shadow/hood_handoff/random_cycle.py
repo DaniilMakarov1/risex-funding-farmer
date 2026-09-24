@@ -2164,17 +2164,29 @@ class RandomCycleEngine:
         finally:
             try:
                 await self._release_preflight_nonces()
-                if config.confirmed_pilot:
+                if callable(getattr(self.client, "stop_read_stream", None)):
                     stop_stream = getattr(self.client, "stop_read_stream", None)
                     try:
+                        if callable(stop_stream):
+                            await stop_stream()
+                    finally:
                         summary = getattr(self.client, "read_stream_summary", None)
                         if journal is not None and callable(summary):
                             value = summary()
                             if value is not None:
                                 journal.append("PILOT_READ_STREAM_SUMMARY", value)
-                    finally:
-                        if callable(stop_stream):
-                            await stop_stream()
+                        if journal is not None:
+                            from .stream_timeline import compare_saved_stream
+                            try:
+                                timeline = compare_saved_stream(Path(config.cycle_dir) / "stream-events.jsonl")
+                                if len(timeline["orders"]) > 16:
+                                    timeline["orders"] = timeline["orders"][:16]
+                                    timeline["report_rows_truncated"] = True
+                                journal.append("PILOT_STREAM_TIMELINE", timeline)
+                            except Exception:
+                                journal.append("PILOT_STREAM_TIMELINE_UNKNOWN", {
+                                    "reason": "saved stream evidence is absent or invalid"
+                                })
             finally:
                 if journal is not None:
                     journal.release_attempt()
@@ -2256,6 +2268,9 @@ class RandomCycleEngine:
 
     async def _execute_locked(self, config: RandomCycleConfig, journal: DurableJournal) -> RandomCycleResult:
         self._stage = "PREFLIGHT"
+        start_stream = getattr(self.client, "start_read_stream", None)
+        if callable(start_stream) and not config.confirmed_pilot:
+            await start_stream(ready_timeout=5)
         metadata = _as_market(
             await self._bounded(self.client.market_metadata(config.market_id), config, "market metadata read")
         )
@@ -2319,6 +2334,7 @@ class RandomCycleEngine:
             start_stream = getattr(self.client, "start_read_stream", None)
             if not callable(start_stream) or not await start_stream(ready_timeout=5):
                 raise PreflightBlocked("confirmed pilot read-only stream is not ready")
+
 
         pair_budget = _PairAttemptBudget(limit=1 if config.confirmed_pilot else MAX_PREPARATION_ATTEMPTS)
         initial_metadata = metadata
@@ -4814,7 +4830,9 @@ class RandomCycleEngine:
         return RandomCycleEngine._fallback_order_identity_matches(order, plan) and order.terminal
 
     async def _order_book(self, market_id: int) -> OrderBookSnapshot | Mapping[str, Any]:
-        method = getattr(self.client, "order_book", None)
+        method = getattr(self.client, "price_book", None)
+        if not callable(method):
+            method = getattr(self.client, "order_book", None)
         if not callable(method):
             method = getattr(self.client, "order_book_snapshot", None)
         if not callable(method):

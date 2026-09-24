@@ -376,6 +376,45 @@ class HandoffEngine:
         self._visibility_checks_incremental_margin = True
         self._preflight_context: HandoffPreflightContext | None = None
         self._source_dispatch_monotonic: float | None = None
+        self._cancel_preparation_task: asyncio.Task[Any] | None = None
+        self._prepared_cancel: Any | None = None
+        self._cancel_preparation_order_id: str | None = None
+
+    def _stream_milestone(self, name: str, plan: OrderPlan,
+                          order_id: str | None = None) -> None:
+        record = getattr(self.client, "record_read_stream_milestone", None)
+        if callable(record):
+            record(name, plan.account_index, plan.client_order_index, order_id)
+
+    def _start_cancel_preparation(self, plan: OrderPlan, order: OrderSnapshot) -> None:
+        prepare = getattr(self.client, "prepare_cancel_order", None)
+        submit = getattr(self.client, "submit_prepared_cancel_order", None)
+        if (not callable(prepare) or not callable(submit)
+                or self._cancel_preparation_task is not None
+                or not order.active or not self._order_matches(order, plan)
+                or not order.order_id):
+            return
+        self._cancel_preparation_order_id = order.order_id
+        async def prepare_and_record():
+            prepared = await prepare(plan.account_index, plan.market_id, order.order_id)
+            self._stream_milestone("cancel_prepare_done", plan, order.order_id)
+            return prepared
+        self._cancel_preparation_task = asyncio.create_task(prepare_and_record())
+
+    async def _finish_cancel_preparation(self) -> None:
+        task, prepared = self._cancel_preparation_task, self._prepared_cancel
+        self._cancel_preparation_task = None
+        self._prepared_cancel = None
+        self._cancel_preparation_order_id = None
+        if task is not None:
+            if not task.done():
+                task.cancel()
+            result = await asyncio.gather(task, return_exceptions=True)
+            if prepared is None and result and not isinstance(result[0], BaseException):
+                prepared = result[0]
+        invalidate = getattr(self.client, "invalidate_prepared_order", None)
+        if prepared is not None and callable(invalidate):
+            await invalidate(prepared)
 
     async def _read_public_book(
         self,
@@ -772,10 +811,16 @@ class HandoffEngine:
         try:
             return await self._execute_locked(config, journal)
         finally:
-            journal.release_attempt()
+            try:
+                await self._finish_cancel_preparation()
+            finally:
+                journal.release_attempt()
 
     async def _execute_locked(self, config: HandoffConfig, journal: DurableJournal) -> HandoffResult:
         self._source_dispatch_monotonic = None
+        self._cancel_preparation_task = None
+        self._prepared_cancel = None
+        self._cancel_preparation_order_id = None
         self._preflight_context = None
         self._configured_poll_limit = config.max_poll_count
         self._configured_poll_interval = config.poll_interval_seconds
@@ -840,6 +885,14 @@ class HandoffEngine:
             )
         plan_payload = {"plan": plan.as_dict(), "config": binding, "review_required": True}
         journal.append("PLAN_READY", plan_payload, run_id=run_id)
+        bind_stream_order = getattr(self.client, "bind_read_stream_order", None)
+        if callable(bind_stream_order):
+            for role, leg in (("source", plan.source), ("receiver", plan.receiver)):
+                bind_stream_order(
+                    leg.account_index, leg.market_id, leg.client_order_index,
+                    run_id=run_id, phase=config.operation_mode.value, role=role,
+                    attempt_index=config.attempt_index,
+                )
         if not config.operator_execution_opt_in or not config.operator_plan_reviewed:
             journal.append("PREVIEW", plan_payload, run_id=run_id)
             return HandoffResult(
@@ -955,6 +1008,10 @@ class HandoffEngine:
                 )
         latency.update(_prepared_timing_values(prepared_source, "source"))
         latency.update(_prepared_timing_values(prepared_receiver, "receiver"))
+        if prepared_source is not None:
+            self._stream_milestone("prepare_done", plan.source)
+        if prepared_receiver is not None:
+            self._stream_milestone("prepare_done", plan.receiver)
         if config.max_quote_age_seconds is not None and self.clock.now() - config.source_quote_observed_at > config.max_quote_age_seconds:
             unknown_reasons.append("source quote latency budget expired before dispatch")
         try:
@@ -986,6 +1043,7 @@ class HandoffEngine:
                     {"plan": source_dispatch_plan.as_dict()},
                     run_id=run_id,
                 )
+                self._stream_milestone("send_entered", plan.source)
                 source_receipt = _as_receipt(
                     await self._submit_order(
                         source_dispatch_plan,
@@ -994,6 +1052,7 @@ class HandoffEngine:
                 )
                 latency["source_submit_ack_seconds"] = max(0.0, time.perf_counter() - source_submit_started)
                 source_dispatch_ack_at = self.clock.now()
+                self._stream_milestone("ack_parsed", plan.source, source_receipt.order_id)
                 latency["source_dispatch_ack_at"] = source_dispatch_ack_at
                 journal.append(
                     "SOURCE_DISPATCH_RESULT",
@@ -1061,6 +1120,11 @@ class HandoffEngine:
                 latency["coalesced_pre_receiver_window_seconds"] = coalesced_pre_receiver_window_seconds
             if source_order is not None:
                 source_order_id = source_order.order_id
+                bind_cancel = getattr(self.client, "bind_read_stream_cancel", None)
+                if callable(bind_cancel) and self._order_matches(source_order, plan.source):
+                    bind_cancel(plan.source.account_index, plan.source.market_id,
+                                plan.source.client_order_index, source_order_id)
+                self._start_cancel_preparation(plan.source, source_order)
             if source_order is None:
                 unknown_reasons.append("source order identity or status is unresolved")
             elif not self._order_matches(source_order, plan.source):
@@ -1419,6 +1483,7 @@ class HandoffEngine:
                         },
                         run_id=run_id,
                     )
+                    self._stream_milestone("admission_decision", plan.source, source_order_id)
                     guard_event_recorded = True
 
         if paired_mode and not guard_event_recorded:
@@ -1590,6 +1655,7 @@ class HandoffEngine:
                     # widens a pre-signed mutation's lifetime.
                     receiver_final_deadline = min(receiver_final_deadline, prepared_deadline)
             journal.append("RECEIVER_DISPATCH_INTENT", {"plan": receiver_dispatch_plan.as_dict()}, run_id=run_id)
+            self._stream_milestone("send_entered", plan.receiver)
             receiver_receipt = _as_receipt(
                 await self._submit_order(
                     receiver_dispatch_plan,
@@ -1602,6 +1668,7 @@ class HandoffEngine:
             # monotonic duration so an offline report can distinguish an ack
             # from later order visibility.
             latency["receiver_dispatch_ack_at"] = self.clock.now()
+            self._stream_milestone("ack_parsed", plan.receiver, receiver_receipt.order_id)
             journal.append(
                 "RECEIVER_DISPATCH_RESULT",
                 {
@@ -1640,6 +1707,7 @@ class HandoffEngine:
             )
             # Terminal visibility and a positive fill are separate observations.
             if receiver_order is not None:
+                self._stream_milestone("receiver_terminal", plan.receiver, receiver_order.order_id)
                 latency["receiver_terminal_observed_at"] = receiver_order.observed_at
                 if receiver_order.filled_quantity > 0:
                     latency["receiver_fill_observed_at"] = receiver_order.observed_at
@@ -1688,6 +1756,8 @@ class HandoffEngine:
             unknown_reasons=unknown_reasons,
         )
         latency["reconciliation_seconds"] = max(0.0, time.perf_counter() - reconciliation_started)
+        if source_result.order is not None and source_result.order.terminal:
+            self._stream_milestone("cancel_reconciled", plan.source, source_result.order.order_id)
         return await self._finish(
             journal,
             run_id,
@@ -2045,7 +2115,12 @@ class HandoffEngine:
             if self.clock.now() > deadline:
                 break
             try:
-                order = await self._lookup_order(plan, order_id, client_order_index=plan.client_order_index)
+                observed = getattr(self.client, "observed_order", None)
+                order = (observed(plan.account_index, plan.market_id, plan.client_order_index,
+                                  order_id, terminal_only=require_terminal)
+                         if callable(observed) else None)
+                if order is None:
+                    order = await self._lookup_order(plan, order_id, client_order_index=plan.client_order_index)
             except Exception as exc:
                 journal.append("ORDER_OBSERVATION_ERROR", {"leg": plan.side, "poll": poll, "reason": sanitize_exception(exc)}, run_id=run_id)
                 order = None
@@ -2080,6 +2155,7 @@ class HandoffEngine:
                 if require_terminal and order.terminal:
                     return order
                 if not require_terminal and (order.terminal or order.active):
+                    self._start_cancel_preparation(plan, order)
                     return order
             if poll < self._poll_limit:
                 remaining = deadline - self.clock.now()
@@ -2088,8 +2164,9 @@ class HandoffEngine:
                 delay = min(self._poll_interval, remaining)
                 wake = getattr(self.client, "wait_terminal_hint", None) if require_terminal else None
                 if callable(wake):
-                    # A private stream event only wakes the next exact REST
-                    # lookup. It never supplies terminal/admission proof.
+                    # Wake on a private terminal event. A complete validated
+                    # positive terminal snapshot can replace the next REST read;
+                    # incomplete hints still fall back to REST.
                     wait_started = time.monotonic()
                     try:
                         hinted = await asyncio.wait_for(
@@ -2104,7 +2181,7 @@ class HandoffEngine:
                             "market_id": plan.market_id,
                             "client_order_index": plan.client_order_index,
                             "order_id": order_id,
-                            "rest_proof_pending": True,
+                            "exact_lookup_pending": True,
                         }, run_id=run_id)
                         continue
                     unslept = delay - (time.monotonic() - wait_started)
@@ -2557,9 +2634,16 @@ class HandoffEngine:
                     run_id=run_id,
                 )
                 return
-            set_deadline = getattr(self.client, "set_mutation_deadline", None)
-            if callable(set_deadline):
-                set_deadline(mutation_deadline)
+            prepared_cancel = None
+            if (self._cancel_preparation_task is not None
+                    and self._cancel_preparation_order_id == current.order_id):
+                try:
+                    prepared_cancel = await self._cancel_preparation_task
+                    self._prepared_cancel = prepared_cancel
+                except Exception:
+                    # An unsent acceleration failure may use the existing
+                    # exact, freshly bounded cancel path below.
+                    prepared_cancel = None
             journal.append(
                 "CANCEL_DISPATCH_INTENT",
                 {
@@ -2567,15 +2651,32 @@ class HandoffEngine:
                     "account_index": plan.account_index,
                     "market_id": plan.market_id,
                     "order_id": current.order_id,
+                    "prepared_before_decision": prepared_cancel is not None,
                 },
                 run_id=run_id,
             )
-            receipt = _as_receipt(
-                await self._bounded(
+            self._stream_milestone("cancel_decision", plan, current.order_id)
+            if prepared_cancel is not None:
+                submit_prepared = getattr(self.client, "submit_prepared_cancel_order")
+                receipt = _as_receipt(await self._bounded(
+                    submit_prepared(plan.account_index, plan.market_id, current.order_id,
+                                    prepared_cancel, deadline=mutation_deadline),
+                    "prepared source cancellation mutation",
+                ))
+                if receipt.error == "prepared cancel not sent":
+                    journal.append("CANCEL_PREPARED_NOT_SENT", {
+                        "account_index": plan.account_index, "market_id": plan.market_id,
+                        "order_id": current.order_id,
+                    }, run_id=run_id)
+                    prepared_cancel = None
+            if prepared_cancel is None:
+                set_deadline = getattr(self.client, "set_mutation_deadline", None)
+                if callable(set_deadline):
+                    set_deadline(mutation_deadline)
+                receipt = _as_receipt(await self._bounded(
                     self.client.cancel_order(plan.account_index, plan.market_id, current.order_id),
                     "source cancellation mutation",
-                )
-            )
+                ))
             journal.append(
                 "CANCEL_DISPATCH_RESULT",
                 {
@@ -2589,6 +2690,7 @@ class HandoffEngine:
                         key: value for key, value in (receipt.diagnostic_timings or {}).items()
                         if key in {
                             "cancel_nonce_seconds", "cancel_signing_seconds",
+                            "cancel_preparation_seconds", "cancel_prepared_before_dispatch",
                             "cancel_transport_roundtrip_seconds", "http_session_ready_seconds",
                             "http_response_headers_seconds", "http_first_body_byte_seconds",
                             "http_full_body_seconds", "http_parse_seconds",
@@ -2600,6 +2702,7 @@ class HandoffEngine:
                 },
                 run_id=run_id,
             )
+            self._stream_milestone("cancel_ack_parsed", plan, current.order_id)
         except Exception as exc:
             reason = f"source cancellation outcome unknown: {sanitize_exception(exc)}"
             unknown_reasons.append(reason)
@@ -3830,7 +3933,9 @@ def _implementation_fingerprint() -> str:
 
     package_dir = Path(__file__).resolve().parent
     digest = hashlib.sha256()
-    for name in ("contracts.py", "engine.py", "journal.py", "sdk.py", "cli.py"):
+    for name in ("contracts.py", "engine.py", "journal.py", "sdk.py", "cli.py",
+                 "stream_state.py", "stream_reads.py", "stream_measurement.py",
+                 "stream_evidence.py", "stream_timeline.py", "ws_sender.py"):
         path = package_dir / name
         digest.update(name.encode("utf-8"))
         digest.update(b"\0")

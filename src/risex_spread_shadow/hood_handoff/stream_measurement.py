@@ -100,6 +100,7 @@ class StreamProjection:
     transport_sent_close_code: int | None = None
     stopped_reason: str | None = None
     last_orders: dict[tuple[int, int], tuple[str, str, str, str]] = field(default_factory=dict)
+    last_duplicate_keys: list[tuple[int, int]] = field(default_factory=list)
 
     def reconnect(self) -> None:
         """Invalidate stream continuity; budgets and local chronology persist."""
@@ -110,6 +111,7 @@ class StreamProjection:
         self.private_snapshot_accounts.clear()
 
     def feed(self, raw: bytes, received_at: float) -> list[dict[str, object]]:
+        self.last_duplicate_keys.clear()
         if self.stopped_reason is not None:
             return []
         if (type(raw) is not bytes or isinstance(received_at, bool)
@@ -146,6 +148,8 @@ class StreamProjection:
             self.malformed += 1
             return []
         channel, kind = frame.get("channel"), frame.get("type")
+        if isinstance(kind, str) and kind in {"ping", "pong"}:
+            return []
         if kind == "connected":
             self.connected_controls += 1
             return []
@@ -235,6 +239,7 @@ class StreamProjection:
             state = (order_id, status, filled, remaining)
             if prior == state:
                 self.order_duplicates += 1
+                self.last_duplicate_keys.append((account, client))
                 continue
             if prior is not None and (prior[0] != order_id or prior[1] in TERMINAL and status != prior[1]
                                       or Decimal(filled) < Decimal(prior[2])):

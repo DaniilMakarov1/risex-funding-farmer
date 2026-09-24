@@ -387,7 +387,7 @@ def test_sdk_opt_in_stream_lifecycle_is_warmed_once_and_closes(monkeypatch, tmp_
         assert set(summary) == {
             "connected", "ready", "frames", "bytes", "book_gaps",
             "private_subscription_controls", "order_events", "order_conflicts",
-            "malformed", "stopped_reason",
+            "malformed", "stopped_reason", "ws_price_reads", "ws_order_reads",
         }
         assert not await client.start_read_stream(ready_timeout=0.5)
         assert await client.wait_terminal_hint(27337, 99, "123", 0.1)

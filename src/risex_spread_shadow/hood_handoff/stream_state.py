@@ -12,7 +12,9 @@ import json
 import math
 import time
 
+from .stream_reads import StreamReads
 from .offline_observer import ObserverLimits
+from .stream_evidence import StreamEvidenceJournal
 from .stream_measurement import StreamIdentity, StreamProjection, WS_URL, _auth_tokens
 
 
@@ -45,15 +47,19 @@ class ReadStreamState:
     identity: StreamIdentity
     limits: StreamReadLimits = field(default_factory=StreamReadLimits)
     observer: StreamProjection = field(init=False)
+    reads: StreamReads = field(init=False)
     connected: bool = False
     book_received_at: float | None = None
     private_snapshot_at: dict[int, float] = field(default_factory=dict)
     exact_orders: dict[tuple[int, int], dict[str, object]] = field(default_factory=dict)
     order_versions: dict[tuple[int, int], int] = field(default_factory=dict)
     consumed_hint_versions: dict[tuple[int, int], int] = field(default_factory=dict)
+    evidence: StreamEvidenceJournal | None = None
+    order_contexts: dict[tuple[int, int], dict[str, object]] = field(default_factory=dict)
     _condition: asyncio.Condition = field(default_factory=asyncio.Condition, repr=False)
 
     def __post_init__(self) -> None:
+        self.reads = StreamReads(self.identity.market_id, self.identity.market_symbol, self.identity.accounts)
         self.observer = StreamProjection(
             self.identity,
             ObserverLimits(max_seconds=self.limits.lifetime_seconds,
@@ -72,6 +78,7 @@ class ReadStreamState:
     async def disconnected(self) -> None:
         """Invalidate all channel and exact-order hints before any reconnect."""
         self.connected = False
+        self.reads.clear()
         self.observer.reconnect()
         self.book_received_at = None
         self.private_snapshot_at.clear()
@@ -81,10 +88,36 @@ class ReadStreamState:
         async with self._condition:
             self._condition.notify_all()
 
+    def bind_order(self, account: int, market: int, client: int,
+                   *, run_id: str, phase: str, role: str,
+                   attempt_index: int | None) -> None:
+        """Associate a planned exact order before its mutation can be sent."""
+        if (type(account) is not int or account not in self.identity.accounts
+                or type(market) is not int or market != self.identity.market_id
+                or type(client) is not int or client < 0
+                or not isinstance(run_id, str) or not run_id.isascii() or len(run_id) > 64
+                or phase not in {"PAIRED_OPENING", "PAIRED_CLOSING"}
+                or role not in {"source", "receiver"}
+                or (attempt_index is not None and (type(attempt_index) is not int
+                                                   or not 0 <= attempt_index <= 100000))):
+            raise ValueError("read-stream order context is invalid")
+        self.order_contexts[(account, client)] = {
+            "run_id": run_id, "phase": phase, "role": role,
+            **({"attempt_index": attempt_index} if attempt_index is not None else {}),
+        }
+
     async def feed(self, raw: bytes, received_at: float) -> list[dict[str, object]]:
         if not self.connected:
             raise RuntimeError("read stream is not connected")
         projections = self.observer.feed(raw, received_at)
+        try:
+            frame = json.loads(raw)
+            if isinstance(frame, dict):
+                self.reads.feed(frame, projections, received_at, time.time() - (time.monotonic() - received_at))
+            else:
+                self.reads.clear()
+        except (ValueError, TypeError, RecursionError):
+            self.reads.clear()
         if self.observer.stopped_reason is not None:
             await self.disconnected()
             return []
@@ -109,6 +142,16 @@ class ReadStreamState:
                     self.exact_orders.pop((account, client), None)
                     self.order_versions.pop((account, client), None)
                     self.consumed_hint_versions.pop((account, client), None)
+            if self.evidence is not None:
+                account, client = item.get("account_index"), item.get("client_order_index")
+                context = self.order_contexts.get((account, client)) if type(account) is int and type(client) is int else None
+                self.evidence.offer(item, context)
+        if self.evidence is not None:
+            for account, client in self.observer.last_duplicate_keys:
+                self.evidence.offer({"kind": "order_duplicate", "epoch": self.observer.epoch,
+                                     "received_at": received_at, "account_index": account,
+                                     "client_order_index": client},
+                                    self.order_contexts.get((account, client)))
         async with self._condition:
             self._condition.notify_all()
         return projections
@@ -123,6 +166,7 @@ class ReadStreamState:
             and type(now) in {int, float} and math.isfinite(now)
             and 0 <= now - self.book_received_at <= self.limits.max_fresh_age_seconds
             and self.observer.private_snapshot_accounts == set(self.identity.accounts)
+            and (self.evidence is None or not self.evidence.failed)
         )
 
     async def wait_subscription_ready(self, timeout: float) -> bool:
@@ -199,7 +243,10 @@ class ReadStreamSession:
             return "stopped_before_connect"
         tokens: dict[int, str] = {}
         result = "duration_limit"
+        cancelled = False
         try:
+            if self.state.evidence is not None:
+                await self.state.evidence.start()
             stop_at = time.monotonic() + self.state.limits.lifetime_seconds
             tokens = await asyncio.wait_for(_auth_tokens(self.state.identity, provider), timeout=10)
             if stop.is_set() or time.monotonic() >= stop_at:
@@ -226,12 +273,22 @@ class ReadStreamSession:
                     except asyncio.TimeoutError:
                         continue
                     raw = incoming.encode("utf-8") if isinstance(incoming, str) else incoming
-                    await self.state.feed(raw, time.monotonic())
+                    received_at = time.monotonic()
+                    await self.state.feed(raw, received_at)
+                    try:
+                        control = json.loads(raw)
+                        if isinstance(control, dict) and control.get("type") == "ping":
+                            await socket.send('{"type":"pong"}')
+                    except (ValueError, TypeError):
+                        pass
                     if self.state.observer.stopped_reason is not None:
                         result = "observer_stopped"
                         break
                 else:
                     result = "stopped"
+        except asyncio.CancelledError:
+            result = "task_cancelled"
+            cancelled = True
         except Exception:
             # Never surface exception text: WebSocket errors may contain auth.
             result = "transport_error"
@@ -239,4 +296,11 @@ class ReadStreamSession:
             tokens.clear()
             if self.state.connected:
                 await self.state.disconnected()
+            if self.state.evidence is not None:
+                try:
+                    await self.state.evidence.close(reason=result)
+                except Exception:
+                    result = "evidence_flush_error"
+        if cancelled:
+            raise asyncio.CancelledError
         return result

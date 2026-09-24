@@ -3,7 +3,7 @@ import copy
 from pathlib import Path
 from dataclasses import replace
 from decimal import Decimal
-from time import perf_counter
+from time import perf_counter, monotonic
 
 import pytest
 
@@ -549,6 +549,112 @@ async def test_source_nonce_still_stale_after_send_while_receiver_domain_is_inde
     assert client._signers[11].cancel_calls == []
     assert len(client._http.calls) == 1
     await client.invalidate_prepared_order(prepared_receiver)
+
+
+@pytest.mark.asyncio
+async def test_prepared_cancel_uses_fresh_source_nonce_and_one_send(monkeypatch):
+    client = LighterSdkClient(
+        _sdk_config("prepared-cancel-fresh"), source_account_index=11,
+        receiver_account_index=22,
+        secrets=StaticSecretProvider({11: "synthetic-source", 22: "synthetic-receiver"}),
+        market_evidence={}, signer_factory=lambda **kwargs: FakeSigner(**kwargs),
+        http_factory=FakeHttp,
+    )
+    monkeypatch.setattr(LighterSdkClient, "verify_sdk", staticmethod(lambda: None))
+    client._lighter = lambda: FakeModule
+    source = _sdk_plan(account_index=11)
+    receiver = _sdk_plan(account_index=22, order_type="MARKET", time_in_force="IOC")
+    first = await client.prepare_order(source)
+    assert (await client.submit_prepared_order(source, first)).accepted
+    other = await client.prepare_order(receiver)
+    assert other._nonce == 41
+    cancel = await client.prepare_cancel_order(11, 7, "99")
+    assert cancel._nonce == 42
+    assert client._signers[11].cancel_calls[-1]["nonce"] == 42
+    assert len(client._http.calls) == 1
+    receipt = await client.submit_prepared_cancel_order(11, 7, "99", cancel,
+                                                         deadline=monotonic() + 1)
+    assert receipt.accepted
+    assert receipt.diagnostic_timings["cancel_prepared_before_dispatch"] == 1.0
+    assert len(client._http.calls) == 2
+    again = await client.submit_prepared_cancel_order(11, 7, "99", cancel,
+                                                       deadline=monotonic() + 1)
+    assert not again.accepted and again.error == "prepared cancel not sent"
+    assert len(client._http.calls) == 2
+    await client.invalidate_prepared_order(other)
+
+
+@pytest.mark.asyncio
+async def test_prepared_cancel_stale_nonce_identity_expiry_and_ambiguous_send(monkeypatch):
+    monkeypatch.setattr(LighterSdkClient, "verify_sdk", staticmethod(lambda: None))
+    stale = _constant_nonce_client(prefix="prepared-cancel-stale")
+    stale._lighter = lambda: FakeModule
+    first = await stale.prepare_order(_sdk_plan())
+    assert (await stale.submit_prepared_order(_sdk_plan(), first)).accepted
+    with pytest.raises(ContractError, match="already sent"):
+        await stale.prepare_cancel_order(11, 7, "99")
+    assert len(stale._http.calls) == 1
+
+    ambiguous = _constant_nonce_client(prefix="prepared-cancel-unknown",
+                                       http_factory=AmbiguousConstantHttp)
+    ambiguous._lighter = lambda: FakeModule
+    token = await ambiguous.prepare_cancel_order(11, 7, "99")
+    wrong = await ambiguous.submit_prepared_cancel_order(11, 7, "100", token,
+                                                         deadline=monotonic() + 1)
+    assert wrong.error == "prepared cancel not sent" and ambiguous._http.calls == []
+    token = await ambiguous.prepare_cancel_order(11, 7, "99")
+    expired = await ambiguous.submit_prepared_cancel_order(11, 7, "99", token,
+                                                           deadline=monotonic() - 1)
+    assert expired.error == "prepared cancel not sent" and ambiguous._http.calls == []
+    token = await ambiguous.prepare_cancel_order(11, 7, "99")
+    with pytest.raises(TimeoutError):
+        await ambiguous.submit_prepared_cancel_order(11, 7, "99", token,
+                                                     deadline=monotonic() + 1)
+    retry = await ambiguous.submit_prepared_cancel_order(11, 7, "99", token,
+                                                         deadline=monotonic() + 1)
+    assert retry.error == "prepared cancel not sent" and len(ambiguous._http.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_warmed_ws_transport_is_bound_before_preparation_and_never_http_replays(monkeypatch):
+    class ValidHashSigner(ConstantNonceSigner):
+        async def sign_create_order(self, **kwargs):
+            tx_type, tx_info, _tx_hash, error = await super().sign_create_order(**kwargs)
+            return tx_type, tx_info, "0x" + "a" * 64, error
+
+    class Sender:
+        def __init__(self):
+            self.calls = []
+            self.started = self.closed = False
+
+        async def start(self):
+            self.started = True
+
+        async def send(self, tx_type, tx_info, tx_hash, *, deadline):
+            self.calls.append((tx_type, tx_hash))
+            raise TimeoutError("synthetic ambiguous WS response")
+
+        async def close(self):
+            self.closed = True
+
+    client = _constant_nonce_client(prefix="warmed-ws-selection", signer=ValidHashSigner())
+    monkeypatch.setattr(LighterSdkClient, "verify_sdk", staticmethod(lambda: None))
+    client._lighter = lambda: FakeModule
+    sender = Sender()
+    await client.enable_warmed_ws_sender(sender)
+    assert sender.started
+    plan = _sdk_plan()
+    prepared = await client.prepare_order(plan)
+    with pytest.raises(ContractError, match="already bound"):
+        await client.enable_warmed_ws_sender(Sender())
+    with pytest.raises(TimeoutError):
+        await client.submit_prepared_order(plan, prepared)
+    retry = await client.submit_prepared_order(plan, prepared)
+    assert not retry.accepted and "consumed" in (retry.error or "")
+    assert sender.calls == [(14, "0x" + "a" * 64)]
+    assert client._http.calls == []
+    await client.aclose()
+    assert sender.closed
 
 
 @pytest.mark.asyncio
