@@ -782,6 +782,8 @@ class LighterSdkClient:
             "private_subscription_controls": observer.private_subscription_controls,
             "order_events": observer.order_events,
             "order_conflicts": observer.order_conflicts,
+            "transaction_events": observer.transaction_events,
+            "transaction_invalid": observer.transaction_invalid,
             "malformed": observer.malformed,
             "stopped_reason": observer.stopped_reason,
             **({} if state.evidence is None else {

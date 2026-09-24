@@ -92,6 +92,8 @@ class StreamProjection:
     order_events: int = 0
     order_duplicates: int = 0
     order_conflicts: int = 0
+    transaction_events: int = 0
+    transaction_invalid: int = 0
     connected_controls: int = 0
     server_error_controls: int = 0
     private_subscription_controls: int = 0
@@ -175,12 +177,15 @@ class StreamProjection:
         if kind == "subscribed/account_tx":
             return [{"kind": "transaction_subscription", "epoch": self.epoch,
                      "received_at": at, "account_index": account}]
-        if kind != "update/account_tx" or not isinstance(frame.get("txs"), list):
+        if kind != "update/account_tx":
+            return []
+        if not isinstance(frame.get("txs"), list):
+            self.transaction_invalid += 1
             return []
         output = []
         # Keep projection work bounded independently of the raw frame budget.
         if len(frame["txs"]) > 512:
-            self.malformed += 1
+            self.transaction_invalid += 1
             return []
         for tx in frame["txs"]:
             if (not isinstance(tx, dict) or type(tx.get("account_index")) is not int
@@ -189,7 +194,7 @@ class StreamProjection:
                     or re.fullmatch(r"(?:0x)?[0-9a-fA-F]{8,128}", tx["hash"]) is None
                     or not _integer(tx.get("status")) or not _integer(tx.get("nonce"))
                     or tx["status"] > 2**63 - 1 or tx["nonce"] > 2**63 - 1):
-                self.malformed += 1
+                self.transaction_invalid += 1
                 continue
             row = {"kind": "transaction", "epoch": self.epoch, "received_at": at,
                    "account_index": account, "tx_hash": tx["hash"].lower(),
@@ -199,6 +204,7 @@ class StreamProjection:
                 if type(value) is int and 0 <= value <= 2**63 - 1:
                     row[f"venue_{name}_raw"] = value
             output.append(row)
+            self.transaction_events += 1
         return output
 
     def _book(self, frame: dict, kind: str, at: float) -> list[dict[str, object]]:

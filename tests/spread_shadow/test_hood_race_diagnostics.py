@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import time
+from decimal import Decimal
 
 import pytest
 
@@ -42,6 +43,7 @@ def test_transaction_projection_preserves_raw_units_without_payload_or_order_pro
     assert "unverified" in saved["venue_clock_basis"]
     assert "PRIVATE" not in repr(row) + repr(saved)
     assert observer.order_events == 0 and not observer.private_snapshot_accounts
+    assert observer.transaction_events == 1
 
 
 @pytest.mark.parametrize("field,value", [
@@ -53,7 +55,8 @@ def test_invalid_transaction_identity_never_becomes_evidence(field, value):
     tx = transaction(); tx[field] = value
     observer = StreamProjection(identity())
     assert observer.feed(frame(tx), 10) == []
-    assert observer.malformed == 1
+    assert observer.transaction_invalid == 1
+    assert observer.malformed == 0  # Diagnostic schema drift cannot veto admission.
 
 
 @pytest.mark.parametrize("value", [None, True, -1, 1.1, "1790247747123", 2**64])
@@ -108,6 +111,30 @@ def test_transaction_projection_is_bounded_and_unknown_channels_are_ignored():
     observer = StreamProjection(identity(), ObserverLimits(max_frame_bytes=8 * 1024 * 1024))
     assert observer.feed(json.dumps(dict(type="update/account_tx", channel="account_tx:27331",
                                         txs=[transaction()] * 513)).encode(), 10) == []
-    assert observer.malformed == 1
+    assert observer.transaction_invalid == 1 and observer.malformed == 0
     assert observer.feed(json.dumps(dict(type="update/account_tx", channel="account_tx:999",
                                         txs=[transaction()])).encode(), 11) == []
+
+
+@pytest.mark.asyncio
+async def test_actual_admission_ignores_transaction_success_and_diagnostic_schema_errors():
+    from test_hood_ws_confirmed import sdk_stream_client
+    from test_hood_ws_reads import put, put_order, order
+    from risex_spread_shadow.hood_handoff import OrderPlan
+    client, state = await sdk_stream_client()
+    anchor = client.begin_ws_admission()
+    plan = OrderPlan(account_index=11, market_id=1, side="BUY", quantity=Decimal(".20"),
+                     price=Decimal("100"), order_type="LIMIT", time_in_force="POST_ONLY",
+                     reduce_only=False, client_order_index=77, quantity_int=20,
+                     price_int=1000, order_expiry_ms=9999999999999)
+    tx = transaction(); tx["account_index"] = 11
+    await put(state, dict(type="update/account_tx", channel="account_tx:11", txs=[tx]))
+    assert client.ws_admission_view(anchor, plan, "123")[0] is None
+    await put_order(state, order())
+    before = state.reads.orders[(11, 77)][1]
+    await put(state, dict(type="update/account_tx", channel="account_tx:11", txs=[{"unknown_schema": True}]))
+    observed, _ = client.ws_admission_view(anchor, plan, "123")
+    assert observed.order_id == "123" and observed.filled_quantity == 0
+    assert state.reads.orders[(11, 77)][1] == before
+    assert client.read_stream_summary()["transaction_invalid"] == 1
+    assert state.observer.malformed == 0
