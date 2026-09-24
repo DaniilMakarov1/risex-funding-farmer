@@ -1,3 +1,7 @@
+# WS activation for owner-run Telegram tests — 2026-09-24
+
+The owner now explicitly requests activation of the verified WS version and will launch real tests through Telegram. Integrate tested source 7f52812 (5311 passed, 3 skipped) with current main documentation, preserving the final active LIMIT recheck and HTTP transaction submission. Authorize one controlled idle-controller restart on the existing owner/config/credential boundary. Preserve config, evidence, saved intent and command offset; no reset, replay, new order, cancellation or leverage write by the agent. Prove no active trading child and acquire the operator lock before stopping the controller; verify the instance lock is released before changing runtime files. Keep code identical to tested source; documentation merge alone does not require another full suite. Verify runtime imports, binding, startup and locks, then report ready for owner-triggered /run. Save owner-only activation evidence separately. Do not send Telegram trading commands.
+
 # Parent-owned WS read acceleration — 2026-09-24
 
 The owner explicitly stopped Chief and assigned the parent sole implementation, self-review and integration ownership: maximize replacement of REST by WebSocket, measure latency, explain every retained REST operation. Chief confirmed stopped writes and handed over WIP at 44472ce on codex/spread-v1-stream-evidence-cancel-ws. Preserve that worktree and its uncommitted work. Current branch codex/ws-read-acceleration is an isolated copy; owner-only evidence is hood-ws-read-acceleration-20260924/solo-v1. No delegates.
@@ -114,7 +118,13 @@ Authority is limited to source and immutable saved-evidence inspection, official
 
 Acceptance requires a full actual-diff self-review, source/evidence provenance, relevant adverse and integration checks, and one final clean isolated Python 3.11 / lighter-sdk 1.1.2 full suite after execution or causal-order edits. State separately what is measured offline, modeled, and live NOT_RUN. A tested partial candidate is acceptable when venue stream equivalence or transport superiority remains unproved; do not label it full success. Preserve original evidence and predecessor work. Commit locally as READY_FOR_REVIEW or WIP_NOT_ACCEPTED, save the packet first, and then deliver branch/worktree/HEAD, six-part status, diffs, tests, hashes, gain and limits to auditor task `01a0c9cd-c8bc-75b0-92b3-04b75270a65e` via `send_message_to_thread`. Stop after delivery.
 
-# HCR-42 controller restart — historical owner authorization
+## Preserved main documentation instruction
+
+# Owner-directed AGENTS text update — completed
+
+On 2026-09-23 the owner requested committing the revised Russian translation of `AGENTS.md` after removing its entire "Safety and secrets" section. This explicit instruction authorizes the language exception for `AGENTS.md` and the removal of that section; the remaining four governing files retain their existing English-language convention. This documentation change does not authorize any new trading, account, credential, runtime, or strategy action. Preserve concurrent work and stage only `AGENTS.md` and this authority record.
+
+# HCR-42 controller restart — owner authorization
 
 ## Current finite operation
 
