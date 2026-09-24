@@ -1609,6 +1609,19 @@ class LighterSdkClient:
         if was_ready:
             self._release_prepared_reservation(prepared)
 
+    async def warm_mutation_http(self) -> None:
+        """Public read through the actual sendTx pool; no signing or nonce use.
+
+        Reuse is an optimization, not a promise: the peer may close the socket.
+        The caller cancels this optional read when required preflight finishes.
+        """
+        if self._warmed_ws_sender is not None:
+            return
+        payload = await self._http.get("api/v1/orderBookDetails",
+                                       params={"market_id": self.config.market_id},
+                                       authorization="")
+        _require_success_code(payload, "HTTP warmup")
+
     async def enable_warmed_ws_sender(self, sender: Any | None = None) -> None:
         """Select WS for this client before preparing or sending any mutation.
 

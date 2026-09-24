@@ -3020,6 +3020,7 @@ class RandomCycleEngine:
         config: RandomCycleConfig,
         *,
         market_read_label: str,
+        warm_closing_transport: bool = False,
     ) -> tuple[MarketMetadata, AccountSnapshot, AccountSnapshot]:
         """Read metadata and both accounts before taking the final book quote.
 
@@ -3039,6 +3040,24 @@ class RandomCycleEngine:
             )
 
         await self._release_preflight_nonces()
+        warm_task = None
+        if warm_closing_transport:
+            self._closing_http_warmup = {"status": "unavailable"}
+            warm = getattr(self.client, "warm_mutation_http", None)
+            if callable(warm):
+                async def warm_once() -> None:
+                    started = time.perf_counter()
+                    try:
+                        await asyncio.wait_for(warm(), timeout=min(1.0, config.request_timeout_seconds))
+                        self._closing_http_warmup["status"] = "completed"
+                    except asyncio.CancelledError:
+                        self._closing_http_warmup["status"] = "unfinished_read_cancelled"
+                        raise
+                    except Exception:
+                        self._closing_http_warmup["status"] = "failed"
+                    finally:
+                        self._closing_http_warmup["seconds"] = time.perf_counter() - started
+                warm_task = asyncio.create_task(warm_once())
         tasks = [
             asyncio.create_task(read_metadata()),
             asyncio.create_task(self._accounts(config)),
@@ -3053,6 +3072,11 @@ class RandomCycleEngine:
             await asyncio.gather(*tasks, return_exceptions=True)
             await self._release_preflight_nonces()
             raise
+        finally:
+            if warm_task is not None:
+                if not warm_task.done():
+                    warm_task.cancel()
+                await asyncio.gather(warm_task, return_exceptions=True)
         source, receiver = accounts
         return metadata, source, receiver
 
@@ -3382,6 +3406,7 @@ class RandomCycleEngine:
                         metadata, source, receiver = await self._parallel_revalidation_context(
                             config,
                             market_read_label="closing market read",
+                            warm_closing_transport=True,
                         )
                     except _AccountIdentityFailure:
                         self._mark_identity_failure("closing account identity/read validation failed")
@@ -3507,6 +3532,7 @@ class RandomCycleEngine:
                     "CLOSING_PLAN_READY",
                     {
                         "config": opening_config_binding(close_config),
+                        "http_warmup": dict(getattr(self, "_closing_http_warmup", {})),
                         "latency": {**dict(getattr(self, "_last_quote_read", {})),
                                     "preparation_seconds": max(0.0, time.perf_counter() - preparation_started)},
                         "paired_quantity": format(paired_quantity, "f"),

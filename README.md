@@ -1,3 +1,7 @@
+## Closing connection warmup
+
+Paired closing automatically warms its existing HTTP send pool with one public read during mandatory revalidation, before choosing the final quote. It adds no periodic background activity or order. Failure or an unfinished warmup does not block closing; reconnect remains possible if the peer closes the connection. CLOSING_PLAN_READY.http_warmup records its result. This moves potential connection setup before source exposure; it does not guarantee faster matching after a LIMIT rests. ACK-only MARKET dispatch is not enabled.
+
 ## Race timing evidence
 
 Owner-triggered cycles also collect passive `account_tx` events into the existing protected `stream-events.jsonl`, alongside order/local milestones. Match transaction hashes to mutation receipts for analysis; account transaction events can concern other markets and do not prove a selected-market resting order. Raw venue times retain their original units and must not be compared with local wall time without verifying units/clock offset. Missing events remain unknown. No extra command is required; transaction writes still use warmed HTTP until successful Robinhood WS responses are verified. Current measurements show about20ms median WS advantage only on unsigned validation failures, not a demonstrated speedup of live trading.
