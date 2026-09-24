@@ -61,7 +61,7 @@ async def test_zero_fill_missing_active_reconciles_without_unknown(tmp_path, clo
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('adverse', ['history', 'position', 'dispatched', 'unknown', 'active'])
+@pytest.mark.parametrize('adverse', ['history', 'position', 'dispatched', 'unknown', 'active', 'contradictory_fill'])
 async def test_zero_fill_provisional_reason_never_erases_uncertainty(tmp_path, adverse):
     clock=AdvancingClock(); client=MissingActiveZeroClient(clock)
     result=await run_random_cycle(cycle_config(tmp_path/'cycle'),client,clock=clock,rng=FixedRng(20,20))
@@ -76,7 +76,8 @@ async def test_zero_fill_provisional_reason_never_erases_uncertainty(tmp_path, a
     if adverse=='unknown':source=replace(source,unknown_reasons=('ambiguous cancellation',))
     if adverse=='active':source=replace(source,order=replace(source.order,status='open'))
     engine=HandoffEngine(client)
-    assert engine._classify(plan,source,receiver,('source active order absent in pre-receiver account snapshot',)) is Outcome.UNKNOWN
+    reasons = ('source fill observed before receiver dispatch', 'source active order absent in pre-receiver account snapshot') if adverse=='contradictory_fill' else ('source active order absent in pre-receiver account snapshot',)
+    assert engine._classify(plan,source,receiver,reasons) is Outcome.UNKNOWN
 
 
 @pytest.mark.asyncio

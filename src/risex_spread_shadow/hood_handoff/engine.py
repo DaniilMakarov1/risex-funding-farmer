@@ -3506,6 +3506,8 @@ class HandoffEngine:
         if source.filled_quantity == 0 and (
             source.trades or source.order.remaining_quantity != 0
             or not source.order.status.lower().startswith("canceled")
+            or any(reason != "source active order absent in pre-receiver account snapshot"
+                   for reason in unknown_reasons)
         ):
             return False
         expected_source = plan.source_position_before - plan.quantity * plan.direction.sign
