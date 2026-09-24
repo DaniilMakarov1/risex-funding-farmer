@@ -1,6 +1,8 @@
-# Paired-close HTTP warmup — verified, activation pending
+# Paired-close HTTP warmup — integrated and active
 
 Sole implementation on codex/close-http-warmup from7eb5066. Seven focused regressions passed, including failures, cancellation, local HTTP pool reuse and server-forced reconnect without replay. Final clean isolated Python3.11 suite at3597f05:5467 passed,3 skipped,2 dependency warnings in154.10s, exit0. The unchanged paper runtime also printed a pending-task teardown diagnostic. Full diff self-review completed. A bounded pair of public Robinhood reads confirmed connection reuse; this is not a live order-speed measurement. No real trading. Evidence: spread-shadow-runs/hood-close-http-warmup-20260924/solo-v1. ACK remains request acceptance only; current ws_confirmed source-order gate remains unchanged.
+
+Accepted main had advanced with an unrelated reporting correction before activation; the initial activation stopped on its base assertion before touching the controller. Both changes were preserved in merge8f63030, with each source byte-identical to its tested predecessor. The final combined clean isolated Python3.11 suite passed5476/3 skipped/2 dependency warnings in148.56s, exit0. Integrated unchanged in local main8f63030 and activated idle controllerPID12517 under locks. Config/state bytes preserved, no child/active operation, instance lock held and operator lock free. No remote push or agent financial action. Live paired-close latency improvement remains NOT_MEASURED. Combined evidence is solo-v1/merged-v1.
 
 # Three real BTC diagnostic runs and reporting correction — 2026-09-24
 
