@@ -330,6 +330,7 @@ class RandomCycleConfig:
     max_source_to_receiver_seconds: float | None = None
     margin_reserve: OpeningMarginReserve | None = None
     confirmed_pilot: bool = False
+    pilot_allow_leverage_update: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "market_id", _int(self.market_id, "market_id"))
@@ -424,9 +425,11 @@ class RandomCycleConfig:
         )
         if self.auth_token_lifetime_seconds > 8 * 60 * 60:
             raise ContractError("auth_token_lifetime_seconds must not exceed the documented 8-hour lifetime")
-        for name in ("operator_execution_opt_in", "operator_plan_reviewed", "defer_incremental_margin_calculation", "confirmed_pilot"):
+        for name in ("operator_execution_opt_in", "operator_plan_reviewed", "defer_incremental_margin_calculation", "confirmed_pilot", "pilot_allow_leverage_update"):
             if not isinstance(getattr(self, name), bool):
                 raise ContractError(f"{name} must be bool")
+        if self.pilot_allow_leverage_update and not self.confirmed_pilot:
+            raise ContractError("pilot leverage-update opt-in requires confirmed pilot mode")
         if self.confirmed_pilot and (
             self.market_id != 1 or self.market_symbol != "BTC"
             or {self.source_account_index, self.receiver_account_index} != {27331, 27337}
@@ -464,6 +467,7 @@ class RandomCycleConfig:
             "source_order_lifetime_seconds": self.source_order_lifetime_seconds,
             "defer_incremental_margin_calculation": self.defer_incremental_margin_calculation,
             **({"confirmed_pilot": True} if self.confirmed_pilot else {}),
+            **({"pilot_allow_leverage_update": True} if self.pilot_allow_leverage_update else {}),
             **({"margin_reserve": {
                 "initial_quote": format(self.margin_reserve.initial_quote, "f"),
                 "dispatch_quote": format(self.margin_reserve.dispatch_quote, "f"),
@@ -2655,7 +2659,10 @@ class RandomCycleEngine:
             "dispatch_reserve_quote": (None if config.margin_reserve is None
                                        else format(config.margin_reserve.dispatch_quote, "f")),
         })
-        if config.confirmed_pilot and any(current[index] != targets[index] for index in current):
+        if config.confirmed_pilot and any(target != 10000 for target in targets.values()):
+            raise PreflightBlocked("confirmed pilot setting target must remain exactly 10000 bps")
+        if (config.confirmed_pilot and not config.pilot_allow_leverage_update
+                and any(current[index] != targets[index] for index in current)):
             raise PreflightBlocked("confirmed pilot forbids leverage or margin-setting changes")
         for index in (source.account_index, receiver.account_index):
             if current[index] == targets[index]:

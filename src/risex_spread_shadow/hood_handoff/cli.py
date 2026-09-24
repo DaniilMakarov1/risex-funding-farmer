@@ -1631,7 +1631,9 @@ def _prompt_random_cycle_launch(config: RandomCycleConfig) -> bool:
             f"source={config.source_account_index} receiver={config.receiver_account_index} "
             f"direction={config.direction.value}; exact 0.00020 BTC, at most 40.00 quote "
             "per account, 20-second proved hold, one paired attempt per phase, "
-            "read-only stream required, no leverage-setting write."
+            "read-only stream required; "
+            + ("at most one exact 1x setting per account after fresh proof."
+               if config.pilot_allow_leverage_update else "no leverage-setting write.")
         )
     else:
         print(
@@ -1741,6 +1743,7 @@ async def _run_random_cycle(args: argparse.Namespace, value: Mapping[str, Any]) 
                                     if config.confirmed_pilot else
                                     "uniform integer seconds in [20,300] after both opening legs are fully reconciled"),
                     "confirmed_pilot": config.confirmed_pilot,
+                    "pilot_allow_leverage_update": config.pilot_allow_leverage_update,
                     "fallback_policy": (
                         "at most one exact reduce-only recovery attempt per account; preserve a proved residual"
                         if config.confirmed_pilot else

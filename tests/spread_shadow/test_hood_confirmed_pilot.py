@@ -10,7 +10,7 @@ import pytest
 
 from risex_spread_shadow.hood_handoff import (
     AccountSnapshot, ContractError, DepthLevel, Direction, FallbackResult, MarketMetadata,
-    OpeningMarginReserve, OrderBookSnapshot, Outcome, PreflightBlocked,
+    MutationReceipt, OpeningMarginReserve, OrderBookSnapshot, Outcome, PreflightBlocked,
     RandomCycleConfig, RandomCycleEngine,
 )
 from risex_spread_shadow.hood_handoff import random_cycle as cycle_module
@@ -117,6 +117,7 @@ class Client:
     {"market_id": 2}, {"source_account_index": 27332},
     {"margin_reserve": OpeningMarginReserve(Decimal("0.09"), Decimal("0.02"))},
     {"confirmed_pilot": 1},
+    {"confirmed_pilot": False, "pilot_allow_leverage_update": True},
 ])
 def test_pilot_config_rejects_unapproved_identity_or_policy(tmp_path, change):
     with pytest.raises(ContractError):
@@ -208,6 +209,66 @@ def test_pilot_refuses_setting_change_before_calling_setter(monkeypatch, tmp_pat
 
     asyncio.run(scenario())
     assert client.submitted == 0
+
+
+def test_separately_opted_pilot_prepares_at_most_one_exact_1x_setting_per_account(monkeypatch, tmp_path):
+    client = Client()
+    fractions = {27331: 5227, 27337: 5712}
+    writes = []
+
+    async def setting(index, market_id, fraction, mode):
+        writes.append((index, market_id, fraction, mode))
+        fractions[index] = fraction
+        return MutationReceipt(True, None, f"synthetic-{index}")
+
+    client.update_leverage_fraction = setting
+    engine = RandomCycleEngine(client, clock=Clock())
+    monkeypatch.setattr(cycle_module, "_observed_leverage_fraction",
+                        lambda snapshot, _label: fractions[snapshot.account_index])
+
+    async def current(_config):
+        return account(27331), account(27337)
+
+    monkeypatch.setattr(engine, "_accounts", current)
+    plan = SimpleNamespace(quantity=Decimal("0.00020"),
+                           opening_source_price=Decimal("100000"),
+                           opening_receiver_bound=Decimal("100000"))
+    journal = SimpleNamespace(append=lambda *_args, **_kwargs: None)
+
+    async def scenario():
+        await engine._configure_leverage(
+            config(tmp_path / "cycle", pilot_allow_leverage_update=True), journal,
+            market(), book(), plan, account(27331), account(27337))
+
+    asyncio.run(scenario())
+    assert writes == [(27331, 1, 10000, 0), (27337, 1, 10000, 0)]
+    assert fractions == {27331: 10000, 27337: 10000}
+
+
+def test_separately_opted_pilot_does_not_replay_ambiguous_setting(monkeypatch, tmp_path):
+    client = Client()
+    writes = []
+
+    async def ambiguous(index, market_id, fraction, mode):
+        writes.append((index, market_id, fraction, mode))
+        raise TimeoutError("synthetic unknown delivery")
+
+    client.update_leverage_fraction = ambiguous
+    engine = RandomCycleEngine(client, clock=Clock())
+    monkeypatch.setattr(cycle_module, "_observed_leverage_fraction", lambda *_: 5227)
+    plan = SimpleNamespace(quantity=Decimal("0.00020"),
+                           opening_source_price=Decimal("100000"),
+                           opening_receiver_bound=Decimal("100000"))
+    journal = SimpleNamespace(append=lambda *_args, **_kwargs: None)
+
+    async def scenario():
+        with pytest.raises(TimeoutError):
+            await engine._configure_leverage(
+                config(tmp_path / "cycle", pilot_allow_leverage_update=True), journal,
+                market(), book(), plan, account(27331), account(27337))
+
+    asyncio.run(scenario())
+    assert writes == [(27331, 1, 10000, 0)]
 
 
 def test_pilot_partial_residual_attempt_is_not_replayed(monkeypatch, tmp_path):
