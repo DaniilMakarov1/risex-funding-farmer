@@ -1,5 +1,9 @@
 # Current status
 
+## WS version activated for owner-run Telegram tests — 2026-09-24
+
+The owner requested activation and will launch real tests through Telegram. Local main integrated 9ffe8fd; src/ and tests/ are byte-identical to tested 7f52812 (5311 passed, 3 skipped, 2 dependency warnings). The documentation merge preserves current main rules. Old controller PID 91534 was stopped only after acquiring the operator lock and proving no child or active saved intent. New PID 63977 runs from the local main checkout with Python 3.11.5 / lighter-sdk 1.1.2 and the same protected config/owner. Config, binding, saved state and offset were unchanged. Verification found the instance lock held, operator lock free, no child/active intent, empty error log and an established Telegram TCP connection. No trading command or financial action was performed by the agent. Source order final recheck remains enabled; transaction submission remains HTTP; the WS read lifecycle begins inside the next owner-run cycle. This activation supersedes older statements that the candidate is not active. Local integration is complete; no remote publication is claimed. Evidence: spread-shadow-runs/hood-ws-activation-20260924/solo-v1.
+
 ## Parent-owned WS read acceleration — implemented and self-verified
 
 Chief confirmed stopped writes; its WIP at 44472ce is preserved untouched. Parent implementation and self-review completed on codex/ws-read-acceleration. Tested source: 7f528128bc8c56cd2f23cd477e16ec672a5594bf. Final clean isolated Python 3.11.5 / lighter-sdk 1.1.2 suite: **5311 passed, 3 skipped, 2 dependency warnings**, 146.64 seconds. Actual imports were verified against the isolated source. First full run had three reserved-route cleanup failures; these were corrected and the failed log remains preserved. The final route/WS/cycle focused group passed 237 tests.

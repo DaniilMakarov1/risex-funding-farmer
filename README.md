@@ -1,3 +1,5 @@
+> Runtime update, 2026-09-24: the WS read version is activated in the local Telegram controller. The next owner `/run` starts its stream before order placement; final active-source and public owner/queue checks remain REST, transaction submission remains HTTP. Older candidate-only descriptions below are historical; see the latest STATUS entry.
+
 # RISEx Spread Shadow
 
 The WS read acceleration candidate is on `codex/ws-read-acceleration`; it is not active in the running controller. Ordinary random cycles in this candidate start a bounded read stream automatically. Stream depth serves price calculations; exact complete order events serve discovery and terminal observation. REST remains the fallback and the source for final active-order checks, public owner/queue proof, account risk and final trade/position/fee reconciliation. Human-facing Telegram delivery stays outside the order transport. A cycle saves `stream-events.jsonl` with causal timing, not raw private frames. A faster cached read is not a measured faster trade. See STATUS and NEXT_TASK for tested versions and evidence.
