@@ -77,7 +77,7 @@ async def test_visibility_race_returns_exact_winner_and_drains_other_task(winner
         try:
             if winner=='ws_error':raise RuntimeError('stream disconnected')
             if winner in {'ws','rest_error'}:return value
-            if winner=='ws_invalid':return replace(value,owner_account_index=999)
+            if winner=='ws_invalid':return replace(value,account_index=999)
             await release.wait();return value
         finally:stopped.append('ws')
     engine=HandoffEngine(SimpleNamespace(wait_order_observation=wait))
@@ -205,7 +205,7 @@ async def test_stream_terminal_wait_ignores_active_and_other_identity():
 
 @pytest.mark.asyncio
 async def test_completed_rest_identity_conflict_is_not_hidden_by_ws():
-    value=snapshot();wrong=replace(value,owner_account_index=999)
+    value=snapshot();wrong=replace(value,account_index=999)
     async def lookup(*args,**kwargs):return wrong
     async def wait(*args,**kwargs):return value
     engine=HandoffEngine(SimpleNamespace(wait_order_observation=wait));engine._lookup_order=lookup
