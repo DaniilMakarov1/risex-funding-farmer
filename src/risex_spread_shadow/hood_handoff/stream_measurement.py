@@ -6,6 +6,7 @@ import asyncio
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 import json
+import re
 import os
 from pathlib import Path
 import time
@@ -165,7 +166,40 @@ class StreamProjection:
         for account in self.identity.accounts:
             if channel == f"account_all_orders:{account}":
                 return self._orders(frame, kind, account, received_at)
+            if channel == f"account_tx:{account}":
+                return self._transactions(frame, kind, account, received_at)
         return []
+
+    def _transactions(self, frame: dict, kind: str, account: int, at: float) -> list[dict[str, object]]:
+        """Allowlisted diagnostics only; transaction success is not resting-order proof."""
+        if kind == "subscribed/account_tx":
+            return [{"kind": "transaction_subscription", "epoch": self.epoch,
+                     "received_at": at, "account_index": account}]
+        if kind != "update/account_tx" or not isinstance(frame.get("txs"), list):
+            return []
+        output = []
+        # Keep projection work bounded independently of the raw frame budget.
+        if len(frame["txs"]) > 512:
+            self.malformed += 1
+            return []
+        for tx in frame["txs"]:
+            if (not isinstance(tx, dict) or type(tx.get("account_index")) is not int
+                    or tx["account_index"] != account
+                    or not isinstance(tx.get("hash"), str)
+                    or re.fullmatch(r"(?:0x)?[0-9a-fA-F]{8,128}", tx["hash"]) is None
+                    or not _integer(tx.get("status")) or not _integer(tx.get("nonce"))
+                    or tx["status"] > 2**63 - 1 or tx["nonce"] > 2**63 - 1):
+                self.malformed += 1
+                continue
+            row = {"kind": "transaction", "epoch": self.epoch, "received_at": at,
+                   "account_index": account, "tx_hash": tx["hash"].lower(),
+                   "transaction_status": tx["status"], "nonce": tx["nonce"]}
+            for name in ("queued_at", "executed_at", "transaction_time", "sequence_index", "block_height"):
+                value = tx.get(name)
+                if type(value) is int and 0 <= value <= 2**63 - 1:
+                    row[f"venue_{name}_raw"] = value
+            output.append(row)
+        return output
 
     def _book(self, frame: dict, kind: str, at: float) -> list[dict[str, object]]:
         if kind not in {"subscribed/order_book", "update/order_book"}:
@@ -258,8 +292,8 @@ class StreamProjection:
                 "remaining_base_amount": remaining,
                 "terminal": status in TERMINAL, "stream_complete": False,
             }
-            for name in ("timestamp", "created_at", "updated_at", "transaction_time"):
-                if _integer(item.get(name)):
+            for name in ("timestamp", "created_at", "updated_at", "transaction_time", "block_height"):
+                if _integer(item.get(name)) and item[name] <= 2**63 - 1:
                     projection[f"venue_{name}_raw"] = item[name]
             output.append(projection)
         if (kind == "subscribed/account_all_orders"

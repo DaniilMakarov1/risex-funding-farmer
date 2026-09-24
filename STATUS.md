@@ -1,3 +1,7 @@
+# Race latency verification — WIP_NOT_ACCEPTED (2026-09-24)
+
+Parent works alone on codex/ws-race-measurement-20260924 from main a080bbe. Bounded safe Robinhood probes observed exact-ID unsigned WS validation rejection21602, 12 warmed HTTP/WS comparisons (medians298.894/279.383ms; ping278.455ms), and subscription acknowledgements for both account_tx channels with zero transaction events. These do not establish accepted mutation timing or earlier resting-order proof. Preserve HTTP and current admission. Candidate fixes the inactive sender rejection parser and retains raw venue order/transaction diagnostics in the bounded background journal. Focused145 tests passed after correcting one oversized fixture to exercise the intended transaction-count bound; initial runtime Python lacked pytest. Full clean isolated Python3.11 suite and activation pending. Evidence: spread-shadow-runs/hood-ws-race-20260924/solo-v1. No agent real order, cancel, tier change or relocation.
+
 # Owner WS runs086–089 — verified and active
 
 All four saved cycles completed with PARTIAL pairing and CONFIRMED_FLAT inventory. Each source limit was canceled with zero execution; no receiver MARKET, HOLD or paired close occurred. Every refusal was the old combined L2 price/quantity mismatch. The old refusal omitted book values, so public publication lag versus actual competition cannot be resolved historically. Do not relabel the historical stops as proved false positives.

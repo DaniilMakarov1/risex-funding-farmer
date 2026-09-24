@@ -171,6 +171,7 @@ def test_session_keeps_one_read_only_socket_until_stop_and_invalidates(monkeypat
     asyncio.run(scenario())
     assert [value["channel"] for value in sent] == [
         "order_book/1", "account_all_orders/27331", "account_all_orders/27337",
+        "account_tx/27331", "account_tx/27337",
     ]
     assert all(value["type"] == "subscribe" for value in sent)
     assert "auth" not in sent[0]

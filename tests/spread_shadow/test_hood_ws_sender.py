@@ -142,3 +142,39 @@ async def test_ws_sender_serializes_distinct_transactions_and_explicit_reject():
     await socket.incoming.put(json.dumps({"data": {"id": second_id, "code": 400}}))
     assert (await second)["code"] == 400
     await sender.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error,extra,decidable", [
+    ({"code": 21602, "message": "PRIVATE_NEVER_RETURN"}, {}, True),
+    ({"code": True}, {}, False),
+    ({"code": "21602"}, {}, False),
+    ({"code": 500}, {}, False),
+    ({"code": 200}, {}, False),
+    ({"code": 99999}, {}, False),
+    ({"code": 21602}, {"code": 200}, False),
+    ({"code": 21602}, {"tx_hash": "0x" + "a" * 64}, False),
+])
+async def test_observed_robinhood_rejection_is_correlated_and_never_replayed(error, extra, decidable):
+    socket = Socket()
+    sender = WarmTxSender(connect_factory=lambda: asyncio.sleep(0, result=socket))
+    await sender.start()
+    tx_hash = "0x" + "a" * 64
+    pending = asyncio.create_task(sender.send(14, "{}", tx_hash, deadline=time.monotonic() + 1))
+    await wait_sent(socket, 1)
+    request_id = socket.sent[0]["data"]["id"]
+    await socket.incoming.put(json.dumps({"id": "wrong", "error": error, **extra}))
+    await asyncio.sleep(0)
+    assert not pending.done()
+    await socket.incoming.put(json.dumps({"id": request_id, "error": error, **extra}))
+    if decidable:
+        result = await pending
+        assert result["code"] == 21602
+        assert "PRIVATE_NEVER_RETURN" not in repr(result)
+    else:
+        with pytest.raises(RuntimeError, match="undecidable"):
+            await pending
+    with pytest.raises(RuntimeError, match="already attempted"):
+        await sender.send(14, "{}", tx_hash, deadline=time.monotonic() + 1)
+    assert len(socket.sent) == 1
+    await sender.close()

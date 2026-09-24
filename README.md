@@ -1,3 +1,7 @@
+## Race timing evidence
+
+Owner-triggered cycles also collect passive `account_tx` events into the existing protected `stream-events.jsonl`, alongside order/local milestones. Match transaction hashes to mutation receipts for analysis; account transaction events can concern other markets and do not prove a selected-market resting order. Raw venue times retain their original units and must not be compared with local wall time without verifying units/clock offset. Missing events remain unknown. No extra command is required; transaction writes still use warmed HTTP until successful Robinhood WS responses are verified. Current measurements show about20ms median WS advantage only on unsigned validation failures, not a demonstrated speedup of live trading.
+
 # Current fast admission mode
 
 Set `"receiver_admission": "ws_confirmed"` in the existing random-cycle configuration to prepare before LIMIT and admit MARKET from fresh exact private WS state plus a local L2 veto. The same mode covers paired opening and closing. Telegram and terminal name it explicitly. Orders still use the existing transaction transport; preflight, cancellation recovery and final accounts/trades/fees may use REST. Omit the setting or use `"strict"` to retain repeated REST admission checks. A controller config change requires an idle restart and a matching persisted config binding; never delete history to change modes.

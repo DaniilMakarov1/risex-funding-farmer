@@ -10,13 +10,14 @@ import asyncio
 import json
 import math
 import os
+import re
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Mapping
 
 
 _EVENT_KINDS = frozenset({"order", "order_conflict", "order_duplicate", "book_gap", "book_unanchored",
-                          "private_orders_snapshot"})
+                          "private_orders_snapshot", "transaction", "transaction_subscription"})
 _MILESTONES = frozenset({
     "prepare_done", "send_entered", "ack_parsed", "exact_rest_observed", "exact_ws_observed",
     "admission_decision", "receiver_terminal", "cancel_send_entered",
@@ -35,11 +36,19 @@ def _safe_projection(item: Mapping[str, object], context: Mapping[str, object] |
     row: dict[str, object] = {"kind": kind, "connection_epoch": epoch,
                               "receive_monotonic_seconds": float(received_at),
                               "clock_basis": "time.monotonic/process-local", "stream_complete": False}
-    if kind in {"order", "order_conflict", "order_duplicate", "private_orders_snapshot"}:
+    if kind in {"order", "order_conflict", "order_duplicate", "private_orders_snapshot", "transaction", "transaction_subscription"}:
         account = item.get("account_index")
         if type(account) is not int or account < 0:
             return None
         row["account_index"] = account
+    if kind == "transaction":
+        tx_hash, status, nonce = item.get("tx_hash"), item.get("transaction_status"), item.get("nonce")
+        if (not isinstance(tx_hash, str) or re.fullmatch(r"(?:0x)?[0-9a-fA-F]{8,128}", tx_hash) is None
+                or type(status) is not int or not 0 <= status <= 2**63 - 1
+                or type(nonce) is not int or not 0 <= nonce <= 2**63 - 1):
+            return None
+        row.update(tx_hash=tx_hash.lower(), transaction_status=status, nonce=nonce,
+                   execution_proof=False, account_scope=True)
     if kind in {"order", "order_conflict", "order_duplicate"}:
         client = item.get("client_order_index")
         if type(client) is not int or client < 0:
@@ -63,6 +72,15 @@ def _safe_projection(item: Mapping[str, object], context: Mapping[str, object] |
         row.update(market_id=market, order_id=order_id, status=status,
                    filled_base_amount=filled, remaining_base_amount=remaining,
                    terminal=item.get("terminal") is True)
+    if kind in {"order", "transaction"}:
+        fields = (("timestamp", "created_at", "updated_at", "transaction_time", "block_height")
+                  if kind == "order" else
+                  ("queued_at", "executed_at", "transaction_time", "sequence_index", "block_height"))
+        for name in fields:
+            value = item.get(f"venue_{name}_raw")
+            if type(value) is int and 0 <= value <= 2**63 - 1:
+                row[f"venue_{name}_raw"] = value
+        row["venue_clock_basis"] = "raw/units-and-clock-offset-unverified"
     if context is not None:
         # The engine owns these fields.  Do not copy arbitrary context keys.
         for name in ("run_id", "phase", "role"):
@@ -147,7 +165,8 @@ class StreamEvidenceJournal:
                 or "market_id" in row and row["market_id"] != self.market_id):
             self.dropped += 1
             return
-        row.setdefault("market_id", self.market_id)
+        if kind not in {"transaction", "transaction_subscription"}:
+            row.setdefault("market_id", self.market_id)
         self._offer_row(row)
 
     def offer_milestone(self, milestone: str, *, account: int, client: int,

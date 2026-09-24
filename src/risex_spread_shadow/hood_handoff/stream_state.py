@@ -278,9 +278,11 @@ class ReadStreamSession:
                 await self.state.connected_now()
                 channels = [f"order_book/{self.state.identity.market_id}"]
                 channels.extend(f"account_all_orders/{account}" for account in self.state.identity.accounts)
+                # Passive timing evidence; never a readiness/admission gate.
+                channels.extend(f"account_tx/{account}" for account in self.state.identity.accounts)
                 for channel in channels:
                     value = {"type": "subscribe", "channel": channel}
-                    if channel.startswith("account_all_orders/"):
+                    if channel.startswith(("account_all_orders/", "account_tx/")):
                         value["auth"] = tokens[int(channel.rsplit("/", 1)[1])]
                     await socket.send(json.dumps(value, separators=(",", ":")))
                     value.clear()

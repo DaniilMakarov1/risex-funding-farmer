@@ -70,6 +70,19 @@ class WarmTxSender:
                 response = data if isinstance(data, dict) else frame
                 if response.get("id") != self._pending_id:
                     continue
+                # Robinhood's observed unsigned rejection is top-level
+                # {id, error: {code: 21602, message: ...}}. Only this verified
+                # validation code is decidable; unknown/server errors remain
+                # ambiguous and never authorize replay. Never copy messages.
+                if "error" in response:
+                    error = response["error"]
+                    if (isinstance(error, dict) and type(error.get("code")) is int
+                            and error["code"] == 21602 and "code" not in response
+                            and "tx_hash" not in response):
+                        pending.set_result({"code": 21602, "tx_hash": self._pending_hash})
+                    else:
+                        pending.set_exception(RuntimeError("WS transaction response is undecidable"))
+                    continue
                 code = response.get("code")
                 if type(code) is not int or code < 100 or code >= 500:
                     pending.set_exception(RuntimeError("WS transaction response is undecidable"))
