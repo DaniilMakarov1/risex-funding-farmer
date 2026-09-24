@@ -1226,10 +1226,13 @@ class HandoffEngine:
 
         if ws_confirmed and not unknown_reasons and source_order is not None:
             local_started = time.perf_counter()
+            guard_request_started_at = self.clock.now()
+            ws_evidence: dict[str, Any] = {}
             try:
                 source_order, local_book = self.client.ws_admission_view(ws_anchor, plan.source, source_order_id)
                 if source_order is None:
                     raise PreflightBlocked("exact source event is missing/stale")
+                ws_evidence["source_order"] = self._order_observation_payload(source_order)
                 if not self._source_exact_resting(source_order, plan.source, source_order_id):
                     raise PreflightBlocked("exact source is no longer fully resting")
                 if source_order.observed_at < source_dispatch_intent_at:
@@ -1243,10 +1246,14 @@ class HandoffEngine:
                 ):
                     raise PreflightBlocked("source-to-receiver latency budget expired")
                 public_book = _coerce_public_book(local_book, config, now)
-                levels = public_book["asks"] if plan.source.side == "SELL" else public_book["bids"]
-                if (not levels or levels[0]["price"] != plan.source.price
-                        or levels[0]["quantity"] != plan.source.quantity):
-                    raise PreflightBlocked("L2 best level differs from source price/quantity")
+                ws_evidence.update(self._ws_l2_evidence(public_book, plan.source, now))
+                ws_reason = {
+                    "BETTER_PRICE": "L2 shows better-priced volume",
+                    "SAME_PRICE_EXTRA_VOLUME": "L2 shows extra volume at source price",
+                    "SOURCE_LEVEL_SMALLER": "L2 source level is smaller than exact private remainder",
+                }.get(ws_evidence["ws_l2_status"])
+                if ws_reason is not None:
+                    raise PreflightBlocked(ws_reason)
                 # The book is anonymous. This deliberately does not claim FIFO proof.
                 priority_guard = {"status": "WS_CONFIRMED", "priority_status": "UNPROVED",
                                   "receiver_admission": "ws_confirmed", "priority_proof_admitted": False,
@@ -1254,7 +1261,7 @@ class HandoffEngine:
                                   "source_order": self._order_observation_payload(source_order),
                                   "source_account": self._account_observation_payload(source),
                                   "receiver_account": self._account_observation_payload(receiver),
-                                  "public_book": public_book,
+                                  **ws_evidence,
                                   "account_evidence_basis": "pre-LIMIT snapshots"}
                 receiver_mutation_observations = (source, receiver, source_order, public_book, plan.metadata_observed_at)
             except Exception as exc:
@@ -1262,7 +1269,8 @@ class HandoffEngine:
                 unknown_reasons.append(f"WS_ADMISSION_STOP: {reason}")
                 priority_guard = {"status": "WS_REFUSED", "priority_status": "UNPROVED",
                                   "receiver_admission": "ws_confirmed", "priority_proof_admitted": False,
-                                  "priority_reason": unknown_reasons[-1]}
+                                  "priority_reason": unknown_reasons[-1], **ws_evidence}
+            latency["source_to_receiver_decision_seconds"] = max(0.0, self.clock.now() - source_dispatch_intent_at)
             latency["pre_receiver_checks_seconds"] = time.perf_counter() - local_started
             latency["receiver_admission_seconds"] = latency["pre_receiver_checks_seconds"]
             latency["receiver_admission_at"] = self.clock.now()
@@ -2662,6 +2670,30 @@ class HandoffEngine:
         return payload
 
     @staticmethod
+    def _ws_l2_evidence(book: Mapping[str, Any], source: OrderPlan, now: float) -> dict[str, Any]:
+        """Public depth can veto, but cannot require private/public publication order."""
+        best = book["asks" if source.side == "SELL" else "bids"][0]
+        price, quantity = best["price"], best["quantity"]
+        better = price < source.price if source.side == "SELL" else price > source.price
+        if better:
+            status = "BETTER_PRICE"
+        elif price != source.price:
+            status = "PUBLICATION_UNCONFIRMED"
+        elif quantity > source.quantity:
+            status = "SAME_PRICE_EXTRA_VOLUME"
+        elif quantity < source.quantity:
+            status = "SOURCE_LEVEL_SMALLER"
+        else:
+            status = "SOURCE_LEVEL_VISIBLE"
+        return {
+            "ws_l2_status": status,
+            "source_price": str(source.price), "source_quantity": str(source.quantity),
+            "best_price": str(price), "best_quantity": str(quantity),
+            "book_observed_at": book["observed_at"],
+            "book_age_seconds": max(0.0, now - book["observed_at"]),
+        }
+
+    @staticmethod
     def _retryable_pair_after_guard(
         plan: HandoffPlan,
         source: LegReconciliation,
@@ -2669,13 +2701,27 @@ class HandoffEngine:
         unknown_reasons: Sequence[str],
         priority_guard: Mapping[str, Any] | None,
     ) -> bool:
-        if priority_guard is None or priority_guard.get("status") not in {"LOST", "UNKNOWN"}:
+        if priority_guard is None:
+            return False
+        ws_liquidity_veto = (
+            priority_guard.get("status") == "WS_REFUSED"
+            and priority_guard.get("receiver_admission") == "ws_confirmed"
+            and priority_guard.get("ws_l2_status") in {"BETTER_PRICE", "SAME_PRICE_EXTRA_VOLUME"}
+        )
+        if priority_guard.get("status") not in {"LOST", "UNKNOWN"} and not ws_liquidity_veto:
             return False
         terminal_source = HandoffEngine._is_exact_canceled_post_only_zero_fill(
             source.order,
             plan.source,
         )
-        if terminal_source:
+        if ws_liquidity_veto:
+            if source.order is None or not source.order.status.lower().startswith("canceled"):
+                return False
+            expected_reason = priority_guard.get("priority_reason")
+            if (not isinstance(expected_reason, str) or not expected_reason.startswith("WS_ADMISSION_STOP: ")
+                    or not unknown_reasons or any(reason != expected_reason for reason in unknown_reasons)):
+                return False
+        elif terminal_source:
             # The terminal source form is checked structurally below.  Its
             # only permitted top-level barrier is the exact terminal reason;
             # arbitrary scalar strings cannot opt into retry.

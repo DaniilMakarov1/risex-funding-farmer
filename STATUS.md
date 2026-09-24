@@ -1,3 +1,11 @@
+# Owner WS runs086–089 — corrections under verification
+
+All four saved cycles completed with PARTIAL pairing and CONFIRMED_FLAT inventory. Each source limit was canceled with zero execution; no receiver MARKET, HOLD or paired close occurred. Every refusal was the old combined L2 price/quantity mismatch. The old refusal omitted book values, so public publication lag versus actual competition cannot be resolved historically. Do not relabel the historical stops as proved false positives.
+
+Real local opening intervals: source ACK median310.086ms (306.080–441.220); ACK→exact observation median204.328ms; source intent→guard decision median520.305ms (518.073–529.165), versus931.133ms across082–085 opening decisions (~44.12% lower). Different samples/conditions, not controlled causal proof; new source→MARKET and paired-close timings are NOT_MEASURED because those sends never occurred. Guard→cancel intent median298.575ms, cancel acknowledgement307.237ms. Sources and hashes: spread-shadow-runs/hood-ws-postruns-20260924/solo-v1/final-measurements.
+
+Candidate codex/ws-postruns-086-089 from main76e9695: treat L2 as a negative veto instead of requiring a second positive source publication, preserve fresh exact private source admission, journal bounded diagnostic source/best-level values on both outcomes, separate decision from send timing, restore existing bounded retries only after proved zero-fill canceled liquidity vetoes, and explain stops in Telegram/terminal. Four private-before-public counterexamples reproduce on the accepted base; focused391 checks pass. Full clean suite and activation pending. No agent real financial action.
+
 # WS-confirmed admission — verified and active
 
 Candidate branch codex/ws-confirmed-admission from accepted main c52ff46. An explicit mode removes repeated REST account/book/final-source admission in paired opening and closing; exact fresh private WS plus local L2 veto replaces that admission. Strict remains the omitted default. Full account and owner/FIFO equivalence is deliberately not claimed. Transactions, authoritative final reconciliation, recovery and ambiguity/no-replay rules remain unchanged.

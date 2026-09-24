@@ -213,6 +213,22 @@ def lifecycle_lines(state):
     return lines
 
 
+def ws_admission_notice(reason):
+    reason = str(reason or '')
+    if 'WS_ADMISSION_STOP:' not in reason:
+        return None
+    descriptions = {
+        'L2 shows better-priced volume': 'в стакане появилась более выгодная цена',
+        'L2 shows extra volume at source price': 'по нашей цене виден дополнительный объём',
+        'L2 source level is smaller than exact private remainder': 'объём публичного уровня противоречит состоянию нашей заявки',
+        'L2 best level differs from source price/quantity': 'публичный стакан не совпал с нашей заявкой; детали старого отказа не сохранены',
+    }
+    for marker, text in descriptions.items():
+        if marker in reason:
+            return 'Встречный MARKET остановлен: ' + text + '.'
+    return 'Встречный MARKET остановлен: актуальное согласованное WS-состояние не подтверждено.'
+
+
 def execution_lines(result, *, phase, attempt=1):
     """Describe exact terminal legs; never infer own matching from positions."""
     from .contracts import LegReconciliation, OrderPlan, OrderSnapshot, TradeReceipt
@@ -287,9 +303,19 @@ def execution_lines(result, *, phase, attempt=1):
             if unproved:
                 pieces.append(f'контрагент не доказан — {amount(unproved)}')
             lines.append(prefix + '; '.join(pieces) + '.')
+    guard = mapping(result.get('priority_guard'))
+    notice = ws_admission_notice(guard.get('priority_reason'))
+    if notice:
+        lines.append(notice)
+        if guard.get('best_price') is not None:
+            lines.append(f'Наша цена/объём: {amount(guard.get("source_price"))}/{amount(guard.get("source_quantity"))}; '
+                         f'лучший уровень: {amount(guard.get("best_price"))}/{amount(guard.get("best_quantity"))}.')
     latency = mapping(result.get('latency'))
     gap = number(latency.get('source_to_receiver_intent_seconds'))
     response = number(latency.get('receiver_submit_ack_seconds'))
+    decision = number(latency.get('source_to_receiver_decision_seconds'))
+    if gap is None and decision is not None and decision >= 0:
+        lines.append(f'LIMIT → решение: {decision:.3f} с; MARKET не отправлен.')
     if gap is not None and gap >= 0:
         lines.append(f'LIMIT → MARKET: {gap:.3f} с' + (f'; ответ на MARKET: {response:.3f} с.' if response is not None and response >= 0 else '.'))
     return lines
@@ -377,6 +403,9 @@ def result_lines(report, *, detailed=False):
     economics, binding = mapping(report.get('economics')), mapping(report.get('binding'))
     fees, pnl = mapping(economics.get('fees')), mapping(economics.get('closed_execution_pnl'))
     lines = []
+    notice = ws_admission_notice(mapping(report.get('cycle')).get('reason'))
+    if notice:
+        lines.append(notice)
     refusal = opening_margin_refusal(mapping(report.get('cycle')).get('preflight_reason'))
     if refusal:
         lines.append(refusal)
