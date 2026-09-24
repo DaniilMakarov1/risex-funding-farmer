@@ -639,3 +639,59 @@ async def test_recovery_disk_failure_prevents_new_launch(tmp_path,monkeypatch):
     monkeypatch.setattr(c.store,'save',fail_after_offset)
     await c.handle(update());await c.task
     assert not calls
+
+
+@pytest.mark.parametrize('stream_text', [
+    '{"kind":"session_start","schema":"hood-stream-evidence-v1"}\n',
+    '{"kind":"session_end","complete":true}\n',
+    '{"kind":"order","status":"filled"}\n',
+    '{"kind":"order"',
+    '',
+])
+def test_stream_diagnostics_do_not_break_or_resolve_prior_mutation_intents(tmp_path, stream_text):
+    slot=intent_journal(tmp_path,unknown=True)
+    stream=slot/'stream-events.jsonl';stream.write_text(stream_text)
+    before=(slot/'opening.jsonl').read_bytes()
+    intents,files,_=recovery.prior_intents(tmp_path,cycle_config(tmp_path/'unused'))
+    assert len(intents)==1 and not intents[0]['resolved']
+    assert next(f['sha256'] for f in files if f['path']==str(stream))==hashlib.sha256(stream_text.encode()).hexdigest()
+    assert (slot/'opening.jsonl').read_bytes()==before
+
+
+@pytest.mark.parametrize('name', ['opening.jsonl','unknown.jsonl'])
+def test_only_reserved_stream_filename_is_exempt_from_strict_history_schema(tmp_path,name):
+    slot=tmp_path/'cycle-001';slot.mkdir()
+    (slot/name).write_text('{"kind":"session_start"}\n')
+    with pytest.raises(PreflightBlocked,match='identity/time'):
+        recovery.prior_intents(tmp_path,cycle_config(tmp_path/'unused'))
+
+
+def test_stream_diagnostic_symlink_still_blocks_recovery(tmp_path):
+    slot=intent_journal(tmp_path)
+    (slot/'stream-events.jsonl').symlink_to(slot/'opening.jsonl')
+    with pytest.raises(PreflightBlocked,match='unsafe historical journal'):
+        recovery.prior_intents(tmp_path,cycle_config(tmp_path/'unused'))
+
+
+@pytest.mark.asyncio
+async def test_telegram_close_after_ws_cycle_runs_actual_synthetic_recovery_and_close(tmp_path):
+    clock=AdvancingClock();client=RecoveryClient(clock,'.2','0')
+    old=intent_journal(tmp_path,complete=True)
+    (old/'stream-events.jsonl').write_text('{"kind":"session_start","schema":"hood-stream-evidence-v1"}\n')
+    async def launch():raise AssertionError('no new cycle')
+    cfg=cycle_config(tmp_path/'unused')
+    async def check(*,require_flat):
+        assert require_flat is False
+        return (await recovery.inspect_current(cfg,client,tmp_path,require_flat=False,clock=clock))[2]
+    results=[]
+    async def close():
+        slot=recovery.allocate_close_slot(tmp_path)
+        results.append(await recovery.close_positions(cycle_config(slot),client,tmp_path,slot,clock=clock))
+    controller=setup(tmp_path,launch);controller.recovery=check;controller.close=close
+    controller.store.data['active']={'before':[],'update_id':0,'action':'run'};controller.store.save()
+    await controller.handle(update(1,'/close'));await controller.task
+    assert results[0]['status']=='CONFIRMED_FLAT'
+    assert client.source_position==client.receiver_position==0
+    assert len(client.submissions)==1 and client.submissions[0].reduce_only
+    await controller.handle(update(1,'/close'))
+    assert len(results)==1  # Consumed command is never replayed.

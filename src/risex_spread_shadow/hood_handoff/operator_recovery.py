@@ -184,6 +184,11 @@ def prior_intents(operator, config):
                 for chunk in iter(lambda: stream.read(65536), b''):
                     digest.update(chunk)
             files.append({'path': str(path), 'sha256': digest.hexdigest()})
+            # WS observations are diagnostic projections, not DurableJournal
+            # mutation intents. Retain their hash, but never use them as proof
+            # of execution or require a trading-journal envelope from them.
+            if path.name == 'stream-events.jsonl':
+                continue
             local = {}
             local_leverage = {}
             for row in journal_rows(path):

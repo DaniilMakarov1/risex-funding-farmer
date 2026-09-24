@@ -1,3 +1,7 @@
+## Recovery journal classification
+
+Historical recovery parses every authoritative trading JSONL with the strict DurableJournal schema. The reserved `stream-events.jsonl` file contains diagnostic WS projections: retain its SHA256 in input provenance but do not parse it as mutation intents or treat its observations as terminal-order proof. Its absence, truncation or missing session end cannot invalidate otherwise complete trading journals or resolve an ambiguous transaction. Symlink checks still apply; all other journal filenames keep strict validation.
+
 ## Cycle-075 correction candidate
 
 A missing active source in an early account snapshot is distinct from a conflicting active order. It still prevents receiver dispatch. Only a fully reconciled, terminal source-only execution with complete history, agreeing exact positions, no dispatched receiver and no mutation/identity uncertainty may classify this admission-only discrepancy as PARTIAL and enter existing reduce-only recovery. UNKNOWN mutation/history/identity barriers remain unchanged, including in paired closing.
