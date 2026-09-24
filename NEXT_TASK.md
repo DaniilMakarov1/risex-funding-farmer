@@ -4,6 +4,8 @@ Work alone from local main7eb5066 on codex/close-http-warmup. Owner explicitly r
 
 Verification complete at3597f05:7 focused regressions; final clean isolated Python3.11 suite5467 passed/3 skipped/2 dependency warnings, with an unchanged paper-runtime pending-task diagnostic. Self-review completed. Integrate identical tested source and activate under idle locks with byte-identical config/state; no agent real trading. Public read reuse is proved, live order improvement remains unmeasured.
 
+Completed: accepted reporting changes preserved in merge8f63030; combined clean full suite5476 passed/3 skipped/2 warnings. Local main integrated and idle controllerPID12517 activated with identical tested source and unchanged config/state. No ACK-only admission or agent trading. Future owner-run paired closes can measure actual reuse and dispatch latency; current read-only reuse observations do not establish matching improvement.
+
 # Three-run saved-result correction — 2026-09-24
 
 The owner requested three agent-run real-order diagnostics and weak-point analysis; the completed isolated campaign is recorded in `spread-shadow-runs/hood-three-live-diagnostics-20260924/solo-v1/` and source branch `codex/three-live-diagnostics-20260924`. All three one-use claims are consumed, no fourth opening is authorized, and separate `close-006` plus a fresh account observation proved both configured BTC positions zero with no active orders. The campaign's trading code was used from a tested isolated checkout and is not part of local main.
