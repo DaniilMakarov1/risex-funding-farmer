@@ -1,3 +1,5 @@
+Cycle-075 correction: an early missing active-order snapshot is distinct from a conflicting order. A subsequently proved source-only residual enters existing reduce-only recovery. WS may win the first exact observation while REST is pending; cancellation nonce preparation starts at source ACK. Final active-source/public priority checks remain. Owner Telegram tests have no one-run quota. A historical known residual is not reset by deployment; use `/accounts` to inspect it and `/close` to explicitly request recovery before a new `/run`.
+
 > Runtime update, 2026-09-24: the WS read version is activated in the local Telegram controller. The next owner `/run` starts its stream before order placement; final active-source and public owner/queue checks remain REST, transaction submission remains HTTP. Older candidate-only descriptions below are historical; see the latest STATUS entry.
 
 # RISEx Spread Shadow

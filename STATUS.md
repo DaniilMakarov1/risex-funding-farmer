@@ -1,6 +1,10 @@
-# Cycle-075 corrections — verification in progress
+# Cycle-075 corrections — verified for activation
 
-Parent implements on codex/ws-cycle-recovery from local main 545a234. Added source-only residual recovery regression for the empty early account snapshot/external-fill race in both directions and opening/closing, WS/REST observation races, and earlier cancellation nonce reservation with expiry/ownership/replay tests. Final source check retained; no live order or runtime change yet. Full isolated suite pending. Earlier live activation and audit remain historical facts.
+Tested source 45ef19cdca388467eb021cb80fb6b9664f97bd66, branch codex/ws-cycle-recovery, based on local main 545a234. Final clean isolated Python 3.11.5 / lighter-sdk 1.1.2 full suite: **5334 passed, 3 skipped, 2 dependency warnings**, 147.55 seconds. Actual imports and clean source were verified. Twenty-three new regressions cover the observed source-only fill with empty early account snapshot during opening/closing and both directions, adverse reconciliation and nonce failures, WS/REST ordering, exact identities and read-task cleanup. The prior full run also passed; the final rerun includes the corrected diagnostic field name. Self-review only.
+
+Missing source evidence still blocks the receiver but no longer masquerades as a conflicting active order. Complete exact source-only reconciliation allows existing reduce-only recovery; ambiguous mutation/identity/history still blocks it. Initial/terminal visibility now races WS against REST; final active-source REST and public owner/queue proof stay in place. Cancel nonce acquisition starts after accepted source ACK, overlaps visibility, and uses the existing one-use registry. Cancellation readiness/wait timings are now honest. No owner test-count quota is introduced; no saved active intent or historical position is reset.
+
+Controlled offline timing with injected REST 297ms and WS 200ms returned after approximately 202ms instead of 299ms (three samples); this demonstrates the waiting mechanism, not a venue latency or fill-rate result. No real order, cancellation or account-setting write was made. Evidence: spread-shadow-runs/hood-cycle075-fix-20260924/solo-v1, including final-full-suite.log, final-source-provenance.json, review.md and controlled-read-race.json. Runtime activation is recorded separately below when performed.
 
 # Current status
 
