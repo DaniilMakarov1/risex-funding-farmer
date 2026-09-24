@@ -1,3 +1,9 @@
+# Request timeout configuration — owner-authorized 2026-09-24
+
+Change the active operator configuration request_timeout_seconds from 5 to 15. Configuration-only work from main dd5c85d on codex/request-timeout-15; preserve other deadlines, trading logic, saved operation history and original journals. Validate with the actual local configuration parser, update the derived Telegram configuration binding under idle operator/instance locks, and preserve the stopped/running controller state. No real orders or new execution campaign.
+
+DONE: actual local parser accepts 15s; all other operator configuration fields are identical. Updated only the derived Telegram binding under both idle locks; offset/history/active state preserved. Controller was stopped and remains stopped. No source change or live orders. Configuration verification evidence: spread-shadow-runs/hood-request-timeout-15-20260924/solo-v1/verification.json.
+
 # Attempt limits — owner-authorized 2026-09-24
 
 Work alone from main5d7f0d9 on codex/attempt-limits-6-15. Increase the existing shared preparation/safe paired retry budget to6 for opening and15 for paired closing. Preserve the one-attempt confirmed pilot, mutation ambiguity barriers, zero-fill retry eligibility, fixed selection, and separate residual recovery policy. Update human notices and current documentation, test exhaustion/late success/unique identities and perform a clean isolated Python3.11 full suite. Integrate verified changes and activate idle Telegram with unchanged config/state. No agent real trading. Evidence:spread-shadow-runs/hood-attempt-limits-20260924/solo-v1.

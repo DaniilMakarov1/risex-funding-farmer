@@ -1,3 +1,7 @@
+# Operator request timeout
+
+The working operator configuration `spread-shadow-runs/hood-cycle-race-latency-20260920/operator-v1/random-cycle.json` sets `request_timeout_seconds` to 15 seconds. This is an upper wait bound, not a mandatory delay. Other deadlines and freshness checks retain their own bounds. Configuration files omitting this field retain the code default.
+
 # Recovery correction — 2026-09-24
 
 ACK cancellation now consumes the already reserved nonce after locating the exact LIMIT, including a refusal before private WS publication. Residual closure waits within configured bounds for delayed trade history and position propagation; it never resends an uncertain order. Reports distinguish known external fills from overall UNKNOWN, record preflight refusals as completed refusals, and use the final cycle reason rather than an earlier retry. Trading modes, ticks, size, leverage and fees policy are unchanged. Activation and verification status are in STATUS.md.
