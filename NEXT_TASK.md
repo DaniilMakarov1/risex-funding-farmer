@@ -4,6 +4,8 @@ Owner reports /close unavailable and requests a fix. Reproduced offline on actua
 
 Verification complete: 87 focused tests and final clean full suite 5343 passed/3 skipped/2 warnings at 412b875. Exact saved inputs now parse; live read-only close admission returned CLOSE_READY with +0.00089 BTC on27337. Activate unchanged tested code in idle controller, preserving old saved active intent/offset/config. No agent close command or financial mutation. Owner must send a new /close after activation.
 
+Activation complete: local main 9a6e501, controllerPID69366, tested src/tests unchanged. Launch lock free, instance lock held, no child. Config and active cycle-075 state preserved. Owner may resend /close; historical consumed commands are not replayed. No agent trading or remote push.
+
 # Cycle-075 correction — parent sole implementer
 
 Owner requested all identified defects fixed: exact residual recovery after a pre-receiver observation discrepancy, WS visibility that can win while REST is outstanding, and earlier cancellation nonce acquisition. Work on codex/ws-cycle-recovery from accepted local main 545a234; preserve live journals and runtime. No one-test quota applies to owner Telegram runs. Preserve final active source and owner/queue checks, mutation ambiguity barriers, exact identities, fees, strict flatness and no replay. No real orders by the agent. Add adverse regressions and a final clean Python3.11 full suite, self-review, integrate verified code and activate only while controller/child are idle without clearing active recovery state. A known residual must remain explicit until owner action or authoritative reconciliation proves it resolved.
