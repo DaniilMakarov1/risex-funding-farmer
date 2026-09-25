@@ -84,7 +84,11 @@ async def test_known_source_id_survives_missing_lookup_and_cleanup_closes_residu
     assert phase.source.filled_quantity == Decimal(".20")
     assert phase.source.history_complete and not phase.source.unknown_reasons
     assert phase.receiver.dispatched is False
-    assert client.history_requests.count(client.target_id) == 2
+    # Cleanup may resolve publication before history reconciliation starts.
+    # Require history for the retained exact ID and its actual external fill,
+    # not a redundant second history request from the earlier cleanup path.
+    assert client.target_id in client.history_requests
+    assert [trade.trade_id for trade in phase.source.trades] == ["outside-source"]
     assert client.source_position == client.receiver_position == 0
     assert result.inventory == "CONFIRMED_FLAT"
     assert result.outcome is Outcome.PARTIAL
