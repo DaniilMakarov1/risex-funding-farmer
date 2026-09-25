@@ -31,6 +31,40 @@ def terminal_matches(order, item):
             and (plan.order_type != 'LIMIT' or order.price == plan.price))
 
 
+def _robinhood_binding(config):
+    return (config.api_base_url == 'https://api.rh.lighter.xyz'
+            and config.environment == 'robinhood' and config.chain_id == 466324)
+
+
+def _robinhood_leverage_execution(raw, tx_hash, now):
+    """Exact Robinhood execution event; retain milliseconds, never invent L1 proof."""
+    if not isinstance(raw, dict):
+        raise PreflightBlocked('Robinhood leverage transaction is malformed')
+    result = {key: raw.get(key) for key in (
+        'hash', 'type', 'status', 'account_index', 'api_key_index', 'nonce',
+        'executed_at', 'committed_at', 'verified_at')}
+    numeric = tuple(key for key in result if key != 'hash')
+    event = raw.get('execution_event', raw.get('event_info'))
+    if isinstance(event, str):
+        try:
+            event = json.loads(event)
+        except (ValueError, TypeError):
+            event = None
+    if (_leverage_tx_hash(tx_hash) is None or result['hash'] != tx_hash
+            or any(type(result[k]) is not int or result[k] < 0 for k in numeric)
+            or result['type'] != 20 or result['status'] != 3
+            or result['committed_at'] != 0 or result['verified_at'] != 0
+            or not math.isfinite(now) or not 0 < result['executed_at'] <= now * 1000
+            or not isinstance(event, dict)
+            or any(type(event.get(k)) is not int for k in ('a', 'm', 'imf', 'mm'))
+            or event['a'] != result['account_index'] or event['m'] < 0
+            or not 2500 <= event['imf'] <= 10000 or event['mm'] != 0
+            or event.get('ae') != ''):
+        raise PreflightBlocked('Robinhood leverage execution event is unproved')
+    result['execution_event'] = {k: event[k] for k in ('a', 'm', 'imf', 'mm', 'ae')}
+    return result
+
+
 class RecoveryReadClient(ReadOnlyLighterSdkClient):
     """Auth/account/exact-order reads only; no mutation signer or nonce path."""
 
@@ -45,6 +79,8 @@ class RecoveryReadClient(ReadOnlyLighterSdkClient):
         finally:
             await http.aclose()
         _require_success_code(payload, 'transaction')
+        if _robinhood_binding(self.config) and payload.get('status') == 3:
+            return _robinhood_leverage_execution(payload, tx_hash, self._clock())
         return _leverage_tx_diagnostic(payload, tx_hash, self._clock())
 
     async def read_leverage_next_nonce(self, account_index, api_key_index):
@@ -135,10 +171,12 @@ async def lookup_previous_order(client, config, plan):
         await http.aclose()
 
 
-def journal_rows(path):
+def journal_rows(path, *, shared_recovery=False):
     """Bounded strict reads, never follow links or repair historical inputs."""
     if path.is_symlink() or path.stat().st_size > 32 * 1024 * 1024:
         raise PreflightBlocked('historical journal is unsafe or too large')
+    if shared_recovery and path.name != 'recovery-checks.jsonl':
+        raise PreflightBlocked('shared recovery journal path is invalid')
     prior = -1
     run_id = None
     with path.open(encoding='utf-8') as stream:
@@ -153,8 +191,14 @@ def journal_rows(path):
                 raise PreflightBlocked('historical journal identity/time is invalid')
             if run_id is None:
                 run_id = row.get('run_id')
-            if not isinstance(run_id, str) or not run_id or row.get('run_id') != run_id:
+            row_run = row.get('run_id')
+            if (not isinstance(row_run, str) or not row_run
+                    or (not shared_recovery and row_run != run_id)):
                 raise PreflightBlocked('historical journal run identity conflicts')
+            if shared_recovery and row.get('event') not in {
+                'CURRENT_STATE_VERIFIED', 'LEVERAGE_RESOLUTION_CHECKPOINT',
+            }:
+                raise PreflightBlocked('shared recovery journal event is invalid')
             prior = at
             yield row
 
@@ -272,12 +316,12 @@ def _leverage_checkpoints(operator):
     if path.is_symlink() or not path.is_file():
         raise PreflightBlocked('unsafe recovery checkpoint')
     checkpoints = {}
-    for row in journal_rows(path):
+    for row in journal_rows(path, shared_recovery=True):
         if row['event'] != 'LEVERAGE_RESOLUTION_CHECKPOINT':
             continue
         payload = row['payload']
         # Version 1 was an unaccepted inference from status/timestamps alone.
-        if payload.get('proof_version') != 2:
+        if type(payload.get('proof_version')) is not int or payload['proof_version'] not in (2, 3):
             continue
         original = payload.get('original_path')
         account_index = payload.get('account_index')
@@ -289,7 +333,7 @@ def _leverage_checkpoints(operator):
     return checkpoints
 
 
-def _checkpoint_matches(item, checkpoints):
+def _checkpoint_matches(item, checkpoints, config=None):
     payload = checkpoints.get((item['journal_path'], item['account_index']))
     if payload is None:
         return False
@@ -303,6 +347,24 @@ def _checkpoint_matches(item, checkpoints):
         'nonce': identity['nonce'], 'api_key_index': identity['api_key_index'],
         'tx_type': 20,
     }
+    if payload.get('proof_version') == 3:
+        if config is None or not _robinhood_binding(config):
+            raise PreflightBlocked('Robinhood checkpoint venue binding conflicts')
+        at = payload.get('account_observed_at')
+        if isinstance(at, bool) or not isinstance(at, (int, float)) or not math.isfinite(at):
+            raise PreflightBlocked('Robinhood checkpoint observation is invalid')
+        tx = _robinhood_leverage_execution(payload.get('transaction', {}), identity['hash'], at)
+        if (any(payload.get(key) != value for key, value in expected.items())
+                or any(tx.get(key) != value for key, value in identity.items())
+                or payload.get('tx_status') != tx['status']
+                or any(payload.get(k) != tx[k] for k in ('executed_at', 'committed_at', 'verified_at'))
+                or tx['execution_event']['m'] != config.market_id
+                or tx['execution_event']['imf'] != item['fraction_bps']
+                or tx['executed_at'] < math.floor(item['intent_at'] * 1000)
+                or type(payload.get('next_nonce')) is not int
+                or payload['next_nonce'] <= identity['nonce']):
+            raise PreflightBlocked('Robinhood checkpoint conflicts with immutable history')
+        return True
     if (any(payload.get(key) != value for key, value in expected.items())
             or type(payload.get('tx_status')) is not int
             or payload['tx_status'] not in (0, 2)
@@ -325,7 +387,7 @@ async def resolve_prior(config, client, operator, *, clock=None, require_leverag
     intents, files, pending_leverage = await asyncio.to_thread(prior_intents, operator, config)
     if pending_leverage and require_leverage_resolved:
         checkpoints = await asyncio.to_thread(_leverage_checkpoints, operator)
-        unresolved_settings = [item for item in pending_leverage if not _checkpoint_matches(item, checkpoints)]
+        unresolved_settings = [item for item in pending_leverage if not _checkpoint_matches(item, checkpoints, config)]
         if unresolved_settings:
             if len(unresolved_settings) > config.max_poll_count:
                 raise PreflightBlocked('too many unresolved leverage settings for a bounded check')
@@ -348,13 +410,19 @@ async def resolve_prior(config, client, operator, *, clock=None, require_leverag
                 identity = item['prepared_identity']
                 tx = await asyncio.wait_for(reader(identity['hash']), timeout=remaining())
                 try:
-                    tx = _leverage_tx_diagnostic(tx, identity['hash'], engine.clock.now())
+                    robinhood_execution = _robinhood_binding(config) and 'execution_event' in tx
+                    tx = (_robinhood_leverage_execution(tx, identity['hash'], engine.clock.now())
+                          if robinhood_execution else _leverage_tx_diagnostic(tx, identity['hash'], engine.clock.now()))
                 except (ContractError, TypeError, AttributeError) as exc:
                     raise PreflightBlocked('previous leverage transaction evidence is incomplete') from exc
                 if (any(tx.get(key) != value for key, value in identity.items())
-                        or tx['status'] not in (0, 2)
-                        or tx['executed_at'] < math.floor(item['intent_at'])
-                        or tx['committed_at'] <= 0 or tx['verified_at'] <= 0):
+                        or (robinhood_execution and (
+                            tx['execution_event']['m'] != config.market_id
+                            or tx['execution_event']['imf'] != item['fraction_bps']
+                            or tx['executed_at'] < math.floor(item['intent_at'] * 1000)))
+                        or (not robinhood_execution and (tx['status'] not in (0, 2)
+                            or tx['executed_at'] < math.floor(item['intent_at'])
+                            or tx['committed_at'] <= 0 or tx['verified_at'] <= 0))):
                     raise PreflightBlocked('previous leverage transaction is pending or conflicting')
                 next_nonce = await asyncio.wait_for(
                     nonce_reader(identity['account_index'], identity['api_key_index']),
@@ -369,7 +437,7 @@ async def resolve_prior(config, client, operator, *, clock=None, require_leverag
                 label = 'source' if account.account_index == config.source_account_index else 'receiver'
                 if (account.source_identity != item['source_identity']
                         or account.signed_position != 0 or account.active_orders
-                        or (tx['status'] == 2 and
+                        or (tx['status'] in (2, 3) and
                             _observed_leverage_fraction(account, label) != item['fraction_bps'])):
                     raise PreflightBlocked('previous leverage transaction conflicts with fresh account setting')
             checkpoint = DurableJournal(Path(operator) / 'recovery-checks.jsonl', clock=engine.clock.now)
@@ -377,7 +445,7 @@ async def resolve_prior(config, client, operator, *, clock=None, require_leverag
             try:
                 for item, tx, next_nonce in proved:
                     checkpoint.append('LEVERAGE_RESOLUTION_CHECKPOINT', {
-                        'proof_version': 2, 'original_path': item['journal_path'],
+                        'proof_version': 3 if 'execution_event' in tx else 2, 'original_path': item['journal_path'],
                         'original_sha256': item['journal_sha256'],
                         'account_index': item['account_index'],
                         'source_identity': item['source_identity'],
@@ -387,6 +455,7 @@ async def resolve_prior(config, client, operator, *, clock=None, require_leverag
                         'tx_status': tx['status'], 'executed_at': tx['executed_at'],
                         'committed_at': tx['committed_at'], 'verified_at': tx['verified_at'],
                         'next_nonce': next_nonce,
+                        **({'transaction': tx} if 'execution_event' in tx else {}),
                         'account_observed_at': accounts[item['account_index']].observed_at,
                     })
             finally:

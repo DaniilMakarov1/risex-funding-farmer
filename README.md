@@ -1,3 +1,7 @@
+# Recovery after an interrupted leverage confirmation
+
+Fresh /run checks can now read the shared recovery journal across multiple checks. For Robinhood, recovery binds the original prepared transaction to its execution event, consumed nonce and fresh matching flat accounts. It does not wait for nonexistent L1 commit timestamps or reinterpret millisecond execution time as seconds. Missing/conflicting proof still blocks. Old cycles and their reported outcomes remain unchanged; a resolved administrative barrier does not resume an old series.
+
 # Temporary account rate limits
 
 HTTP 429 during leverage readback or paired preparation now triggers a bounded cooldown and fresh account reads, without resending a leverage setting. The same cooldown applies to residual-recovery account reads. If the exchange remains rate limited, requests cannot fit the existing deadline, or account evidence conflicts, the operation stops. Diagnostics identify HTTP 429; failed series are never automatically replayed. Ordinary successful reads have no added request or sleep.

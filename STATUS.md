@@ -1,3 +1,9 @@
+# Launch after cycle-165 — WIP_NOT_ACCEPTED, 2026-09-25
+
+Read-only diagnosis from published main `a6843d0` found two independent blockers. The shared recovery journal has 167 legitimate run IDs, but the leverage checkpoint reader applied a single-run invariant. After correcting that path, Robinhood returned the exact prepared transaction with status 3, millisecond executed_at, zero L1 commit/verify timestamps, and an execution event matching account 27337 / market 1 / fraction 4528 / cross mode / empty error. A new venue-bound version-3 proof requires that full event plus consumed nonce and fresh matching flat accounts, preserving version-2 and trading-journal constraints. Candidate read-only recovery returned READY with both positions exactly zero and no active orders and appended one validated checkpoint; original cycle history was not rewritten. No financial command.
+
+123 focused recovery/hash/controller checks passed after correcting three new fixture mistakes (missing require_flat argument, timestamp boundary fixture, and constructing an invalid venue config). Full clean isolated Python 3.11 suite and self-review pending; no runtime activation yet. Evidence: `spread-shadow-runs/hood-launch-unblock-20260925/solo-v1/`.
+
 # Cycle-165 HTTP 429 correction — verified and active, 2026-09-25
 
 Published main `5a84bf1` completed cycle-163/164 before cycle-165 stopped in leverage preparation, with no order creation intent. Four SDK account/accountActiveOrders HTTP responses were 429 immediately after the second leverage transaction. Generic exception mapping incorrectly called this an account identity read failure, and leverage readback had no rate-limit recovery. A separate owner-authorized read-only observation found both accounts exactly flat and no active selected-market orders; historical journals are unchanged. The prior cycle-158 delayed-order cleanup is not this failure.
