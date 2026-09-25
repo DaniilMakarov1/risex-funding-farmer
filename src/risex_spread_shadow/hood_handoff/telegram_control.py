@@ -144,6 +144,9 @@ def admission_failure_category(exc):
     if isinstance(exc, aiohttp.ClientConnectionError):
         return 'READ_CONNECTION'
     if isinstance(exc, PreflightBlocked):
+        from .operator_recovery import HistoryBoundExceeded
+        if isinstance(exc, HistoryBoundExceeded):
+            return 'HISTORY_LIMIT'
         if str(exc) == 'positions remain; use /close before /run':
             return 'POSITIONS_REMAIN'
         return 'PREFLIGHT_REFUSED'

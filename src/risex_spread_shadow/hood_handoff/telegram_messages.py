@@ -147,6 +147,7 @@ def launch_failure_message(name, code, *, blocked=False):
         'CREDENTIAL_UNAVAILABLE': 'Доступ к сохранённым ключам не подтверждён.',
         'PREFLIGHT_REFUSED': 'Проверка готовности отказала до начала цикла.',
         'PREPARATION_UNAVAILABLE': 'Подготовка запуска завершилась ошибкой.',
+        'HISTORY_LIMIT': 'История журналов превысила предел проверки.',
     }
     reason = reasons.get(code)
     if reason is None:
@@ -220,6 +221,7 @@ def admission_refusal_message(record):
                'READ_TIMEOUT': 'Истекло время чтения данных.',
                'READ_CONNECTION': 'Не удалось получить данные по соединению.',
                'PREFLIGHT_REFUSED': 'Проверка безопасности не подтвердила готовность.',
+               'HISTORY_LIMIT': 'История журналов превысила предел проверки; нужна правка ограничения, повтор не поможет.',
                'CHECK_FAILED': 'Проверка не завершилась; требуется повторная сверка.'}
     stage = record.get('stage') if isinstance(record.get('stage'), str) else None
     category = record.get('category') if isinstance(record.get('category'), str) else 'CHECK_FAILED'

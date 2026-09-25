@@ -23,6 +23,33 @@ from .telegram_accounts import missing_key
 
 SLOT = re.compile(r'(?:cycle|close)-[0-9]{3,}')
 INTENTS = {'SOURCE_DISPATCH_INTENT', 'RECEIVER_DISPATCH_INTENT', 'FALLBACK_DISPATCH_INTENT'}
+# Per-slot trading journals keep the original strict bound.  The shared
+# append-only recovery journal grows with every readiness check across all
+# series, so it has its own (still finite) bound; rows are streamed one line at
+# a time and each line keeps the 2 MiB limit.
+HISTORICAL_JOURNAL_MAX_BYTES = 32 * 1024 * 1024
+SHARED_RECOVERY_JOURNAL_MAX_BYTES = 512 * 1024 * 1024
+HISTORICAL_JOURNAL_MAX_FILES = 10000
+
+
+class HistoryBoundExceeded(PreflightBlocked):
+    """A finite history-scan bound was reached; not an order or position fact."""
+
+
+def persisted_proof(proof):
+    """Journal form of a readiness proof: the per-file input list is replaced by
+    its exact count and SHA-256 over the canonical sorted list.  The in-memory
+    proof is not modified.  This keeps each shared-journal row small instead of
+    repeating every historical path/hash on every check."""
+    value = dict(proof)
+    inputs = value.pop('inputs', None)
+    if isinstance(inputs, list):
+        canonical = json.dumps(sorted(({'path': str(item.get('path')), 'sha256': str(item.get('sha256'))}
+                                       for item in inputs), key=lambda item: item['path']),
+                               sort_keys=True, separators=(',', ':')).encode('utf-8')
+        value['inputs_count'] = len(inputs)
+        value['inputs_sha256'] = hashlib.sha256(canonical).hexdigest()
+    return value
 
 
 def terminal_matches(order, item):
@@ -173,10 +200,13 @@ async def lookup_previous_order(client, config, plan):
 
 def journal_rows(path, *, shared_recovery=False):
     """Bounded strict reads, never follow links or repair historical inputs."""
-    if path.is_symlink() or path.stat().st_size > 32 * 1024 * 1024:
-        raise PreflightBlocked('historical journal is unsafe or too large')
+    if path.is_symlink():
+        raise PreflightBlocked('historical journal is unsafe')
     if shared_recovery and path.name != 'recovery-checks.jsonl':
         raise PreflightBlocked('shared recovery journal path is invalid')
+    limit = SHARED_RECOVERY_JOURNAL_MAX_BYTES if shared_recovery else HISTORICAL_JOURNAL_MAX_BYTES
+    if path.stat().st_size > limit:
+        raise HistoryBoundExceeded('historical journal is too large')
     prior = -1
     run_id = None
     with path.open(encoding='utf-8') as stream:
@@ -219,8 +249,8 @@ def prior_intents(operator, config):
         if slot.is_symlink() or not slot.is_dir():
             raise PreflightBlocked('unsafe historical slot')
         for path in sorted(slot.glob('*.jsonl')):
-            if len(files) >= 2000:
-                raise PreflightBlocked('historical journal count exceeded')
+            if len(files) >= HISTORICAL_JOURNAL_MAX_FILES:
+                raise HistoryBoundExceeded('historical journal count exceeded')
             if path.is_symlink():
                 raise PreflightBlocked('unsafe historical journal')
             digest = hashlib.sha256()
@@ -510,7 +540,7 @@ async def check_recovery(config, operator, *, require_flat=True,
             journal = DurableJournal(Path(operator) / 'recovery-checks.jsonl')
             journal.acquire_attempt()
             try:
-                journal.append('CURRENT_STATE_VERIFIED', proof)
+                journal.append('CURRENT_STATE_VERIFIED', persisted_proof(proof))
             finally:
                 journal.release_attempt()
             return proof
@@ -549,7 +579,7 @@ async def close_positions(config, client, operator, slot, *, clock=None):
         journal.append('CLOSE_STARTED', {'binding': config.binding(), 'runtime_provenance': capture_provenance(config.binding())})
         try:
             source, receiver, proof = await inspect_current(config, client, operator, require_flat=False, clock=engine.clock, journal=journal)
-            journal.append('CLOSE_BASELINE', proof)
+            journal.append('CLOSE_BASELINE', persisted_proof(proof))
             results, source_after, receiver_after = await engine.close_reconciled_positions(config, journal, source, receiver)
             resolved = source_after is not None and receiver_after is not None and all(
                 item.outcome is not Outcome.UNKNOWN for item in results)

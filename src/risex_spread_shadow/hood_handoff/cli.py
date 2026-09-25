@@ -1440,12 +1440,15 @@ def _persist_prejournal_launch_failure(cycle_dir: Path, exc: BaseException) -> s
     """Persist only an allowlisted cause; never copy an exception or key text."""
     if (cycle_dir / 'cycle.jsonl').exists():
         return None
+    from .operator_recovery import HistoryBoundExceeded
     if isinstance(exc, PreflightBlocked) and 'leverage setting is unresolved' in str(exc):
         code = 'PRIOR_LEVERAGE_UNRESOLVED'
     elif isinstance(exc, PreflightBlocked) and 'previous order is unresolved' in str(exc):
         code = 'PRIOR_ORDER_UNRESOLVED'
     elif isinstance(exc, KeychainError):
         code = 'CREDENTIAL_UNAVAILABLE'
+    elif isinstance(exc, HistoryBoundExceeded):
+        code = 'HISTORY_LIMIT'
     elif isinstance(exc, PreflightBlocked):
         code = 'PREFLIGHT_REFUSED'
     else:
