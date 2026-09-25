@@ -1,3 +1,7 @@
+# Initial explicit-offset spread readiness (2026-09-25)
+
+Only the exact ContractError PRICE_OFFSET_NO_ROOM from automatic price selection permits initial read-only retries. Ordinary success adds no I/O or sleep. After the first failed observation, wait within existing reconcile_timeout_seconds and total max_poll_count observations, at poll_interval_seconds, bounding in-flight repeated observations. Reread and validate metadata, book and both exactly flat accounts; check timestamps at final price selection. No random draw, setting or order precedes readiness. Confirmed-pilot initial behavior remains unchanged. Existing paired opening/closing preparation retries recognize the same exact error within their unchanged shared attempt budgets. Other identity, authorization, active-order, nonflat, stale or malformed observations are not waived. Exhaustion stops honestly; it does not lower the requested tick offset or make an unknown result safe. INITIAL_SPREAD_WAIT/READY feed the existing background Telegram lifecycle observer without network work in the trading child.
+
 # Shared recovery and Robinhood execution proof (2026-09-25)
 
 Only recovery-checks.jsonl may carry multiple nonempty run IDs with globally strict sequence/time/size/payload validation and an allowlist of CURRENT_STATE_VERIFIED and LEVERAGE_RESOLUTION_CHECKPOINT events. Trading journals remain single-run. Checkpoint duplicates and immutable-history conflicts remain blocking.

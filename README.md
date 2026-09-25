@@ -1,3 +1,7 @@
+# Waiting for room inside the spread
+
+With an explicit tick offset, a temporarily narrow spread now triggers bounded initial waiting instead of an immediate one-snapshot refusal. Telegram may show that the system is waiting for a spread that fits the requested price offset; orders have not yet been sent. Current production bounds are 20 seconds after the first no-room observation and at most 40 total observations, with fresh validation on each. If the market never permits that price or another check fails, the series still stops. The offset is never silently reduced and a stopped series is never replayed automatically.
+
 # Recovery after an interrupted leverage confirmation
 
 Fresh /run checks can now read the shared recovery journal across multiple checks. For Robinhood, recovery binds the original prepared transaction to its execution event, consumed nonce and fresh matching flat accounts. It does not wait for nonexistent L1 commit timestamps or reinterpret millisecond execution time as seconds. Missing/conflicting proof still blocks. Old cycles and their reported outcomes remain unchanged; a resolved administrative barrier does not resume an old series.

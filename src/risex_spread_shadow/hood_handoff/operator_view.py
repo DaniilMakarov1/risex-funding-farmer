@@ -175,6 +175,10 @@ def read_lifecycle(path):
                 event, payload = row.get('event'), mapping(row.get('payload'))
                 if event == 'CYCLE_STARTED':
                     state['binding'] = dict(mapping(payload.get('binding')))
+                elif event == 'INITIAL_SPREAD_WAIT':
+                    state['stage'] = 'SPREAD_WAIT'
+                elif event == 'INITIAL_SPREAD_READY':
+                    state['stage'] = 'PREPARING'
                 elif event == 'OPENING_COMPLETE':
                     state['opening'] = {}
                     result = mapping(payload.get('result'))
@@ -209,7 +213,7 @@ def read_lifecycle(path):
 def lifecycle_lines(state):
     state = mapping(state)
     stage = state.get('stage')
-    labels = {'HOLD': 'Позиции открыты между нашими счетами.', 'CLOSING': 'Началось закрытие позиций.',
+    labels = {'SPREAD_WAIT': 'Ожидаем спред для заданного отступа цены; заявки ещё не отправлены.', 'HOLD': 'Позиции открыты между нашими счетами.', 'CLOSING': 'Началось закрытие позиций.',
               'RECOVERY': 'Идёт отдельное закрытие остатка.', 'COMPLETE': 'Цикл завершён; итог сверяется.'}
     lines = [labels.get(stage, 'Подготовка и открытие; парное исполнение ещё не подтверждено.')]
     opening = mapping(state.get('opening'))

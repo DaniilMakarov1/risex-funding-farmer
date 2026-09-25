@@ -460,7 +460,7 @@ class Controller:
                             sent.add(key)
                             self.queue_notice(self.cycle_notice(views.execution_message(notice)))
                     stage = progress.get('stage') if progress else None
-                    if stage in {'HOLD', 'CLOSING', 'RECOVERY'} and stage not in sent:
+                    if stage in {'SPREAD_WAIT', 'HOLD', 'CLOSING', 'RECOVERY'} and stage not in sent:
                         sent.add(stage)
                         # Slow/unavailable delivery cannot hold up the child.
                         self.queue_notice(self.cycle_notice(views.running_message(added, progress)))

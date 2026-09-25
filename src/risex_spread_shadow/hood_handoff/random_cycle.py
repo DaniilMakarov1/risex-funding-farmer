@@ -2020,10 +2020,15 @@ def _with_cycle_classifications(result: RandomCycleResult) -> RandomCycleResult:
     )
 
 
+def _is_price_offset_no_room(exc: BaseException) -> bool:
+    return (isinstance(exc, ContractError) and str(exc) ==
+            "PRICE_OFFSET_NO_ROOM: spread cannot fit the requested tick improvement")
+
+
 def _is_retryable_preparation_error(exc: BaseException) -> bool:
     """Classify only finite pre-mutation facts that a fresh snapshot can fix."""
 
-    if isinstance(exc, _RetryablePreparationFailure):
+    if isinstance(exc, _RetryablePreparationFailure) or _is_price_offset_no_room(exc):
         return True
     if isinstance(exc, (TimeoutError, asyncio.TimeoutError, ConnectionError, OSError)):
         return True
@@ -2321,31 +2326,71 @@ class RandomCycleEngine:
         if children:
             raise PreflightBlocked("cycle directory is already consumed")
 
+    async def _initial_open_context(self, config, journal):
+        async def observe():
+            metadata = _as_market(
+                await self._bounded(self.client.market_metadata(config.market_id), config, "market metadata read")
+            )
+            book = _as_book(
+                await self._bounded(self._order_book(config.market_id), config, "order book read"), metadata
+            )
+            now = self.clock.now()
+            _validate_market_book(config, metadata, book, now)
+            source, receiver = await self._accounts(config, now)
+            if source.signed_position != 0 or receiver.signed_position != 0:
+                raise PreflightBlocked("random cycle requires both selected-market positions to be exactly flat")
+            now = self.clock.now()
+            _validate_account_fresh(config, source, "source", now)
+            _validate_account_fresh(config, receiver, "receiver", now)
+            proposal = select_automatic_prices(
+                config.direction,
+                metadata,
+                book,
+                now=now,
+                freshness_seconds=config.freshness_seconds,
+                price_improvement_ticks=config.price_improvement_ticks,
+            )
+            return metadata, book, source, receiver, proposal
+
+        # The successful path remains one observation, without a timer or sleep.
+        try:
+            return await observe()
+        except ContractError as exc:
+            if not _is_price_offset_no_room(exc) or config.confirmed_pilot:
+                raise
+        deadline = _clock_monotonic(self.clock) + config.reconcile_timeout_seconds
+        for attempt in range(1, config.max_poll_count + 1):
+            remaining = deadline - _clock_monotonic(self.clock)
+            if attempt == config.max_poll_count or remaining <= config.poll_interval_seconds:
+                raise PreflightBlocked("PRICE_OFFSET_NO_ROOM: initial spread wait exhausted; no orders sent")
+            if attempt == 1:
+                journal.append("INITIAL_SPREAD_WAIT", {
+                    "price_improvement_ticks": config.price_improvement_ticks,
+                    "maximum_reads": config.max_poll_count,
+                    "timeout_seconds": config.reconcile_timeout_seconds,
+                })
+            await self.clock.sleep(config.poll_interval_seconds)
+            remaining = deadline - _clock_monotonic(self.clock)
+            if remaining <= 0:
+                raise PreflightBlocked("PRICE_OFFSET_NO_ROOM: initial spread wait exhausted; no orders sent")
+            try:
+                context = await asyncio.wait_for(observe(), timeout=remaining)
+                if _clock_monotonic(self.clock) >= deadline:
+                    raise PreflightBlocked("initial spread readiness deadline exceeded")
+                journal.append("INITIAL_SPREAD_READY", {"reads": attempt + 1})
+                return context
+            except ContractError as exc:
+                if not _is_price_offset_no_room(exc):
+                    raise
+        raise AssertionError("initial spread wait must terminate")
+
     async def _execute_locked(self, config: RandomCycleConfig, journal: DurableJournal) -> RandomCycleResult:
         self._stage = "PREFLIGHT"
         start_stream = getattr(self.client, "start_read_stream", None)
         if callable(start_stream) and not config.confirmed_pilot:
             self._read_stream_attempted = True
             await start_stream(ready_timeout=5)
-        metadata = _as_market(
-            await self._bounded(self.client.market_metadata(config.market_id), config, "market metadata read")
-        )
-        book = _as_book(
-            await self._bounded(self._order_book(config.market_id), config, "order book read"), metadata
-        )
-        now = self.clock.now()
-        _validate_market_book(config, metadata, book, now)
-        source, receiver = await self._accounts(config, now)
-        if source.signed_position != 0 or receiver.signed_position != 0:
-            raise PreflightBlocked("random cycle requires both selected-market positions to be exactly flat")
-        proposal = select_automatic_prices(
-            config.direction,
-            metadata,
-            book,
-            now=now,
-            freshness_seconds=config.freshness_seconds,
-            price_improvement_ticks=config.price_improvement_ticks,
-        )
+        metadata, book, source, receiver, proposal = await self._initial_open_context(config, journal)
         bounds = compute_quantity_bounds(metadata, source, receiver, proposal.source_limit_price,
                                          receiver_bound=proposal.receiver_worst_price, direction=config.direction,
                                          initial_reserve_quote=(config.margin_reserve.initial_quote
