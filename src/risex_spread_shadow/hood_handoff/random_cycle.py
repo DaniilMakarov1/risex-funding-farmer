@@ -2814,11 +2814,11 @@ class RandomCycleEngine:
         return source, receiver
 
     async def _rate_limited_accounts(
-        self, config: RandomCycleConfig, now: float | None = None,
+        self, config: RandomCycleConfig,
         *, journal: DurableJournal | None = None,
     ) -> tuple[AccountSnapshot, AccountSnapshot]:
         return await self._recovery_read(
-            config, lambda: self._accounts(config, now),
+            config, lambda: self._accounts(config),
             "account snapshot", journal, rate_limit_only=True,
         )
 
