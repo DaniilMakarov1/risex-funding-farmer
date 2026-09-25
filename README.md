@@ -1,3 +1,9 @@
+# USD PnL and executed series volume — 2026-09-25
+
+For the configured Robinhood BTC market, cycle and series PnL are displayed in nominal USD (USDG denomination), without applying or claiming a live USDG/USD conversion. Series totals include executed USD turnover: the sum of actual fill quantity times actual execution price across both configured accounts, including opening, closing and in-cycle residual fills. Each account side counts: a $50 match between our accounts contributes $100 turnover. Unfilled orders contribute nothing, and a repeated account/trade receipt never adds turnover twice.
+
+Missing/incomplete volume evidence remains unknown, with any proven subtotal labelled separately. Fees are not needed to prove turnover; missing fees still leave net PnL unknown. Funding and pre-cycle closure of old inventory remain excluded. Unknown foreign denominations are not relabelled USD. The final report uses the existing background reader/sender and adds no venue or FX calls to trading. Robinhood describes the settlement collateral in [its Wallet perpetual futures documentation](https://robinhood.com/us/en/support/articles/robinhood-wallet-perpetual-futures/).
+
 # Finite series length and final results — 2026-09-25
 
 The five-cycle cap is removed: `/run 20` requests twenty cycles with saved settings; `/run ack 1 20` uses ACK admission and one tick for each. Counts must be positive decimal integers (no signs, fractions or leading zeroes) within the Telegram command length. Tick offsets remain 1–5. This is a finite request, never an endless loop or a restart-resumable campaign.

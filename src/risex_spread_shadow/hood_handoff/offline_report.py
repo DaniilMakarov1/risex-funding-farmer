@@ -387,6 +387,14 @@ def _project_payload(event: str, payload: Mapping[str, Any], data: _FileData) ->
 
     truncated: list[bool] = []
     projected = _bounded_json(payload, truncated=truncated)
+    if event == "CYCLE_STARTED" and isinstance(projected, dict):
+        from .operator_view import nominal_usd
+        binding = payload.get("binding")
+        if isinstance(binding, Mapping) and nominal_usd(binding) and isinstance(projected.get("binding"), dict):
+            # Retain only these exact public constants for USD denomination.
+            # Arbitrary endpoint strings can contain credentials and stay omitted.
+            projected["binding"].update(api_base_url="https://api.rh.lighter.xyz",
+                                        environment="robinhood", chain_id=466324)
     if truncated:
         data.issue("PAYLOAD_TRUNCATED", "required projected detail exceeds the report display bound", event=event)
     return projected if isinstance(projected, dict) else {}

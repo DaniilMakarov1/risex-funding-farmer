@@ -62,6 +62,18 @@ def number(value):
         return None
 
 
+def nominal_usd(binding):
+    """Configured Robinhood BTC quotes, in nominal USD (USDG settlement).
+
+    This is a reporting denomination, not a market USDG/USD FX conversion.
+    Other venues/markets require their own evidenced denomination contract.
+    """
+    return (binding.get('api_base_url') == 'https://api.rh.lighter.xyz'
+            and binding.get('environment') == 'robinhood'
+            and binding.get('chain_id') == 466324
+            and binding.get('market_id') == 1 and binding.get('market_symbol') == 'BTC')
+
+
 def amount(value):
     parsed = number(value)
     if parsed is None:
@@ -465,7 +477,9 @@ def result_lines(report, *, detailed=False):
     if fees.get('status') != 'PROVEN' and any(mapping(f).get('fee_evidence') == 'NONZERO_UNIT_UNVERIFIED' for f in report.get('confirmed_fills', [])):
         lines.append('Ненулевые поля комиссий сохранены; единица их пересчёта ещё не подтверждена.')
     lines.append('PnL сделок до комиссий: ' + amount(pnl.get('gross')) + '; после комиссий: ' + amount(pnl.get('net')) + '.')
-    lines.append('PnL указан в валюте котировки, без фандинга. Итог с фандингом неизвестен.')
+    lines.append(('PnL указан в USD по номиналу USDG; без пересчёта USDG/USD. '
+                  if nominal_usd(binding) else 'PnL указан в валюте котировки. ')
+                 + 'Без фандинга; итог с фандингом неизвестен.')
     if detailed or inventory.get('status') != 'CONFIRMED_FLAT':
         recovery_reason = mapping(report.get('cycle')).get('recovery_stop_reason')
         if recovery_reason and inventory.get('status') != 'CONFIRMED_FLAT':

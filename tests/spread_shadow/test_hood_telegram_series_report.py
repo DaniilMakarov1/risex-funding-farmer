@@ -15,7 +15,7 @@ from test_hood_telegram_messages import valid
 
 def report(gross='0.03', net='0.02'):
     return {'status': 'COMPLETE',
-            'binding': {'api_base_url': 'https://venue.invalid', 'market_id': 1, 'market_symbol': 'BTC',
+            'binding': {'api_base_url': 'https://api.rh.lighter.xyz', 'environment': 'robinhood', 'chain_id': 466324, 'market_id': 1, 'market_symbol': 'BTC',
                         'source_account_index': 11, 'receiver_account_index': 22},
             'inventory': {'status': 'CONFIRMED_FLAT'},
             'order_state': {'unresolved_intents': [], 'unresolved_observed_orders': []},
@@ -223,3 +223,107 @@ async def test_bad_or_oversized_count_never_launches(tmp_path, command):
     c = setup(tmp_path, launch)
     await c.handle(update(text=command))
     assert c.task is None
+
+
+def fill(account, trade, quantity, price, side='BUY', phase='opening'):
+    return {'account_index': account, 'market_id': 1, 'trade_id': trade,
+            'quantity': quantity, 'price': price, 'side': side,
+            'phase': phase, 'history_complete': True, 'counterparty_account_index': 39}
+
+
+def test_usd_pnl_and_total_two_account_open_close_external_and_residual_volume():
+    first, second = report(), report('-0.07', None)
+    first['confirmed_fills'] = [
+        fill(11, 'own-open', '0.001', '50000'),
+        fill(22, 'own-open', '0.001', '50000', 'SELL'),
+        fill(11, 'own-close', '0.001', '50100', 'SELL', 'closing'),
+        fill(22, 'own-close', '0.001', '50100', 'BUY', 'closing')]
+    second['confirmed_fills'] = [fill(11, 'external-open', '0.0002', '50000'),
+                                 fill(11, 'residual-close', '0.0002', '50200', 'SELL', 'fallback')]
+    result = render({'cycle-001': first, 'cycle-002': second})
+    # 50 + 50 + 50.1 + 50.1 + 10 + 10.04, account receipts counted once.
+    assert 'Исполненный объём обоих счетов: 220.24 USD' in result
+    assert 'До комиссий: -0.04 USD' in result
+    assert 'После комиссий: неизвестен' in result
+    assert 'PnL: 0.02 USD' in result
+    assert 'USD по номиналу USDG' in result
+
+
+def test_proved_empty_fills_have_zero_turnover():
+    result = render({'cycle-001': report('0', '0')})
+    assert 'Исполненный объём обоих счетов: 0 USD' in result
+
+
+@pytest.mark.parametrize('bad', ['missing', 'incomplete', 'unknown_order', 'bad_quantity', 'bad_price',
+                                'wrong_account', 'wrong_market', 'missing_history', 'duplicate', 'conflict'])
+def test_unproved_volume_never_becomes_complete_total(bad):
+    r = report()
+    r['confirmed_fills'] = [fill(11, '1', '0.001', '50000')]
+    if bad == 'missing': r.pop('confirmed_fills')
+    elif bad == 'incomplete': r['status'] = 'INCOMPLETE'
+    elif bad == 'unknown_order': r['order_state']['unresolved_intents'] = ['unknown']
+    elif bad == 'bad_quantity': r['confirmed_fills'][0]['quantity'] = '-1'
+    elif bad == 'bad_price': r['confirmed_fills'][0]['price'] = 'NaN'
+    elif bad == 'wrong_account': r['confirmed_fills'][0]['account_index'] = 99
+    elif bad == 'wrong_market': r['confirmed_fills'][0]['market_id'] = 2
+    elif bad == 'missing_history': r['confirmed_fills'][0].pop('history_complete')
+    else:
+        r['confirmed_fills'].append(copy.deepcopy(r['confirmed_fills'][0]))
+        if bad == 'conflict': r['confirmed_fills'][1]['price'] = '50001'
+    assert 'Исполненный объём обоих счетов: неизвестен' in render({'cycle-001': r})
+
+
+def test_duplicate_account_receipt_across_cycles_is_not_added_twice():
+    first, second = report(), report()
+    first['confirmed_fills'] = second['confirmed_fills'] = [fill(11, 'same', '0.001', '50000')]
+    result = render({'cycle-001': first, 'cycle-002': second})
+    assert 'Исполненный объём обоих счетов: неизвестен' in result
+    assert 'Подтверждённая часть объёма (1/2): 50 USD' in result
+
+
+def test_incomplete_series_reports_known_turnover_subtotal():
+    r = report()
+    r['confirmed_fills'] = [fill(11, 'known', '0.001', '50000')]
+    result = render({'cycle-001': r, 'cycle-002': None}, status='BLOCKED', series_completed=1)
+    assert 'Исполненный объём обоих счетов: неизвестен' in result
+    assert 'Подтверждённая часть объёма (1/2): 50 USD' in result
+
+
+@pytest.mark.parametrize('field,value', [('api_base_url','https://other.invalid'), ('environment','mainnet'),
+                                       ('chain_id',304), ('market_symbol','ETH')])
+def test_foreign_denomination_is_not_relabelled_usd(field, value):
+    r = report()
+    r['binding'][field] = value
+    r['confirmed_fills'] = [fill(11, '1', '0.001', '50000')]
+    result = render({'cycle-001': r})
+    assert 'До комиссий: неизвестен' in result
+    assert 'После комиссий: неизвестен' in result
+    assert 'Исполненный объём обоих счетов: неизвестен' in result
+
+
+def test_turnover_product_preserves_low_order_digits():
+    from risex_spread_shadow.hood_handoff.telegram_series_report import executed_turnover
+    r = report()
+    r['confirmed_fills'] = [fill(11, 'precise', '12345678901234567890.123456789', '0.000000001')]
+    assert executed_turnover(r, set()) == Decimal('12345678901.234567890123456789')
+
+
+def test_single_cycle_view_also_identifies_usd_nominal():
+    from risex_spread_shadow.hood_handoff.operator_view import result_lines
+    result = '\n'.join(result_lines(report()))
+    assert 'PnL указан в USD по номиналу USDG' in result
+
+
+@pytest.mark.parametrize('supported', [True, False])
+def test_real_saved_report_preserves_only_supported_public_usd_binding(tmp_path, supported):
+    from risex_spread_shadow.hood_handoff.offline_report import load_saved_cycle_report
+    from risex_spread_shadow.hood_handoff.operator_view import nominal_usd
+    cycle_slot(tmp_path, 1)
+    path = tmp_path / 'cycle-001' / 'cycle.jsonl'
+    rows = [json.loads(line) for line in path.read_text().splitlines()]
+    rows[0]['payload']['binding'].update(api_base_url='https://api.rh.lighter.xyz' if supported else 'https://private.invalid/SECRET_VALUE',
+                                         environment='robinhood', chain_id=466324, market_id=1, market_symbol='BTC')
+    path.write_text(''.join(json.dumps(row) + '\n' for row in rows))
+    saved = load_saved_cycle_report(path.parent)
+    assert nominal_usd(saved['binding']) is supported
+    assert 'SECRET_VALUE' not in json.dumps(saved)
