@@ -1,3 +1,9 @@
+# Cycle-158 delayed maker cleanup — WIP_NOT_ACCEPTED, 2026-09-25
+
+Candidate from published main `0166a29` fixes the single-read cancellation gap after ACK receiver refusal. Historical cycle-158 accepted the closing LIMIT without a venue ID, refused the receiver on a better L2 price, missed the exact source on its immediate read, then stopped with an active order. A later separate read proved that source filled and left the other account short; the historical journal remains unchanged. The correction polls exact source identity within existing time/count bounds, stops on conflicts, reuses freshly validated evidence for one-shot cancellation, and preserves all terminal trade/position and series gates. Both initial publication and disappearance during cancellation recheck are covered. No receiver admission path or numeric policy changes.
+
+Self-review and final isolated suite are pending. Initial 381 focused integration checks passed; 28 new adverse counterexamples fail on the unchanged accepted base and pass on the candidate. Further exact identity, count/deadline and cancellation-propagation checks pass. No runtime change or financial command. Evidence: `spread-shadow-runs/hood-ack-cleanup-20260925/solo-v1/` in the original workspace.
+
 # USD report and executed volume — verified and active, 2026-09-25
 
 Candidate from published main `650570d` adds nominal USD labels for configured Robinhood BTC cycle/series PnL and final executed USD turnover across both accounts. Price-times-quantity uses exact Decimal products/sums. Same-account trade duplicates cannot inflate volume; both sides of a mutual trade count separately. Unknown currencies/history/fields remain unknown, while complete empty histories prove zero. Gross/net fee and funding semantics and pre-cycle exclusions are preserved. No trading engine, risk, settings, persistent-state schema or network changes.

@@ -1673,18 +1673,20 @@ class HandoffEngine:
         if unknown_reasons:
             await self._invalidate_prepared(prepared_receiver)
             # A dispatch can be ambiguous before the first order observation.
-            # Resolve the exact client identity once more so an identified
-            # remaining maker can be cancelled safely; a missing identity is
-            # never guessed and remains UNKNOWN.
+            # ACK may precede publication. Resolve the exact client identity
+            # within the existing observation bounds before abandoning cleanup.
+            # Missing/conflicting evidence never authorizes another mutation.
+            cleanup_just_read = False
             if source_order is None and source_dispatch_attempted:
                 try:
-                    source_order = await self._lookup_order(
+                    source_order = await self._lookup_cleanup_order(
                         plan.source,
                         source_order_id if source_order_id is not None else (
                             source_receipt.order_id if source_receipt is not None else None
                         ),
-                        client_order_index=plan.source.client_order_index,
+                        journal, run_id,
                     )
+                    cleanup_just_read = source_order is not None
                 except Exception as exc:
                     unknown_reasons.append(f"source cancellation lookup unresolved: {sanitize_exception(exc)}")
             if source_order is not None:
@@ -1699,6 +1701,7 @@ class HandoffEngine:
                         if source_order_id is not None
                         else (source_receipt.order_id if source_receipt is not None else None)
                     ),
+                    exact_order_just_read=cleanup_just_read,
                 )
             reconciliation_started = time.perf_counter()
             source_result, receiver_result = await self._reconcile(
@@ -2378,6 +2381,55 @@ class HandoffEngine:
                     await self._sleep(delay)
         return None
 
+    async def _lookup_cleanup_order(
+        self,
+        plan: OrderPlan,
+        order_id: str | None,
+        journal: DurableJournal,
+        run_id: str,
+    ) -> OrderSnapshot | None:
+        """Resolve delayed publication for cleanup, never retrying a mutation."""
+        deadline = time.monotonic() + self._order_timeout
+        clock_deadline = self.clock.now() + self._order_timeout
+        for poll in range(1, self._poll_limit + 1):
+            remaining = min(deadline - time.monotonic(), clock_deadline - self.clock.now())
+            if remaining <= 0:
+                break
+            try:
+                order = await asyncio.wait_for(
+                    self._lookup_order(plan, order_id), timeout=remaining,
+                )
+            except ContractError:
+                raise  # Contradictory identity/parameters cannot heal through a retry.
+            except Exception as exc:
+                journal.append("ORDER_OBSERVATION_ERROR", {
+                    "leg": plan.side, "poll": poll,
+                    "reason": sanitize_exception(exc), "purpose": "source_cleanup",
+                }, run_id=run_id)
+                order = None
+            if order is not None:
+                if not self._order_matches(order, plan) or not order.order_id or (
+                    order_id is not None and order.order_id != str(order_id)
+                ):
+                    raise ContractError("source cleanup order identity/parameters conflict with plan")
+                if self._time_fresh(order.observed_at, self.clock.now(), self._configured_freshness) and (
+                    order.active or order.terminal
+                ):
+                    if poll > 1:
+                        journal.append("ORDER_OBSERVED", {
+                            "account_index": order.account_index, "market_id": order.market_id,
+                            "order_id": order.order_id, "status": order.status,
+                            "filled_quantity": str(order.filled_quantity),
+                            "remaining_quantity": str(order.remaining_quantity),
+                            "observed_at": order.observed_at, "poll": poll,
+                            "purpose": "source_cleanup",
+                        }, run_id=run_id)
+                    return order
+            remaining = min(deadline - time.monotonic(), clock_deadline - self.clock.now())
+            if poll < self._poll_limit and remaining > 0:
+                await self._sleep(min(self._poll_interval, remaining))
+        return None
+
     async def _lookup_order(
         self,
         plan: OrderPlan,
@@ -2822,7 +2874,9 @@ class HandoffEngine:
             # identity and passes that same observation without an intervening
             # await. A second identical REST read adds latency but no stronger
             # ordering guarantee against a concurrent venue fill.
-            current = order if exact_order_just_read else await self._lookup_order(plan, order.order_id)
+            current = order if exact_order_just_read else await self._lookup_cleanup_order(
+                plan, order.order_id, journal, run_id,
+            )
             if (
                 current is None
                 or not self._order_matches(current, plan)

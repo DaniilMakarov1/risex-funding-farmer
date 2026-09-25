@@ -1,3 +1,7 @@
+# Delayed order visibility during cleanup
+
+If an accepted LIMIT is temporarily absent from exact order reads after the receiver is refused, cleanup waits within the existing observation limits instead of abandoning it after one read. A discovered active order is canceled once; a filled order is reconciled and any proved residual uses the existing reduce-only closure. Unknown/conflicting state still stops the series. This cannot guarantee completion during a venue outage and does not resume previously blocked series or send a command at restart.
+
 # USD PnL and executed series volume — 2026-09-25
 
 For the configured Robinhood BTC market, cycle and series PnL are displayed in nominal USD (USDG denomination), without applying or claiming a live USDG/USD conversion. Series totals include executed USD turnover: the sum of actual fill quantity times actual execution price across both configured accounts, including opening, closing and in-cycle residual fills. Each account side counts: a $50 match between our accounts contributes $100 turnover. Unfilled orders contribute nothing, and a repeated account/trade receipt never adds turnover twice.
