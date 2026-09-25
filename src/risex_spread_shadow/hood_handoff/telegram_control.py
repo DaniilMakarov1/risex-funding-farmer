@@ -26,7 +26,7 @@ import aiohttp
 
 from .keychain import MacOSKeychainBackend, read_hidden_secret
 from .offline_report import load_saved_cycle_report
-from .operator_view import read_lifecycle, read_execution_notices, read_launch_failure
+from .operator_view import amount, read_lifecycle, read_execution_notices, read_launch_failure
 from .operator_control import exclusive_lock
 from . import telegram_messages as views
 
@@ -199,6 +199,7 @@ class Controller:
         self._series_sleep = series_sleep or asyncio.sleep
         self._series_delay = series_delay or (lambda: random.SystemRandom().randint(5, 30))
         self._series_pause = None
+        self._pending_card = None
         self.now = now
         self.started = now()
         self.task = None
@@ -455,6 +456,9 @@ class Controller:
     async def _deliver_notices(self):
         while not self._notice_queue.empty():
             message = self._notice_queue.get_nowait()
+            if isinstance(message, dict) and message.get('kind') == 'cycle':
+                await self._deliver_notice(await asyncio.to_thread(self.render_cycle_card, message))
+                continue
             if isinstance(message, dict):
                 from .telegram_series_report import report_pages
                 pages = report_pages(message, self.report)
@@ -473,10 +477,31 @@ class Controller:
         except asyncio.TimeoutError:
             print('Telegram progress delivery timed out; trading continues.', file=sys.stderr, flush=True)
 
-    def cycle_notice(self, message):
+    def cycle_notice(self, message, icon='⏳'):
         active = self.store.data.get('active') or {}
         index, total = active.get('series_index', 1), active.get('series_total', 1)
-        return f'<b>Цикл {index}/{total}</b> · команда {active.get("update_id", "?")} · ' + message
+        title = f'Цикл {index}/{total}' if total != 1 else 'Цикл'
+        return f'{icon} <b>{title}</b> · ' + message
+
+    def render_cycle_card(self, card):
+        """Worker-thread rendering of one finished cycle; display only, never raises."""
+        from .telegram_cards import cycle_card
+        name = card.get('name')
+        try:
+            slot = self.operator / name if isinstance(name, str) and re.fullmatch(r'cycle-[0-9]+', name) else None
+            code = read_launch_failure(slot) if slot is not None else None
+            if code is not None:
+                return views.launch_failure_message(name, code)
+            return cycle_card(card, self.report(name), None if slot is None or slot.is_symlink() else slot)
+        except Exception:
+            return cycle_card(card, None)
+
+    def _flush_card(self, pause=None):
+        card, self._pending_card = self._pending_card, None
+        if card is not None:
+            if pause is not None:
+                card['pause'] = pause
+            self.queue_notice(card)
 
     async def lifecycle_notices(self):
         """Finite stage and per-attempt execution notices, outside the child."""
@@ -496,30 +521,40 @@ class Controller:
                 if len(added) == 1:
                     path = self.operator / added[0] / 'cycle.jsonl'
                     progress = await asyncio.to_thread(read_lifecycle, path)
-                    for key, notice in await asyncio.to_thread(read_execution_notices, path):
-                        if key not in sent:
+                    # Routine progress is summarized by one card after the
+                    # cycle; only rare events are pushed while it runs.
+                    for key, _ in await asyncio.to_thread(read_execution_notices, path):
+                        if key.endswith('-limited') and key not in sent:
                             sent.add(key)
-                            self.queue_notice(self.cycle_notice(views.execution_message(notice)))
+                            phase = 'открытие' if key.startswith('opening') else 'закрытие'
+                            self.queue_notice(self.cycle_notice(
+                                f'{phase}: биржа временно ограничила чтение (HTTP 429). '
+                                'Жду и перепроверяю; ордера не повторяются.', '⚠️'))
                     for resized in (progress or {}).get('size_updates', []):
                         key = f'size-{resized.get("attempt")}'
                         if key not in sent:
                             sent.add(key)
                             self.queue_notice(self.cycle_notice(
-                                f'Пересчитал объём по свежей марже: {views.amount(resized.get("old_quantity"))} → '
-                                f'{views.amount(resized.get("new_quantity"))}. Проверяю перед открытием.'))
+                                f'объём уменьшен по свежей марже: {views.text(amount(resized.get("old_quantity")), 24)} → '
+                                f'{views.text(amount(resized.get("new_quantity")), 24)} BTC; проверяю перед открытием.', '↘️'))
                     stage = progress.get('stage') if progress else None
-                    if stage in {'SPREAD_WAIT', 'HOLD', 'CLOSING', 'RECOVERY'} and stage not in sent:
+                    alerts = {'SPREAD_WAIT': ('⏳', 'жду спред под заданный отступ цены; ордера ещё не отправлены.'),
+                              'RECOVERY': ('🛠', 'пара закрылась не полностью — закрываю остаток reduce-only.')}
+                    if stage in alerts and stage not in sent:
                         sent.add(stage)
                         # Slow/unavailable delivery cannot hold up the child.
-                        self.queue_notice(self.cycle_notice(views.running_message(added, progress)))
+                        self.queue_notice(self.cycle_notice(alerts[stage][1], alerts[stage][0]))
             except (Exception, asyncio.TimeoutError):
                 pass
             await asyncio.sleep(0.5)
 
     async def run_one(self, action='run'):
         total = (self.store.data.get('active') or {}).get('series_total', 1)
+        carded = False
+        self._pending_card = None
         try:
             for step in range(1, total + 1):
+                carded = False
                 if step > 1:
                     await self._prepare_next_series_step()
                 notices = asyncio.create_task(self.lifecycle_notices())
@@ -527,21 +562,28 @@ class Controller:
                     options = (self.store.data.get('active') or {}).get('launch_options', {})
                     if action == 'run' and (self.store.data.get('active') or {}).get('phase') == 'AUTO_CLOSE':
                         await self._close_before_run()
-                    self.queue_notice(self.cycle_notice('Начинаю подготовку и открытие.') if action == 'run'
-                                      else '<b>Закрытие</b> · Проверяю остатки; ордера только reduce-only.')
+                    if action == 'close':
+                        self.queue_notice('<b>Закрытие</b> · Проверяю остатки; ордера только reduce-only.')
                     await (self.close() if action == 'close' else self.launch(**options))
-                    label = self.cycle_notice('')
+                    before = set((self.store.data.get('active') or {}).get('before', []))
                     safe = self.finish(retain_active=step < total)
-                    if action == 'run':
-                        self.queue_notice(label + ('Завершён: нулевые позиции подтверждены. '
-                            + ('Далее проверка следующего цикла.' if step < total else 'Это последний цикл; серия закончена.')
-                            if safe else 'Остановлен: безопасное завершение не подтверждено. Продолжения серии нет.'))
+                    name = (self.store.data.get('last') or {}).get('cycle')
+                    if (action == 'run' and isinstance(name, str) and name.startswith('cycle-')
+                            and name not in before):
+                        # One card per newly created cycle slot; a following
+                        # pause is added when drawn, without delaying the series.
+                        self._pending_card = {'kind': 'cycle', 'name': name, 'index': step,
+                                              'total': total, 'safe': safe, 'pause': None}
+                        carded = True
+                        if not (safe and step < total):
+                            self._flush_card()
                 finally:
                     notices.cancel()
                     await asyncio.gather(notices, return_exceptions=True)
                 if step < total and not safe:
                     break
         except Exception:
+            self._flush_card()
             active = self.store.data.get('active') or {}
             close_before = active.get('auto_close_before') if active.get('phase') == 'AUTO_CLOSE' else None
             close_added = (sorted(set(self.slots('close')) - set(close_before))
@@ -559,8 +601,9 @@ class Controller:
                                                 'series_completed': active['series_index'] - 1,
                                                 **self._series_membership(active)})
             self.store.save()  # Keep durable active intent; never automatically retry.
+        self._flush_card()
         self._runner_finished = True
-        if not self.queue_series_report():
+        if not self.queue_series_report() and not carded:
             self.queue_notice(self.summary_after_task())
 
     async def _prepare_next_series_step(self):
@@ -575,14 +618,13 @@ class Controller:
         if not integer(delay) or not 5 <= delay <= 30:
             raise RuntimeError('invalid inter-cycle delay')
         self._series_pause = delay
-        self.queue_notice(self.cycle_notice(f'Пауза перед следующим циклом: {delay} сек.'))
+        self._flush_card(pause=delay)
         try:
             await self._series_sleep(delay)
         finally:
             self._series_pause = None
         if self.recovery is None:
             raise RuntimeError('series recovery is unavailable')
-        self.queue_notice(self.cycle_notice('Проверяю позиции и старые ордера перед следующим открытием.'))
         proof = await self.recovery(require_flat=False)
         if not isinstance(proof, dict) or proof.get('status') != 'CLOSE_READY':
             raise RuntimeError('next cycle close readiness is unproved')
@@ -632,7 +674,7 @@ class Controller:
         """One saved /run may close once; never advance on a missing terminal or read."""
         active = self.store.data['active']
         before = set(active['auto_close_before'])
-        self.queue_notice(self.cycle_notice('Перед открытием закрываю существующий остаток reduce-only.'))
+        self.queue_notice(self.cycle_notice('перед открытием закрываю старый остаток reduce-only.', '🛠'))
         await self.close()
         added = sorted(set(self.slots('close')) - before)
         if len(added) != 1:
@@ -802,13 +844,12 @@ class Controller:
                 selected = json.loads(self.config.read_text())
                 selected.update(launch_options)
                 mode = selected.get('receiver_admission', 'strict')
-                ticks = selected.get('price_improvement_ticks', '1 (старое правило)')
-                details = f"\nРежим: {mode}; улучшение цены: {ticks} тиков."
-                if mode == 'ack':
-                    details += " MARKET без ожидания WS лимитки; её наличие не подтверждено. Проверка стакана сохранена."
+                ticks = selected.get('price_improvement_ticks')
+                details = {'ack': 'ACK', 'ws_confirmed': 'WS'}.get(mode, views.text(mode, 24))
+                details += f' · +{views.text(ticks, 8)} тик' if ticks is not None else ' · старое правило цены'
             except Exception:
-                details = ''
-            await self.notify((views.accepted_message(uid, series_total) + details)
+                details = None
+            await self.notify(views.accepted_message(uid, series_total, details)
                               if command == '/run' else views.close_accepted_message(uid))
         elif isinstance(command, str):
             await self.notify(views.unknown_message())

@@ -56,15 +56,13 @@ def startup_message():
             '<i>Подключение бота само по себе не запускает торговлю.</i>')
 
 
-def accepted_message(number, series_total=1):
-    request = (f'Запрошена серия из {series_total} последовательных реальных циклов. '
-               if series_total > 1 else 'Запрошены проверка позиций и один реальный цикл. ')
-    return (f'<b>📨 Команда принята</b> · <code>{text(number, 24)}</code>\n'
-            + request + 'При доказанном остатке сначала выполнится '
-            'одно закрытие; цикл начнётся только после подтверждения нулевых позиций. '
-            'Каждый следующий цикл требует новой проверки. Это ещё не подтверждение отправки '
-            'или исполнения ордеров.\n\n'
-            'Ход работы: /status · Итог: /report')
+def accepted_message(number, series_total=1, details=None):
+    request = f'серия из {series_total} циклов' if series_total > 1 else 'один цикл'
+    mode = f' · {details}' if details else ''
+    return (f'📨 <b>Принято: {request}</b>{mode}\n'
+            'Перед каждым циклом проверю нулевые позиции и старые ордера; при остатке сначала закрою его reduce-only. '
+            'После каждого цикла — короткая карточка, в конце серии — итог.\n'
+            f'<i>Это ещё не исполнение ордеров.</i> Команда <code>{text(number, 24)}</code> · /status — ход работы')
 
 
 def close_accepted_message(number):

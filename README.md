@@ -1,3 +1,7 @@
+## Telegram messages: one card per cycle
+
+A series now produces: one short acceptance, one card after each cycle and one final summary. The card shows the result (✅ paired, 🟡 closed but pair incomplete, ⛔ needs checking), BTC size and two-account turnover in USD, whether each phase was filled between our own accounts (🤝), by external accounts (👥, with their IDs) or mixed (🔀), LIMIT→MARKET time, how long preparation/hold/closing took, PnL and fees, and the pause before the next cycle. Robinhood trade receipts currently carry no fee, so the card shows an upper estimate from the published tariff (maker 0.012%, taker 0.035%) clearly marked as an estimate; PnL stays before fees until the exchange reports actual fees. During a cycle only rare events are pushed: waiting for spread, HTTP 429 cooldown, size reduction, residual closure. Use `/status` for live progress and `/report` for details; both are unchanged. Messages are rendered by the controller in the background and add no work to order sending.
+
 ## Why /run was refused after 16:57 on 2026-09-25, and what changed
 
 The shared check log `recovery-checks.jsonl` outgrew a 32 MiB safety limit, so every `/run` stopped at the READY check (Telegram: PREFLIGHT_REFUSED); `/close` still worked. The shared log now has its own larger finite limit and each check writes a short record (count + hash of inspected journals) instead of every file hash. If a history limit is ever reached again, Telegram shows HISTORY_LIMIT instead of a generic refusal; repeating `/run` will not help.

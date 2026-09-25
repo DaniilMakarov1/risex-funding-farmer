@@ -355,7 +355,8 @@ async def test_slow_cycle_notices_do_not_gate_next_cycle_or_final_state(tmp_path
     async def launch(**options):
         calls.append(len(calls) + 1)
         cycle_slot(tmp_path, calls[-1])
-        if len(calls) == 1:
+        if len(calls) == 2:
+            # The first cycle's card is stuck in delivery; the next cycle runs anyway.
             await asyncio.wait_for(entered.wait(), 1)
     c = setup(tmp_path, launch, Slow())
     c.recovery = recover
@@ -385,10 +386,15 @@ async def test_series_notices_identify_each_transition_and_end(tmp_path):
     await c.handle(update(text='/run 2'))
     await c.task
     await c._notice_task
-    text = '\n'.join(m for _, m in c.transport.messages)
-    assert 'Цикл 1/2' in text and 'Цикл 2/2' in text
-    assert text.index('Далее проверка следующего цикла') < text.index('перед следующим открытием')
-    assert 'Это последний цикл; серия закончена' in text
+    messages = [m for _, m in c.transport.messages]
+    # Accepted, one card per cycle and one final summary: no routine progress.
+    assert len(messages) == 4
+    assert 'Принято: серия из 2 циклов' in messages[0]
+    assert '<b>Цикл 1/2</b> · <code>cycle-001</code>' in messages[1]
+    assert 'Следующий цикл через' in messages[1]
+    assert '<b>Цикл 2/2</b> · <code>cycle-002</code>' in messages[2]
+    assert 'Следующий цикл через' not in messages[2]
+    assert 'Серия завершена: 2/2' in messages[3] and 'Итого' in messages[3]
 
 
 async def test_notice_queue_is_bounded_and_drops_old_progress(tmp_path):

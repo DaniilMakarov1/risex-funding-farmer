@@ -74,12 +74,21 @@ def test_trailing_write_is_tolerated_but_closing_shows_opening_positions_as_hist
     assert view.amount('1e10000000') == '1E+10000000'
 
 
+def spread_then_hold():
+    """A spread wait observed first, then the proved opening and hold."""
+    values = rows()
+    values.insert(1, {'event': 'INITIAL_SPREAD_WAIT', 'payload': {}})
+    for i, row in enumerate(values, 1):
+        row.update(sequence=i, run_id='test-cycle', at=1790098680 + i - 1)
+    return values
+
+
 @pytest.mark.asyncio
 async def test_slow_progress_delivery_cannot_delay_child_completion_or_replay(tmp_path):
     notified, child_done = asyncio.Event(), asyncio.Event()
     class Slow(Transport):
         async def send(self, owner, text):
-            if 'Позиции открыты между нашими счетами' in text:
+            if 'жду спред' in text:
                 notified.set()
                 await asyncio.Event().wait()
             await super().send(owner, text)
@@ -88,7 +97,7 @@ async def test_slow_progress_delivery_cannot_delay_child_completion_or_replay(tm
         calls.append(True)
         cycle = tmp_path/'cycle-001'
         cycle.mkdir()
-        write(cycle/'cycle.jsonl', rows())
+        write(cycle/'cycle.jsonl', spread_then_hold()[:2])
         await asyncio.wait_for(notified.wait(), 2)
         child_done.set()
     c = setup(tmp_path, launch, Slow())
@@ -106,22 +115,26 @@ async def test_one_notice_per_stage_and_live_status_uses_same_observations(tmp_p
     class Notify(Transport):
         async def send(self, owner, text):
             await super().send(owner, text)
-            if 'Позиции открыты между нашими счетами' in text: received.set()
+            if 'жду спред' in text: received.set()
     release = asyncio.Event()
     async def launch():
         cycle = tmp_path/'cycle-001'
         cycle.mkdir()
-        write(cycle/'cycle.jsonl', rows())
+        write(cycle/'cycle.jsonl', spread_then_hold()[:2])
+        await asyncio.wait_for(received.wait(), 2)
+        write(cycle/'cycle.jsonl', spread_then_hold())
         await release.wait()
     c = setup(tmp_path, launch, Notify())
     await c.handle(update())
     await asyncio.wait_for(received.wait(), 2)
-    assert '56 с' in c.summary()
     await asyncio.sleep(0.6)
+    assert '56 с' in c.summary()  # /status still shows the live hold on demand.
     release.set()
     await c.task
-    notices = [text for _,text in c.transport.messages if 'Позиции открыты между нашими счетами' in text]
-    assert len(notices) == 1
+    sent = [text for _, text in c.transport.messages]
+    assert len([text for text in sent if 'жду спред' in text]) == 1
+    # Routine hold progress is no longer pushed; it is summarized by the card.
+    assert not any('Позиции открыты между нашими счетами' in text for text in sent)
 
 
 def test_idle_report_includes_new_local_cycle_without_changing_controller_barriers(tmp_path):

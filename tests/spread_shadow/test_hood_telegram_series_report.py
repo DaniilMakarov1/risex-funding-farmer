@@ -19,7 +19,7 @@ def report(gross='0.03', net='0.02'):
                         'source_account_index': 11, 'receiver_account_index': 22},
             'inventory': {'status': 'CONFIRMED_FLAT'},
             'order_state': {'unresolved_intents': [], 'unresolved_observed_orders': []},
-            'paired_execution': {'direct_counterparty_match': [
+            'paired_execution': {'status': 'SUCCESS', 'direct_counterparty_match': [
                 {'phase': phase, 'status': 'MATCHED', 'matched_quantity': '0.001',
                  'external_source_quantity': '0', 'external_receiver_quantity': '0',
                  'unproved_source_quantity': '0', 'unproved_receiver_quantity': '0',
@@ -42,18 +42,21 @@ def render(records, **changes):
 def test_exact_negative_positive_and_zero_pnl_no_account_double_count():
     result = render({'cycle-001': report('0.03', '0.02'),
                      'cycle-002': report('-0.07', '-0.09'), 'cycle-003': report('0', '0')})
-    assert 'До комиссий: -0.04' in result
-    assert 'После комиссий: -0.07' in result
-    assert result.count('открытие — парное; закрытие — парное') == 3
-    assert 'Фандинг не включён' in result
+    assert 'PnL до комиссий: −0.0400 $' in result
+    assert 'PnL после комиссий: −0.0700 $' in result
+    assert 'Комиссии: 0.0300 $' in result
+    assert result.count('🤝/🤝') == 3
+    assert 'Циклы: ✅ 3 · 🟡 0 · ⛔ 0' in result
+    assert 'фандинг не включён' in result
     assert add_exact(Decimal('123456789012345678901234567890'), Decimal('0.00000001')) == Decimal('123456789012345678901234567890.00000001')
 
 
 def test_missing_fee_preserves_gross_but_never_fabricates_net():
     result = render({'cycle-001': report('0.03', '0.02'), 'cycle-002': report('-0.07', None)})
-    assert 'До комиссий: -0.04' in result
-    assert 'После комиссий: неизвестен' in result
-    assert 'Известная часть после комиссий (1/2): 0.02' in result
+    assert 'PnL до комиссий: −0.0400 $' in result
+    assert 'PnL после комиссий: неизвестен' in result
+    assert 'Известная часть после комиссий (1/2): +0.0200 $' in result
+    assert 'Комиссии: неизвестны' in result
 
 
 @pytest.mark.parametrize('bad', ['missing', 'incomplete', 'nonflat', 'unresolved', 'foreign_market', 'nan'])
@@ -66,8 +69,10 @@ def test_bad_cycle_never_becomes_zero_or_valid_total(bad):
     elif bad == 'foreign_market': second['binding']['market_id'] = 2
     elif bad == 'nan': second['economics']['closed_execution_pnl']['gross'] = 'NaN'
     result = render({'cycle-001': report(), 'cycle-002': second})
-    assert 'До комиссий: неизвестен' in result and 'После комиссий: неизвестен' in result
-    assert 'Известная часть до комиссий (1/2): 0.03' in result
+    assert 'PnL до комиссий: неизвестен' in result and 'PnL после комиссий: неизвестен' in result
+    assert 'Известная часть до комиссий (1/2): +0.0300 $' in result
+    # A NaN PnL in a flat paired cycle leaves only the value unknown.
+    assert ('Циклы: ✅ 2 · 🟡 0 · ⛔ 0' if bad == 'nan' else 'Циклы: ✅ 1 · 🟡 0 · ⛔ 1') in result
 
 
 def test_external_mixed_unknown_unattempted_and_residual_labels():
@@ -79,10 +84,10 @@ def test_external_mixed_unknown_unattempted_and_residual_labels():
     empty['paired_execution']['direct_counterparty_match'][1]['status'] = 'NOT_ATTEMPTED'
     external['confirmed_fills'] = [{'phase': 'fallback', 'counterparty_account_index': 39}]
     result = render({'cycle-001': external, 'cycle-002': mixed, 'cycle-003': empty})
-    assert 'открытие — внешние участники' in result
-    assert 'закрытие — смешанное: свои + внешние; есть неизвестное' in result
-    assert 'открытие — без исполнений; закрытие — не выполнялось' in result
-    assert 'остаток: внешние участники' in result
+    assert '1. cycle-001 · 👥/🤝 🛠 ·' in result
+    assert '2. cycle-002 · 🤝/🔀 ·' in result
+    assert '3. cycle-003 · ∅/— ·' in result
+    assert result.count('🛠') == 2  # the residual row plus the legend
 
 
 def test_large_report_paginates_all_cycles_and_has_one_total():
@@ -91,16 +96,16 @@ def test_large_report_paginates_all_cycles_and_has_one_total():
     assert len(pages) > 1
     assert all(len(page.encode('utf-16-le')) // 2 <= 3500 for page in pages)
     full = '\n'.join(valid(p) for p in pages)
-    assert all(full.count(name + ':') == 1 for name in names)
-    assert full.count('Общий PnL') == 1
-    assert 'До комиссий: 21' in full and 'После комиссий: 14' in full
+    assert all(full.count(f'{n}. {name} ·') == 1 for n, name in enumerate(names, 1))
+    assert full.count('Итого') == 1
+    assert 'PnL до комиссий: +21.00 $' in full and 'PnL после комиссий: +14.00 $' in full
 
 
 def test_restart_legacy_membership_and_duplicate_protection():
     legacy = list(report_pages({'series_total': 6, 'series_completed': 6, 'status': 'FINISHED'}, lambda _: pytest.fail('must not invent membership')))
     assert 'не сохранён' in legacy[0]
     duplicate = '\n'.join(report_pages(state(['cycle-001', 'cycle-001']), lambda _: report()))
-    assert 'После комиссий: неизвестен' in duplicate
+    assert 'PnL после комиссий: неизвестен' in duplicate
 
 
 @pytest.mark.parametrize('command', ['/run 6', '/run ack 1 12', '/run ws 5 10'])
@@ -127,7 +132,7 @@ async def test_more_than_five_cycles_persist_membership_and_recover_report(tmp_p
     await reloaded.handle(update(2, '/report'))
     await reloaded._notice_task
     output = '\n'.join(text for _, text in reloaded.transport.messages)
-    assert 'Общий PnL' in output
+    assert 'Итого' in output
     assert all(name in output for name in c.store.data['last']['series_slots'])
 
 
@@ -154,8 +159,8 @@ async def test_report_pages_do_not_fill_lossy_queue(tmp_path):
     assert c._notice_queue.qsize() == 1
     await c._notice_task
     combined = '\n'.join(m for _, m in c.transport.messages)
-    assert 'cycle-5000:' in combined
-    assert 'После комиссий: 100' in combined
+    assert '5000. <code>cycle-5000</code>' in combined
+    assert 'PnL после комиссий: <b>+100.00 $</b>' in combined
 
 
 async def test_incomplete_step_stops_large_series_and_keeps_both_results(tmp_path):
@@ -176,7 +181,7 @@ async def test_incomplete_step_stops_large_series_and_keeps_both_results(tmp_pat
     assert c.store.data['active'] is not None
     output = '\n'.join(m for _, m in c.transport.messages)
     assert 'Серия остановлена: 1/20' in output
-    assert 'После комиссий: неизвестен' in output
+    assert 'PnL после комиссий: неизвестен' in output
     reloaded = setup(tmp_path, launch)
     reloaded.finish()
     assert reloaded.store.data['last']['series_slots'] == ['cycle-001', 'cycle-002']
@@ -208,13 +213,13 @@ async def test_final_report_snapshot_survives_new_command_state(tmp_path):
     c.store.data['last']['series_slots'].clear()
     c.store.data['last'] = None
     await c._notice_task
-    assert 'cycle-002:' in '\n'.join(m for _, m in c.transport.messages)
+    assert '<code>cycle-002</code>' in '\n'.join(m for _, m in c.transport.messages)
 
 
 def test_precycle_close_exclusion_is_explicit_and_does_not_invent_entry_pnl():
     result = render({'cycle-001': report()}, series_precloses=['close-001'])
     assert 'Предварительные закрытия старых позиций исключены' in result
-    assert 'После комиссий: 0.02' in result
+    assert 'PnL после комиссий: +0.0200 $' in result
 
 
 @pytest.mark.parametrize('command', ['/run 0006', '/run 6.5', '/run -20', '/run ack 1 +10', '/run ' + '9' * 4096])
@@ -242,16 +247,20 @@ def test_usd_pnl_and_total_two_account_open_close_external_and_residual_volume()
                                  fill(11, 'residual-close', '0.0002', '50200', 'SELL', 'fallback')]
     result = render({'cycle-001': first, 'cycle-002': second})
     # 50 + 50 + 50.1 + 50.1 + 10 + 10.04, account receipts counted once.
-    assert 'Исполненный объём обоих счетов: 220.24 USD' in result
-    assert 'До комиссий: -0.04 USD' in result
-    assert 'После комиссий: неизвестен' in result
-    assert 'PnL: 0.02 USD' in result
-    assert 'USD по номиналу USDG' in result
+    assert 'Оборот обоих счетов: 220.24 $' in result
+    assert 'PnL до комиссий: −0.0400 $' in result
+    assert 'PnL после комиссий: неизвестен' in result
+    assert '1. cycle-001 · 🤝/🤝 · +0.0200 $' in result
+    assert '2. cycle-002 · 🤝/🤝 🛠 · −0.0700 $ до ком.' in result
+    assert 'USD — номинал USDG' in result
+    # Receipts carry no fee: only a labelled cap estimate, never a net value.
+    # 0.001*50000*0.00035*2 + 0.001*50100*0.00035*2 + 0.0002*(50000+50200)*0.00035
+    assert 'Комиссии: биржа не прислала · оценка по тарифу ≤ 0.0771 $' in result
 
 
 def test_proved_empty_fills_have_zero_turnover():
     result = render({'cycle-001': report('0', '0')})
-    assert 'Исполненный объём обоих счетов: 0 USD' in result
+    assert 'Оборот обоих счетов: 0 $' in result
 
 
 @pytest.mark.parametrize('bad', ['missing', 'incomplete', 'unknown_order', 'bad_quantity', 'bad_price',
@@ -270,23 +279,23 @@ def test_unproved_volume_never_becomes_complete_total(bad):
     else:
         r['confirmed_fills'].append(copy.deepcopy(r['confirmed_fills'][0]))
         if bad == 'conflict': r['confirmed_fills'][1]['price'] = '50001'
-    assert 'Исполненный объём обоих счетов: неизвестен' in render({'cycle-001': r})
+    assert 'Оборот обоих счетов: неизвестен' in render({'cycle-001': r})
 
 
 def test_duplicate_account_receipt_across_cycles_is_not_added_twice():
     first, second = report(), report()
     first['confirmed_fills'] = second['confirmed_fills'] = [fill(11, 'same', '0.001', '50000')]
     result = render({'cycle-001': first, 'cycle-002': second})
-    assert 'Исполненный объём обоих счетов: неизвестен' in result
-    assert 'Подтверждённая часть объёма (1/2): 50 USD' in result
+    assert 'Оборот обоих счетов: неизвестен' in result
+    assert 'Подтверждённая часть оборота (1/2): 50.00 $' in result
 
 
 def test_incomplete_series_reports_known_turnover_subtotal():
     r = report()
     r['confirmed_fills'] = [fill(11, 'known', '0.001', '50000')]
     result = render({'cycle-001': r, 'cycle-002': None}, status='BLOCKED', series_completed=1)
-    assert 'Исполненный объём обоих счетов: неизвестен' in result
-    assert 'Подтверждённая часть объёма (1/2): 50 USD' in result
+    assert 'Оборот обоих счетов: неизвестен' in result
+    assert 'Подтверждённая часть оборота (1/2): 50.00 $' in result
 
 
 @pytest.mark.parametrize('field,value', [('api_base_url','https://other.invalid'), ('environment','mainnet'),
@@ -296,9 +305,10 @@ def test_foreign_denomination_is_not_relabelled_usd(field, value):
     r['binding'][field] = value
     r['confirmed_fills'] = [fill(11, '1', '0.001', '50000')]
     result = render({'cycle-001': r})
-    assert 'До комиссий: неизвестен' in result
-    assert 'После комиссий: неизвестен' in result
-    assert 'Исполненный объём обоих счетов: неизвестен' in result
+    assert 'PnL до комиссий: неизвестен' in result
+    assert 'PnL после комиссий: неизвестен' in result
+    assert 'Оборот обоих счетов: неизвестен' in result
+    assert 'оценка по тарифу' not in result
 
 
 def test_turnover_product_preserves_low_order_digits():
