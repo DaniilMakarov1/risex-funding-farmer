@@ -208,3 +208,25 @@ def accounts_message(result):
               'Снимки получены отдельно и могут измениться; другие рынки не проверены. '
               'Проверка не снимает блокировку запуска.</i>', '/accounts — обновить · /help — команды']
     return '\n'.join(lines)
+
+
+def admission_refusal_message(record):
+    if not isinstance(record, dict) or record.get('status') != 'REFUSED':
+        return ''
+    stages = {'VALIDATION': 'проверка команды', 'CLOSE_READY': 'сверка старых заявок и позиций',
+              'READY': 'подтверждение готовности к открытию', 'PERSISTENCE': 'сохранение команды'}
+    reasons = {'POSITIONS_REMAIN': 'Есть открытые позиции. /close — проверить и закрыть остаток.',
+               'OPERATOR_BUSY': 'Другая операция удерживает блокировку.',
+               'READ_TIMEOUT': 'Истекло время чтения данных.',
+               'READ_CONNECTION': 'Не удалось получить данные по соединению.',
+               'PREFLIGHT_REFUSED': 'Проверка безопасности не подтвердила готовность.',
+               'CHECK_FAILED': 'Проверка не завершилась; требуется повторная сверка.'}
+    stage = record.get('stage') if isinstance(record.get('stage'), str) else None
+    category = record.get('category') if isinstance(record.get('category'), str) else 'CHECK_FAILED'
+    return ('<b>Новая операция пока не начата</b>\nКоманда принята, но запуск не состоялся.\n'
+            + 'Команда: ' + text(record.get('update_id'), 24) + ' · ' + timestamp(record.get('at')) + '\n'
+            + 'Этап: ' + stages.get(stage, 'проверка готовности') + '.\n'
+            + reasons.get(category, reasons['CHECK_FAILED']) + '\n'
+            + 'Код: ' + text(category, 32) + '.\n'
+            + 'По этой команде торговый цикл не запущен. Старая команда не повторяется. '
+              'Новая /run заново проверит готовность; /accounts — текущие позиции.')

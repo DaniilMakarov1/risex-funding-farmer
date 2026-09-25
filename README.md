@@ -1,3 +1,7 @@
+# Accepted command but no new cycle
+
+If readiness refuses a command, /status now shows the rejected command ID, check stage, time and safe failure category even when the original Telegram reply was not delivered or the controller restarted. Acceptance means the command was received, not that an order was sent. A fresh /run performs new checks; a consumed command is never replayed. Detailed historic series results remain available through /report. Transport diagnostics deliberately omit tokens, request URLs and response bodies.
+
 # Waiting for room inside the spread
 
 With an explicit tick offset, a temporarily narrow spread now triggers bounded initial waiting instead of an immediate one-snapshot refusal. Telegram may show that the system is waiting for a spread that fits the requested price offset; orders have not yet been sent. Current production bounds are 20 seconds after the first no-room observation and at most 40 total observations, with fresh validation on each. If the market never permits that price or another check fails, the series still stops. The offset is never silently reduced and a stopped series is never replayed automatically.

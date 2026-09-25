@@ -128,6 +128,27 @@ class Store:
             os.close(directory_fd)
 
 
+class TelegramFailure(RuntimeError):
+    def __init__(self, category):
+        self.category = category
+        super().__init__('Telegram transport unavailable')
+
+
+def admission_failure_category(exc):
+    from .contracts import PreflightBlocked
+    if isinstance(exc, BlockingIOError):
+        return 'OPERATOR_BUSY'
+    if isinstance(exc, TimeoutError):
+        return 'READ_TIMEOUT'
+    if isinstance(exc, aiohttp.ClientConnectionError):
+        return 'READ_CONNECTION'
+    if isinstance(exc, PreflightBlocked):
+        if str(exc) == 'positions remain; use /close before /run':
+            return 'POSITIONS_REMAIN'
+        return 'PREFLIGHT_REFUSED'
+    return 'CHECK_FAILED'
+
+
 class Telegram:
     def __init__(self, session, token):
         self.session = session
@@ -141,11 +162,13 @@ class Telegram:
                                          json=payload, allow_redirects=False) as response:
                 value = await response.json()
                 if response.status != 200 or not isinstance(value, dict) or value.get('ok') is not True:
-                    raise RuntimeError('Telegram request failed')
+                    raise TelegramFailure(f'HTTP_{response.status}' if type(response.status) is int and 100 <= response.status <= 599 else 'INVALID_RESPONSE')
                 return value['result']
-        except (Exception, asyncio.TimeoutError):
+        except TelegramFailure:
+            raise
+        except (Exception, asyncio.TimeoutError) as exc:
             # aiohttp exception strings can include the credential-bearing URL.
-            raise RuntimeError('Telegram transport unavailable') from None
+            raise TelegramFailure('TIMEOUT' if isinstance(exc, TimeoutError) else 'CONNECTION_FAILED') from None
 
     async def send(self, owner, text):
         # Never cut HTML inside an entity or tag. Views bound dynamic fields;
@@ -358,6 +381,9 @@ class Controller:
         if self._checking:
             return '<b>Проверяю текущие позиции и старые ордера</b>\nНовая операция ещё не отправлялась.'
         active = self.store.data['active']
+        refusal = views.admission_refusal_message(self.store.data.get('last_admission'))
+        if refusal:
+            return refusal
         prefix = self._series_prefix()
         # finish() clears active before awaiting final notification; the task
         # can still be alive during that await. It is no longer a running cycle.
@@ -399,9 +425,13 @@ class Controller:
     async def notify(self, text):
         try:
             await self.transport.send(self.owner, text)
-        except Exception:
-            # Never print exception text: a transport URL can contain the token.
-            print('Telegram notification delivery failed; command will not be replayed.', file=sys.stderr, flush=True)
+        except Exception as exc:
+            # Only a fixed category, never URLs, response bodies or exception text.
+            category = exc.category if isinstance(exc, TelegramFailure) else 'UNCLASSIFIED'
+            if not re.fullmatch(r'HTTP_[1-5][0-9]{2}|INVALID_RESPONSE|TIMEOUT|CONNECTION_FAILED', category):
+                category = 'UNCLASSIFIED'
+            print('Telegram notification delivery failed; command will not be replayed. category=' + category,
+                  file=sys.stderr, flush=True)
 
     def queue_notice(self, message):
         """Bounded best-effort display only; never awaited by cycle sequencing."""
@@ -609,7 +639,10 @@ class Controller:
 
     async def admit(self, action, uid, launch_options=None, series_total=1):
         self._checking = True
+        stage = 'VALIDATION'
         try:
+            self.store.data['last_admission'] = None
+            self.store.save()
             auto_close_before = None
             if (not integer(series_total) or series_total < 1
                     or action != 'run' and series_total != 1):
@@ -618,21 +651,25 @@ class Controller:
                 raise RuntimeError('series recovery or close is unavailable')
             if self.recovery is not None:
                 if action == 'run' and self.close is not None:
+                    stage = 'CLOSE_READY'
                     proof = await self.recovery(require_flat=False)
                     if not isinstance(proof, dict) or proof.get('status') != 'CLOSE_READY':
                         raise RuntimeError('pre-cycle close readiness is unproved')
                     positions = self._exact_recovery_positions(proof)
                     if all(position == 0 for position in positions):
+                        stage = 'READY'
                         await self.reconcile_idle(require_flat=True)
                     else:
                         auto_close_before = self.slots('close')
                         self.store.data['last_recovery'] = {
                             k: proof.get(k) for k in ('status', 'at', 'previous_intents')}
                 else:
+                    stage = 'READY' if action == 'run' else 'CLOSE_READY'
                     await self.reconcile_idle(require_flat=action == 'run')
             elif self.store.data['active'] is not None:
                 await self.notify(views.blocked_message())
                 return
+            stage = 'PERSISTENCE'
             self.store.data['active'] = {'before': self.slots(action), 'update_id': uid, 'action': action}
             if action == 'run' and series_total > 1:
                 self.store.data['active'].update({'series_total': series_total, 'series_index': 1,
@@ -644,9 +681,15 @@ class Controller:
                 self.store.data['active']['launch_options'] = dict(launch_options)
             self.store.save()
         except Exception as exc:
-            from .contracts import PreflightBlocked
-            reason = str(exc) if isinstance(exc, PreflightBlocked) else 'Проверка недоступна или другая операция ещё выполняется.'
-            await self.notify(views.recovery_refused_message(reason))
+            record = {'status': 'REFUSED', 'update_id': uid, 'action': action,
+                      'stage': stage, 'category': admission_failure_category(exc), 'at': self.now()}
+            self.store.data['last_admission'] = record
+            print('Telegram admission refused: ' + json.dumps(record, sort_keys=True), file=sys.stderr, flush=True)
+            try:
+                self.store.save()
+            except Exception:
+                print('Telegram admission refusal persistence failed.', file=sys.stderr, flush=True)
+            await self.notify(views.admission_refusal_message(record))
             return
         finally:
             self._checking = False
