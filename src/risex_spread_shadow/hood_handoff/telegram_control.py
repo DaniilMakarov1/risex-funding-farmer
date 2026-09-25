@@ -73,6 +73,16 @@ class Store:
                 or active.get('action', 'run') not in ('run', 'close')
                 or not all(isinstance(n, str) and re.fullmatch(r'(?:cycle|close)-[0-9]+', n) for n in active['before'])):
                 raise RuntimeError('invalid active operation state')
+            if active is not None and ('phase' in active or 'auto_close_before' in active):
+                close_before = active.get('auto_close_before')
+                if (active.get('action') != 'run' or active.get('phase') not in ('AUTO_CLOSE', 'RUN')
+                        or not isinstance(close_before, list)
+                        or not all(isinstance(n, str) and re.fullmatch(r'close-[0-9]+', n)
+                                   for n in close_before)
+                        or len(close_before) != len(set(close_before))
+                        or (active.get('phase') == 'RUN' and not re.fullmatch(
+                            r'close-[0-9]+', str(active.get('auto_close_slot'))))):
+                    raise RuntimeError('invalid pre-cycle close state')
             last = self.data['last']
             if last is not None and (not isinstance(last, dict)
                 or last.get('status') not in ('NOT_LAUNCHED', 'FINISHED', 'BLOCKED')
@@ -226,8 +236,23 @@ class Controller:
         action = active.get('action', 'run')
         added = sorted(set(self.slots(action)) - set(active['before']))
         if not added:
-            self.store.data['last'] = {'status': 'NOT_LAUNCHED', 'cycle': None}
-            self.store.data['active'] = None
+            close_before = active.get('auto_close_before') if action == 'run' else None
+            close_added = (sorted(set(self.slots('close')) - set(close_before))
+                           if isinstance(close_before, list) else [])
+            if len(close_added) == 1:
+                report = self.close_report(close_added[0])
+                safe = (report is not None and report.get('status') == 'CONFIRMED_FLAT'
+                        and (active.get('phase') != 'RUN'
+                             or active.get('auto_close_slot') == close_added[0]))
+                self.store.data['last'] = {'status': 'NOT_LAUNCHED' if safe else 'BLOCKED',
+                                           'cycle': close_added[0]}
+                if safe:
+                    self.store.data['active'] = None
+            elif close_added or close_before is not None:
+                self.store.data['last'] = {'status': 'BLOCKED', 'cycle': None}
+            else:
+                self.store.data['last'] = {'status': 'NOT_LAUNCHED', 'cycle': None}
+                self.store.data['active'] = None
         elif len(added) == 1:
             report = self.report(added[0])
             safe = (report is not None and report['status'] == 'COMPLETE'
@@ -252,14 +277,17 @@ class Controller:
         # can still be alive during that await. It is no longer a running cycle.
         if active is not None and self.task is not None and not self.task.done() and not self._runner_finished:
             added = sorted(set(self.slots(active.get('action', 'run'))) - set(active['before']))
-            if active.get('action') == 'close':
+            if active.get('action') == 'close' or active.get('phase') == 'AUTO_CLOSE':
                 return '<b>⏳ Закрытие позиций выполняется</b>\nПроверяю и закрываю остатки на двух настроенных счетах. /status — состояние'
             progress = read_lifecycle(self.operator / added[0] / 'cycle.jsonl') if len(added) == 1 else None
             return views.running_message(added, progress)
         blocked = active is not None
         last = self.store.data['last']
         if last and str(last.get('cycle')).startswith('close-'):
-            return views.close_message(last['cycle'], self.close_report(last['cycle']))
+            message = views.close_message(last['cycle'], self.close_report(last['cycle']))
+            if last.get('status') == 'NOT_LAUNCHED' or blocked and active.get('action') == 'run':
+                message += '\n<b>⚠️ Новый цикл не начался</b> · требуется свежая проверка перед следующей командой.'
+            return message
         # Read-only display also includes completed terminal-launched cycles.
         # This never clears the controller's durable active/restart barrier.
         if not last or last.get('status') != 'NOT_LAUNCHED':
@@ -320,16 +348,67 @@ class Controller:
         notices = asyncio.create_task(self.lifecycle_notices())
         try:
             options = (self.store.data.get('active') or {}).get('launch_options', {})
+            if action == 'run' and (self.store.data.get('active') or {}).get('phase') == 'AUTO_CLOSE':
+                await self._close_before_run()
             await (self.close() if action == 'close' else self.launch(**options))
             self.finish()
         except Exception:
-            self.store.data['last'] = {'status': 'BLOCKED', 'cycle': None}
+            active = self.store.data.get('active') or {}
+            close_before = active.get('auto_close_before') if active.get('phase') == 'AUTO_CLOSE' else None
+            close_added = (sorted(set(self.slots('close')) - set(close_before))
+                           if isinstance(close_before, list) else [])
+            self.store.data['last'] = {'status': 'BLOCKED',
+                                       'cycle': close_added[0] if len(close_added) == 1 else None}
             self.store.save()  # Keep durable active intent; never automatically retry.
         finally:
             notices.cancel()
             await asyncio.gather(notices, return_exceptions=True)
         self._runner_finished = True
         await self.notify(self.summary_after_task())
+
+    @staticmethod
+    def _exact_recovery_positions(proof):
+        """Require finite exact positions and the validated no-order account shape."""
+        positions = []
+        identities = []
+        for role in ('source', 'receiver'):
+            row = proof.get(role) if isinstance(proof, dict) else None
+            if (not isinstance(row, dict) or type(row.get('account_index')) is not int
+                    or type(row.get('market_id')) is not int or row.get('active_orders') != []
+                    or row.get('authorized') is not True or row.get('ready') is not True
+                    or not isinstance(row.get('signed_position'), str)):
+                raise RuntimeError('current account proof is incomplete')
+            try:
+                position = Decimal(row['signed_position'])
+            except (InvalidOperation, ValueError):
+                raise RuntimeError('current position is invalid') from None
+            if not position.is_finite():
+                raise RuntimeError('current position is invalid')
+            positions.append(position)
+            identities.append((row['account_index'], row['market_id']))
+        if identities[0][0] == identities[1][0] or identities[0][1] != identities[1][1]:
+            raise RuntimeError('current account identities conflict')
+        return positions
+
+    async def _close_before_run(self):
+        """One saved /run may close once; never advance on a missing terminal or read."""
+        active = self.store.data['active']
+        before = set(active['auto_close_before'])
+        await self.close()
+        added = sorted(set(self.slots('close')) - before)
+        if len(added) != 1:
+            raise RuntimeError('pre-cycle close slot is ambiguous')
+        result = self.close_report(added[0])
+        if result is None or result.get('status') != 'CONFIRMED_FLAT':
+            raise RuntimeError('pre-cycle close is not confirmed flat')
+        proof = await self.recovery(require_flat=True)
+        if (not isinstance(proof, dict) or proof.get('status') != 'READY'
+                or any(position != 0 for position in self._exact_recovery_positions(proof))):
+            raise RuntimeError('fresh post-close flatness is unproved')
+        self.store.data['last_recovery'] = {k: proof.get(k) for k in ('status', 'at', 'previous_intents')}
+        active['phase'] = 'RUN'
+        active['auto_close_slot'] = added[0]
+        self.store.save()
 
     async def reconcile_idle(self, *, require_flat=True):
         """Replace a historical barrier only after a bounded current check."""
@@ -347,12 +426,28 @@ class Controller:
     async def admit(self, action, uid, launch_options=None):
         self._checking = True
         try:
+            auto_close_before = None
             if self.recovery is not None:
-                await self.reconcile_idle(require_flat=action == 'run')
+                if action == 'run' and self.close is not None:
+                    proof = await self.recovery(require_flat=False)
+                    if not isinstance(proof, dict) or proof.get('status') != 'CLOSE_READY':
+                        raise RuntimeError('pre-cycle close readiness is unproved')
+                    positions = self._exact_recovery_positions(proof)
+                    if all(position == 0 for position in positions):
+                        await self.reconcile_idle(require_flat=True)
+                    else:
+                        auto_close_before = self.slots('close')
+                        self.store.data['last_recovery'] = {
+                            k: proof.get(k) for k in ('status', 'at', 'previous_intents')}
+                else:
+                    await self.reconcile_idle(require_flat=action == 'run')
             elif self.store.data['active'] is not None:
                 await self.notify(views.blocked_message())
                 return
             self.store.data['active'] = {'before': self.slots(action), 'update_id': uid, 'action': action}
+            if auto_close_before is not None:
+                self.store.data['active'].update({'phase': 'AUTO_CLOSE',
+                                                  'auto_close_before': auto_close_before})
             if launch_options:
                 self.store.data['active']['launch_options'] = dict(launch_options)
             self.store.save()

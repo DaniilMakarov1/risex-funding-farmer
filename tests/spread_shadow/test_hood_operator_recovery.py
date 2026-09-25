@@ -469,7 +469,11 @@ async def test_fresh_command_rechecks_sticky_barrier_and_close_is_owner_only(tmp
     async def close():calls.append('close')
     async def check(*,require_flat):
         entered.set();await release.wait()
-        return {'status':'READY' if require_flat else 'CLOSE_READY','at':1000,'previous_intents':1}
+        return {'status':'READY' if require_flat else 'CLOSE_READY','at':1000,'previous_intents':1,
+                'source': {'account_index': 11, 'market_id': 1, 'signed_position': '0',
+                           'active_orders': [], 'authorized': True, 'ready': True},
+                'receiver': {'account_index': 22, 'market_id': 1, 'signed_position': '0',
+                             'active_orders': [], 'authorized': True, 'ready': True}}
     c=setup(tmp_path,launch);c.recovery=check;c.close=close
     c.store.data['active']={'before':[],'update_id':0};c.store.save()
     await c.handle(update(1));await entered.wait()

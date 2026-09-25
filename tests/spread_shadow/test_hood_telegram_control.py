@@ -302,7 +302,11 @@ async def test_server_discards_backlog_and_uses_fixed_detached_child(tmp_path, m
     checks=[]
     async def recover(*args, require_flat=True):
         checks.append(require_flat)
-        return {'status':'READY' if require_flat else 'CLOSE_READY','at':1000}
+        return {'status':'READY' if require_flat else 'CLOSE_READY','at':1000,
+                'source': {'account_index': 11, 'market_id': 7, 'signed_position': '0',
+                           'active_orders': [], 'authorized': True, 'ready': True},
+                'receiver': {'account_index': 22, 'market_id': 7, 'signed_position': '0',
+                             'active_orders': [], 'authorized': True, 'ready': True}}
     monkeypatch.setattr(cli,'_validate_simple_local_inputs',lambda *a,**k:(object(),{}))
     monkeypatch.setattr(operator_recovery,'check_recovery',recover)
     monkeypatch.setattr(bot, 'Telegram', API)
@@ -313,7 +317,7 @@ async def test_server_discards_backlog_and_uses_fixed_detached_child(tmp_path, m
     monkeypatch.setattr(Path, 'is_file', lambda p: True if str(p).endswith('.venv-hood/bin/python') else original_is_file(p))
     with pytest.raises(Stop):
         await bot.serve(SimpleNamespace(config=config, owner_id=42), store, 99, 'synthetic-token-not-used')
-    assert checks == [command == '/run']
+    assert checks == ([False, True] if command == '/run' else [False])
     assert len(calls) == 1
     argv, kwargs = calls[0]
     assert argv[1:5] == ('-m', 'risex_spread_shadow.hood_handoff.cli', entry, '--keychain')
