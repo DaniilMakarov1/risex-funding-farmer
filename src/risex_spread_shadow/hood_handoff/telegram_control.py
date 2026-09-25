@@ -83,12 +83,22 @@ class Store:
                         or (active.get('phase') == 'RUN' and not re.fullmatch(
                             r'close-[0-9]+', str(active.get('auto_close_slot'))))):
                     raise RuntimeError('invalid pre-cycle close state')
+            if active is not None and ('series_total' in active or 'series_index' in active):
+                total, index = active.get('series_total'), active.get('series_index')
+                if (active.get('action') != 'run' or not integer(total) or not integer(index)
+                        or not 2 <= total <= 5 or not 1 <= index <= total):
+                    raise RuntimeError('invalid active series state')
             last = self.data['last']
             if last is not None and (not isinstance(last, dict)
                 or last.get('status') not in ('NOT_LAUNCHED', 'FINISHED', 'BLOCKED')
                 or last.get('cycle') is not None and (not isinstance(last['cycle'], str)
                     or re.fullmatch(r'(?:cycle|close)-[0-9]+', last['cycle']) is None)):
                 raise RuntimeError('invalid last operation state')
+            if last is not None and ('series_total' in last or 'series_completed' in last):
+                total, completed = last.get('series_total'), last.get('series_completed')
+                if (not integer(total) or not integer(completed)
+                        or not 2 <= total <= 5 or not 0 <= completed <= total):
+                    raise RuntimeError('invalid last series state')
 
     def save(self):
         temporary = self.directory / f'.state-{uuid.uuid4().hex}'
@@ -229,12 +239,13 @@ class Controller:
             selected = (started, name, last_row['at'], flat)
         return selected
 
-    def finish(self):
+    def finish(self, *, retain_active=False):
         active = self.store.data['active']
         if active is None:
-            return
+            return False
         action = active.get('action', 'run')
         added = sorted(set(self.slots(action)) - set(active['before']))
+        safe_cycle = False
         if not added:
             close_before = active.get('auto_close_before') if action == 'run' else None
             close_added = (sorted(set(self.slots('close')) - set(close_before))
@@ -251,7 +262,16 @@ class Controller:
             elif close_added or close_before is not None:
                 self.store.data['last'] = {'status': 'BLOCKED', 'cycle': None}
             else:
-                self.store.data['last'] = {'status': 'NOT_LAUNCHED', 'cycle': None}
+                previous = self.store.data['last']
+                previous_cycle = (previous.get('cycle') if 'series_total' in active
+                                  and isinstance(previous, dict)
+                                  and previous.get('status') == 'FINISHED'
+                                  and previous.get('series_total') == active['series_total']
+                                  and previous.get('series_completed') == active['series_index'] - 1
+                                  and isinstance(previous.get('cycle'), str)
+                                  and previous['cycle'].startswith('cycle-')
+                                  else None)
+                self.store.data['last'] = {'status': 'NOT_LAUNCHED', 'cycle': previous_cycle}
                 self.store.data['active'] = None
         elif len(added) == 1:
             report = self.report(added[0])
@@ -263,31 +283,60 @@ class Controller:
                 report = self.close_report(added[0])
                 safe = report is not None and report.get('status') == 'CONFIRMED_FLAT'
             self.store.data['last'] = {'status': 'FINISHED' if safe else 'BLOCKED', 'cycle': added[0]}
-            if safe:
+            safe_cycle = bool(safe and action == 'run')
+            if safe and not (retain_active and safe_cycle):
                 self.store.data['active'] = None
         else:
             self.store.data['last'] = {'status': 'BLOCKED', 'cycle': None}
-        self.store.save()
+        if action == 'run' and 'series_total' in active:
+            self.store.data['last'].update({
+                'series_total': active['series_total'],
+                'series_completed': active['series_index'] if safe_cycle else active['series_index'] - 1,
+            })
+        try:
+            self.store.save()
+        except Exception:
+            # A failed terminal checkpoint must not clear the in-memory barrier.
+            self.store.data['active'] = active
+            raise
+        return safe_cycle
+
+    def _series_prefix(self):
+        active, last = self.store.data['active'], self.store.data['last']
+        if active is not None and 'series_total' in active:
+            total, index = active['series_total'], active['series_index']
+            if self.task is not None and not self.task.done() and not self._runner_finished:
+                return f'<b>Серия: цикл {index}/{total}</b> · завершено {index - 1}\n'
+            completed = last.get('series_completed', index - 1) if isinstance(last, dict) else index - 1
+            return f'<b>Серия остановлена: {completed}/{total} циклов завершено</b>\n'
+        if active is not None:
+            return ''
+        if isinstance(last, dict) and 'series_total' in last:
+            completed, total = last['series_completed'], last['series_total']
+            result = 'завершена' if completed == total else 'остановлена'
+            return f'<b>Серия {result}: {completed}/{total} циклов завершено</b>\n'
+        return ''
 
     def summary(self, *, detailed=False):
         if self._checking:
             return '<b>Проверяю текущие позиции и старые ордера</b>\nНовая операция ещё не отправлялась.'
         active = self.store.data['active']
+        prefix = self._series_prefix()
         # finish() clears active before awaiting final notification; the task
         # can still be alive during that await. It is no longer a running cycle.
         if active is not None and self.task is not None and not self.task.done() and not self._runner_finished:
             added = sorted(set(self.slots(active.get('action', 'run'))) - set(active['before']))
             if active.get('action') == 'close' or active.get('phase') == 'AUTO_CLOSE':
-                return '<b>⏳ Закрытие позиций выполняется</b>\nПроверяю и закрываю остатки на двух настроенных счетах. /status — состояние'
+                return prefix + '<b>⏳ Закрытие позиций выполняется</b>\nПроверяю и закрываю остатки на двух настроенных счетах. /status — состояние'
             progress = read_lifecycle(self.operator / added[0] / 'cycle.jsonl') if len(added) == 1 else None
-            return views.running_message(added, progress)
+            return prefix + views.running_message(added, progress)
         blocked = active is not None
         last = self.store.data['last']
         if last and str(last.get('cycle')).startswith('close-'):
             message = views.close_message(last['cycle'], self.close_report(last['cycle']))
             if last.get('status') == 'NOT_LAUNCHED' or blocked and active.get('action') == 'run':
                 message += '\n<b>⚠️ Новый цикл не начался</b> · требуется свежая проверка перед следующей командой.'
-            return message
+            return prefix + message
         # Read-only display also includes completed terminal-launched cycles.
         # This never clears the controller's durable active/restart barrier.
         if not last or last.get('status') != 'NOT_LAUNCHED':
@@ -295,20 +344,20 @@ class Controller:
             if slots:
                 last = {'cycle': slots[-1]}
         if not last:
-            return views.empty_message(blocked)
+            return prefix + views.empty_message(blocked)
         failure_code = (read_launch_failure(self.operator / last['cycle'])
                         if isinstance(last.get('cycle'), str) else None)
         if failure_code is not None:
-            return views.launch_failure_message(last['cycle'], failure_code, blocked=blocked)
+            return prefix + views.launch_failure_message(last['cycle'], failure_code, blocked=blocked)
         report = self.report(last.get('cycle'))
         if report is None:
-            return views.unavailable_message(blocked, last.get('status') == 'NOT_LAUNCHED')
+            return prefix + views.unavailable_message(blocked, last.get('status') == 'NOT_LAUNCHED')
         checkpoint = views.recovery_checkpoint(self.store.data.get('last_recovery')) if not blocked else ''
         message = checkpoint + views.saved_message(last['cycle'], report, blocked=blocked, detailed=detailed)
         later = self.later_close(report)
         if later is not None:
             message += views.later_close_message(later[1], later[2], later[3])
-        return message
+        return prefix + message
 
     async def notify(self, text):
         try:
@@ -320,6 +369,7 @@ class Controller:
     async def lifecycle_notices(self):
         """Finite stage and per-attempt execution notices, outside the child."""
         sent = set()
+        current_step = None
         while True:
             try:
                 active = self.store.data['active']
@@ -327,6 +377,9 @@ class Controller:
                     return
                 if active.get('action') == 'close':
                     return
+                if active.get('series_index') != current_step:
+                    current_step = active.get('series_index')
+                    sent.clear()
                 added = sorted(set(self.slots()) - set(active['before']))
                 if len(added) == 1:
                     path = self.operator / added[0] / 'cycle.jsonl'
@@ -345,26 +398,72 @@ class Controller:
             await asyncio.sleep(0.5)
 
     async def run_one(self, action='run'):
-        notices = asyncio.create_task(self.lifecycle_notices())
+        total = (self.store.data.get('active') or {}).get('series_total', 1)
         try:
-            options = (self.store.data.get('active') or {}).get('launch_options', {})
-            if action == 'run' and (self.store.data.get('active') or {}).get('phase') == 'AUTO_CLOSE':
-                await self._close_before_run()
-            await (self.close() if action == 'close' else self.launch(**options))
-            self.finish()
+            for step in range(1, total + 1):
+                if step > 1:
+                    await self._prepare_next_series_step()
+                notices = asyncio.create_task(self.lifecycle_notices())
+                try:
+                    options = (self.store.data.get('active') or {}).get('launch_options', {})
+                    if action == 'run' and (self.store.data.get('active') or {}).get('phase') == 'AUTO_CLOSE':
+                        await self._close_before_run()
+                    await (self.close() if action == 'close' else self.launch(**options))
+                    safe = self.finish(retain_active=step < total)
+                finally:
+                    notices.cancel()
+                    await asyncio.gather(notices, return_exceptions=True)
+                if step < total and not safe:
+                    break
         except Exception:
             active = self.store.data.get('active') or {}
             close_before = active.get('auto_close_before') if active.get('phase') == 'AUTO_CLOSE' else None
             close_added = (sorted(set(self.slots('close')) - set(close_before))
                            if isinstance(close_before, list) else [])
+            cycle_added = sorted(set(self.slots('run')) - set(active.get('before', [])))
+            previous = self.store.data.get('last')
             self.store.data['last'] = {'status': 'BLOCKED',
-                                       'cycle': close_added[0] if len(close_added) == 1 else None}
+                                       'cycle': (close_added[0] if len(close_added) == 1 else
+                                                 cycle_added[0] if len(cycle_added) == 1 else
+                                                 previous.get('cycle') if isinstance(previous, dict)
+                                                 and 'series_total' in active else None)}
+            if 'series_total' in active:
+                self.store.data['last'].update({'series_total': active['series_total'],
+                                                'series_completed': active['series_index'] - 1})
             self.store.save()  # Keep durable active intent; never automatically retry.
-        finally:
-            notices.cancel()
-            await asyncio.gather(notices, return_exceptions=True)
         self._runner_finished = True
         await self.notify(self.summary_after_task())
+
+    async def _prepare_next_series_step(self):
+        """Durably claim the next step, then require fresh proof before its child."""
+        active = self.store.data['active']
+        active['series_index'] += 1
+        active['before'] = self.slots('run')
+        for field in ('phase', 'auto_close_before', 'auto_close_slot'):
+            active.pop(field, None)
+        self.store.save()
+        if self.recovery is None:
+            raise RuntimeError('series recovery is unavailable')
+        proof = await self.recovery(require_flat=False)
+        if not isinstance(proof, dict) or proof.get('status') != 'CLOSE_READY':
+            raise RuntimeError('next cycle close readiness is unproved')
+        positions = self._exact_recovery_positions(proof)
+        if any(position != 0 for position in positions):
+            if self.close is None:
+                raise RuntimeError('next cycle close is unavailable')
+            active['phase'] = 'AUTO_CLOSE'
+            active['auto_close_before'] = self.slots('close')
+            self.store.data['last_recovery'] = {
+                k: proof.get(k) for k in ('status', 'at', 'previous_intents')}
+            self.store.save()
+            return
+        ready = await self.recovery(require_flat=True)
+        if (not isinstance(ready, dict) or ready.get('status') != 'READY'
+                or any(position != 0 for position in self._exact_recovery_positions(ready))):
+            raise RuntimeError('next cycle flatness is unproved')
+        self.store.data['last_recovery'] = {
+            k: ready.get(k) for k in ('status', 'at', 'previous_intents')}
+        self.store.save()
 
     @staticmethod
     def _exact_recovery_positions(proof):
@@ -423,10 +522,15 @@ class Controller:
         self.store.save()
         return True
 
-    async def admit(self, action, uid, launch_options=None):
+    async def admit(self, action, uid, launch_options=None, series_total=1):
         self._checking = True
         try:
             auto_close_before = None
+            if (not integer(series_total) or not 1 <= series_total <= 5
+                    or action != 'run' and series_total != 1):
+                raise RuntimeError('invalid series count')
+            if action == 'run' and series_total > 1 and (self.recovery is None or self.close is None):
+                raise RuntimeError('series recovery or close is unavailable')
             if self.recovery is not None:
                 if action == 'run' and self.close is not None:
                     proof = await self.recovery(require_flat=False)
@@ -445,6 +549,8 @@ class Controller:
                 await self.notify(views.blocked_message())
                 return
             self.store.data['active'] = {'before': self.slots(action), 'update_id': uid, 'action': action}
+            if action == 'run' and series_total > 1:
+                self.store.data['active'].update({'series_total': series_total, 'series_index': 1})
             if auto_close_before is not None:
                 self.store.data['active'].update({'phase': 'AUTO_CLOSE',
                                                   'auto_close_before': auto_close_before})
@@ -496,12 +602,19 @@ class Controller:
             return
         command = message.get('text')
         launch_options = {}
+        series_total = 1
         if isinstance(command, str):
-            match = re.fullmatch(r'/run (ws|ack)(?: ([1-5]))?', command)
-            if match:
-                launch_options['receiver_admission'] = 'ws_confirmed' if match[1] == 'ws' else 'ack'
-                if match[2]:
-                    launch_options['price_improvement_ticks'] = int(match[2])
+            count_match = re.fullmatch(r'/run ([1-5])', command)
+            option_match = re.fullmatch(r'/run (ws|ack)(?: ([1-5])(?: ([1-5]))?)?', command)
+            if count_match:
+                series_total = int(count_match[1])
+                command = '/run'
+            elif option_match:
+                launch_options['receiver_admission'] = 'ws_confirmed' if option_match[1] == 'ws' else 'ack'
+                if option_match[2]:
+                    launch_options['price_improvement_ticks'] = int(option_match[2])
+                if option_match[3]:
+                    series_total = int(option_match[3])
                 command = '/run'
         if command in ('/start', '/help'):
             await self.notify(views.help_message())
@@ -526,7 +639,7 @@ class Controller:
                 return
             self._runner_finished = False
             self._checking = True
-            self.task = asyncio.create_task(self.admit(command[1:], uid, launch_options))
+            self.task = asyncio.create_task(self.admit(command[1:], uid, launch_options, series_total))
             try:
                 selected = json.loads(self.config.read_text())
                 selected.update(launch_options)
@@ -537,7 +650,8 @@ class Controller:
                     details += " MARKET без ожидания WS лимитки; её наличие не подтверждено. Проверка стакана сохранена."
             except Exception:
                 details = ''
-            await self.notify(views.accepted_message(uid) + (details if command == '/run' else ''))
+            await self.notify(views.accepted_message(uid, series_total if command == '/run' else 1)
+                              + (details if command == '/run' else ''))
         elif isinstance(command, str):
             await self.notify(views.unknown_message())
 
