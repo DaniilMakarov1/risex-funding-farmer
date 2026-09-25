@@ -67,8 +67,8 @@ async def test_default_mode_count_and_legacy_tick_form_are_distinct(tmp_path):
 
 
 @pytest.mark.parametrize('command', [
-    '/run 0', '/run 6', '/run 05', '/run -1', '/run 1.5',
-    '/run ack 1 0', '/run ack 1 6', '/run ack 1 05', '/run ack 0 5',
+    '/run 0', '/run +6', '/run 05', '/run -1', '/run 1.5',
+    '/run ack 1 0', '/run ack 6 10', '/run ack 1 05', '/run ack 0 5',
     '/run ack 1 5 extra', '/close 2',
 ])
 async def test_invalid_series_command_never_launches(tmp_path, command):
@@ -266,7 +266,7 @@ def test_restart_stops_series_without_replaying_next_cycle(tmp_path, next_claime
 
 @pytest.mark.parametrize('bad', [
     {'series_total': True, 'series_index': 1},
-    {'series_total': 6, 'series_index': 1},
+    {'series_total': 0, 'series_index': 1},
     {'series_total': 5, 'series_index': 0},
     {'series_total': 5},
 ])

@@ -1,3 +1,9 @@
+# Uncapped finite series and summary — READY_FOR_REVIEW, 2026-09-25
+
+Candidate from published main `f9cad71` removes the five-cycle parser/state ceiling without changing tick limits or execution safety gates. New multi-cycle commands durably retain unique cycle membership across terminal/error/restart handling. The background sender streams per-cycle own/external/mixed/unknown execution and exact aggregate gross/net execution PnL, with in-cycle residual fills included and unknown fees, incomplete results, funding and pre-cycle closures explicitly distinguished. `/report` repeats the saved series summary; legacy membership is not invented. Numeric slot sorting covers the cycle-999/1000 boundary.
+
+187 focused checks passed, including real controller sequencing for 6/10/12 synthetic cycles, restart membership, unsafe-result stops, missing economics, mixed execution, exact negative/zero sums and delivery of a 5000-cycle synthetic report without enqueuing every page. The first expanded run failed only an arbitrary test expectation of more than 20 pages for 700 rows (the valid bounded layout used 15); replaced it with the actual contract: multiple pages, each within the limit, every row exactly once and one aggregate. Full clean Python 3.11 suite and activation pending. Self-review only; no live trading by the agent. Evidence: `spread-shadow-runs/hood-series-results-20260925/solo-v1/` in the original project workspace.
+
 # Cycle/close audit — verified and active, 2026-09-25
 
 Self-review from accepted local main `6f9652e`. Saved cycles 142–144 are COMPLETE/CONFIRMED_FLAT; every saved paired-close/residual-close plan is reduce-only. Cycle 143 recovered an external opening fill, and 144 needed a second residual order after a proved zero-fill slippage cancellation. No opening order inside their closing paths was found. These are historical proofs, not current account observations.

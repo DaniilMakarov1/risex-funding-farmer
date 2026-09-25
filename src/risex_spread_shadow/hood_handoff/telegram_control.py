@@ -6,6 +6,7 @@ Starting the controller itself never submits orders.
 from __future__ import annotations
 
 import argparse
+import copy
 import asyncio
 from dataclasses import dataclass
 import hashlib
@@ -86,7 +87,7 @@ class Store:
             if active is not None and ('series_total' in active or 'series_index' in active):
                 total, index = active.get('series_total'), active.get('series_index')
                 if (active.get('action') != 'run' or not integer(total) or not integer(index)
-                        or not 2 <= total <= 5 or not 1 <= index <= total):
+                        or not total >= 2 or not 1 <= index <= total):
                     raise RuntimeError('invalid active series state')
             last = self.data['last']
             if last is not None and (not isinstance(last, dict)
@@ -97,8 +98,20 @@ class Store:
             if last is not None and ('series_total' in last or 'series_completed' in last):
                 total, completed = last.get('series_total'), last.get('series_completed')
                 if (not integer(total) or not integer(completed)
-                        or not 2 <= total <= 5 or not 0 <= completed <= total):
+                        or not total >= 2 or not 0 <= completed <= total):
                     raise RuntimeError('invalid last series state')
+            for record in (active, last):
+                if record is None:
+                    continue
+                for field, prefix in (('series_slots', 'cycle'), ('series_precloses', 'close')):
+                    if field not in record:
+                        continue
+                    names = record[field]
+                    if (not integer(record.get('series_total')) or not isinstance(names, list)
+                            or len(names) > record['series_total']
+                            or not all(isinstance(n, str) and re.fullmatch(prefix + r'-[0-9]+', n) for n in names)
+                            or len(set(names)) != len(names)):
+                        raise RuntimeError('invalid series report membership')
 
     def save(self):
         temporary = self.directory / f'.state-{uuid.uuid4().hex}'
@@ -165,7 +178,9 @@ class Controller:
 
     def slots(self, action='run'):
         prefix = 'close' if action == 'close' else 'cycle'
-        return sorted(p.name for p in self.operator.glob(f'{prefix}-*') if p.is_dir() and re.fullmatch(prefix + r'-[0-9]+', p.name))
+        return sorted((p.name for p in self.operator.glob(f'{prefix}-*') if p.is_dir()
+                       and re.fullmatch(prefix + r'-[0-9]+', p.name)),
+                      key=lambda name: int(name.split('-')[1]))
 
     def close_report(self, name):
         from .operator_recovery import load_close_result
@@ -291,9 +306,11 @@ class Controller:
         else:
             self.store.data['last'] = {'status': 'BLOCKED', 'cycle': None}
         if action == 'run' and 'series_total' in active:
+            self._record_series_slot(active, added)
             self.store.data['last'].update({
                 'series_total': active['series_total'],
                 'series_completed': active['series_index'] if safe_cycle else active['series_index'] - 1,
+                **self._series_membership(active),
             })
         try:
             self.store.save()
@@ -302,6 +319,24 @@ class Controller:
             self.store.data['active'] = active
             raise
         return safe_cycle
+
+    @staticmethod
+    def _series_membership(active):
+        return {key: list(active[key]) for key in ('series_slots', 'series_precloses') if key in active}
+
+    @staticmethod
+    def _record_series_slot(active, added):
+        # Older saved commands have no membership ledger. Never infer theirs.
+        names = active.get('series_slots')
+        if isinstance(names, list) and len(added) == 1 and added[0] not in names:
+            names.append(added[0])
+
+    def queue_series_report(self):
+        last = self.store.data.get('last')
+        if isinstance(last, dict) and 'series_total' in last:
+            self.queue_notice(copy.deepcopy(last))
+            return True
+        return False
 
     def _series_prefix(self):
         active, last = self.store.data['active'], self.store.data['last']
@@ -379,11 +414,23 @@ class Controller:
     async def _deliver_notices(self):
         while not self._notice_queue.empty():
             message = self._notice_queue.get_nowait()
-            try:
-                async with asyncio.timeout(10):
-                    await self.notify(message)
-            except asyncio.TimeoutError:
-                print('Telegram progress delivery timed out; trading continues.', file=sys.stderr, flush=True)
+            if isinstance(message, dict):
+                from .telegram_series_report import report_pages
+                pages = report_pages(message, self.report)
+                while True:
+                    page = await asyncio.to_thread(next, pages, None)
+                    if page is None:
+                        break
+                    await self._deliver_notice(page)
+                continue
+            await self._deliver_notice(message)
+
+    async def _deliver_notice(self, message):
+        try:
+            async with asyncio.timeout(10):
+                await self.notify(message)
+        except asyncio.TimeoutError:
+            print('Telegram progress delivery timed out; trading continues.', file=sys.stderr, flush=True)
 
     def cycle_notice(self, message):
         active = self.store.data.get('active') or {}
@@ -459,11 +506,14 @@ class Controller:
                                                  previous.get('cycle') if isinstance(previous, dict)
                                                  and 'series_total' in active else None)}
             if 'series_total' in active:
+                self._record_series_slot(active, cycle_added)
                 self.store.data['last'].update({'series_total': active['series_total'],
-                                                'series_completed': active['series_index'] - 1})
+                                                'series_completed': active['series_index'] - 1,
+                                                **self._series_membership(active)})
             self.store.save()  # Keep durable active intent; never automatically retry.
         self._runner_finished = True
-        self.queue_notice(self.summary_after_task())
+        if not self.queue_series_report():
+            self.queue_notice(self.summary_after_task())
 
     async def _prepare_next_series_step(self):
         """Durably claim the next step, then require fresh proof before its child."""
@@ -540,6 +590,8 @@ class Controller:
         self.store.data['last_recovery'] = {k: proof.get(k) for k in ('status', 'at', 'previous_intents')}
         active['phase'] = 'RUN'
         active['auto_close_slot'] = added[0]
+        if 'series_precloses' in active and added[0] not in active['series_precloses']:
+            active['series_precloses'].append(added[0])
         self.store.save()
 
     async def reconcile_idle(self, *, require_flat=True):
@@ -559,7 +611,7 @@ class Controller:
         self._checking = True
         try:
             auto_close_before = None
-            if (not integer(series_total) or not 1 <= series_total <= 5
+            if (not integer(series_total) or series_total < 1
                     or action != 'run' and series_total != 1):
                 raise RuntimeError('invalid series count')
             if action == 'run' and series_total > 1 and (self.recovery is None or self.close is None):
@@ -583,7 +635,8 @@ class Controller:
                 return
             self.store.data['active'] = {'before': self.slots(action), 'update_id': uid, 'action': action}
             if action == 'run' and series_total > 1:
-                self.store.data['active'].update({'series_total': series_total, 'series_index': 1})
+                self.store.data['active'].update({'series_total': series_total, 'series_index': 1,
+                                                   'series_slots': [], 'series_precloses': []})
             if auto_close_before is not None:
                 self.store.data['active'].update({'phase': 'AUTO_CLOSE',
                                                   'auto_close_before': auto_close_before})
@@ -636,9 +689,9 @@ class Controller:
         command = message.get('text')
         launch_options = {}
         series_total = 1
-        if isinstance(command, str):
-            count_match = re.fullmatch(r'/run ([1-5])', command)
-            option_match = re.fullmatch(r'/run (ws|ack)(?: ([1-5])(?: ([1-5]))?)?', command)
+        if isinstance(command, str) and len(command) <= 4096:
+            count_match = re.fullmatch(r'/run ([1-9][0-9]*)', command)
+            option_match = re.fullmatch(r'/run (ws|ack)(?: ([1-5])(?: ([1-9][0-9]*))?)?', command)
             if count_match:
                 series_total = int(count_match[1])
                 command = '/run'
@@ -652,6 +705,8 @@ class Controller:
         if command in ('/start', '/help'):
             await self.notify(views.help_message())
         elif command in ('/status', '/report'):
+            if command == '/report' and not (self.task is not None and not self.task.done()) and self.queue_series_report():
+                return
             await self.notify(self.summary(detailed=command == '/report'))
         elif command == '/accounts':
             try:

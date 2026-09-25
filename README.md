@@ -1,3 +1,9 @@
+# Finite series length and final results — 2026-09-25
+
+The five-cycle cap is removed: `/run 20` requests twenty cycles with saved settings; `/run ack 1 20` uses ACK admission and one tick for each. Counts must be positive decimal integers (no signs, fractions or leading zeroes) within the Telegram command length. Tick offsets remain 1–5. This is a finite request, never an endless loop or a restart-resumable campaign.
+
+At completion or early stop the bot reports each recorded cycle: paired, external, mixed, unfilled or unproved opening/closing, plus residual execution when present. The final page sums execution PnL across both accounts and all recorded cycles, including in-cycle residual closures. Gross and net are separate; missing fees leave net unknown, incomplete cycles leave the aggregate unknown, and any known subtotal is labelled as a partial sum. Funding and separately initiated pre-cycle closures of old positions are excluded. Long reports paginate outside the trading task; `/report` repeats the latest saved series summary after restart. Old commands without a saved membership list have no reconstructed series total.
+
 # Cycle and close notices — 2026-09-25
 
 `/close` acknowledges only a reduce-only closure and never promises a new cycle. Cycle notices identify the step/total and command ID, announce completion and the next-step check, and distinguish opening, holding, paired closure and residual recovery. A completed flat cycle can proceed to the next requested step even when pairing failed; the existing finite-series checks still apply.
@@ -24,7 +30,7 @@ ACK cancellation now consumes the already reserved nonce after locating the exac
 
 ## Price and receiver timing switches
 
-The configured default is shown before each cycle. Telegram: `/run ws 5` waits for exact private LIMIT state and improves price by five ticks; `/run ack 5` sends MARKET after a positive application ACK, without waiting for that state. `/run ws 1` and `/run ack 1` compare one tick. Append a final count from 1 to 5 for a finite series: `/run ack 1 5` requests five cycles with ACK and one tick, while `/run 5` uses saved defaults for five cycles. Without a count, `/run` still requests one cycle. The selected mode/ticks apply to each cycle and its paired close. These commands initiate real trading. Before each cycle, the controller checks the configured BTC accounts and may perform one bounded reduce-only close of proved inventory; a terminal flat close and fresh exact zero positions are required before opening. Each later cycle also requires the previous cycle's complete terminal report, confirmed flat inventory, no unresolved order state and a new current readiness check. Unknown or incomplete evidence stops the series; startup never resumes it. `/close` remains a separate reduce-only command.
+The configured default is shown before each cycle. Telegram: `/run ws 5` waits for exact private LIMIT state and improves price by five ticks; `/run ack 5` sends MARKET after a positive application ACK, without waiting for that state. `/run ws 1` and `/run ack 1` compare one tick. Append any positive integer count for a finite series: `/run ack 1 5` requests five cycles with ACK and one tick, while `/run 5` uses saved defaults for five cycles. Without a count, `/run` still requests one cycle. The selected mode/ticks apply to each cycle and its paired close. These commands initiate real trading. Before each cycle, the controller checks the configured BTC accounts and may perform one bounded reduce-only close of proved inventory; a terminal flat close and fresh exact zero positions are required before opening. Each later cycle also requires the previous cycle's complete terminal report, confirmed flat inventory, no unresolved order state and a new current readiness check. Unknown or incomplete evidence stops the series; startup never resumes it. `/close` remains a separate reduce-only command.
 
 Terminal: append `--receiver-admission ack --price-improvement-ticks 5` to the existing `python -m risex_spread_shadow.hood_handoff.cli simple --keychain --config ...` command; use `ws_confirmed` to restore the wait. JSON fields are `receiver_admission` and `price_improvement_ticks`. No restart is needed for per-run overrides; manual file edits still require the existing controller restart/binding procedure.
 
@@ -156,7 +162,7 @@ Only a fresh exact `/run` or `/close` from the configured numeric owner in their
 | --- | --- |
 | `/run` | Recheck current readiness; close proved BTC inventory once if present, verify exact flatness, then start one real cycle under the same local configuration. |
 | `/run ack 1 5` | Request five sequential real cycles with ACK admission and one tick. Each next cycle requires a complete, flat prior result and fresh account checks; any uncertainty stops the series. |
-| `/run 5` | Request five sequential cycles with the saved mode and tick settings. Counts 1–5 are accepted. |
+| `/run 5` | Request five sequential cycles with the saved mode and tick settings. Any positive integer count is accepted; for example `/run 20`. |
 | `/close` | Check both configured accounts and close existing positions of this market with bounded reduce-only MARKET/IOC orders. Zero positions send no orders. |
 | `/status` | Short progress or latest saved result, including a terminal-launched cycle when idle. |
 | `/report` | Saved result plus last position times, per-account fees/PnL and bounded diagnostics. |
