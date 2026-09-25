@@ -1,3 +1,18 @@
+## Why /run was refused after 16:57 on 2026-09-25, and what changed
+
+The shared check log `recovery-checks.jsonl` outgrew a 32 MiB safety limit, so every `/run` stopped at the READY check (Telegram: PREFLIGHT_REFUSED); `/close` still worked. The shared log now has its own larger finite limit and each check writes a short record (count + hash of inspected journals) instead of every file hash. If a history limit is ever reached again, Telegram shows HISTORY_LIMIT instead of a generic refusal; repeating `/run` will not help.
+
+If fresh prices or margin no longer fit the selected size at the confirmed leverage, the cycle reduces the size (keeping the 0.10 planning reserve where possible and never below the venue minimum) and rechecks before sending; Telegram shows old → new size. Leverage and hold time do not change. If the private stream is briefly behind (for example it still shows a just-cancelled order), a refused attempt that sent nothing is retried after a short pause within the usual 6/15 attempts; if the stream is unusable, the cycle closes the proved positions with reduce-only orders instead of leaving them open.
+
+These changes take effect only after the controller restarts on the new code. Run, when no cycle is active:
+
+```bash
+cd "/Users/daniilmakarov/Desktop/RISEx Spread Shadow"
+.venv-hood/bin/python spread-shadow-runs/hood-margin-resize-20260925/claude-v1/verify_and_activate.py
+```
+
+It runs the full test suite in a clean temporary environment first and stops if anything fails; then it stops the idle controller, updates `main`, checks both accounts read-only and starts the controller again. It sends no orders. Afterwards send `/run` in Telegram as usual.
+
 ## Cycle spacing and temporary read limits
 
 Finite Telegram series wait a newly sampled 5–30 seconds after each safely completed cycle before checking accounts for the next cycle. The first cycle starts normally; no extra pause follows the final cycle. Telegram announces the chosen pause and `/status` displays it. Fresh readiness checks follow the pause, so actual spacing can be longer. A restart never resumes the old series automatically.
