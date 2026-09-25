@@ -146,3 +146,20 @@ async def test_closed_terminal_does_not_raise_from_progress_task(tmp_path, monke
     def unavailable(*args, **kwargs): raise BrokenPipeError('closed terminal')
     monkeypatch.setattr('builtins.print', unavailable)
     await asyncio.wait_for(_stream_simple_progress(path, set(), asyncio.Event()), 1)
+
+
+@pytest.mark.parametrize('event,stage', [
+    ('CLOSING_PREPARATION_RETRY', 'CLOSING'),
+    ('CLOSING_BLOCKED', 'CLOSING'),
+    ('FALLBACK_SEND_BARRIER', 'RECOVERY'),
+    ('FALLBACK_PREPARATION_FAILED', 'RECOVERY'),
+])
+def test_closing_preparation_and_recovery_never_display_opening(tmp_path, event, stage):
+    values = rows()
+    values.append({'sequence': 4, 'event': event, 'payload': {},
+                   'run_id': 'test-cycle', 'at': 1790098738})
+    path = tmp_path / 'cycle.jsonl'
+    write(path, values)
+    state = view.read_lifecycle(path)
+    assert state['stage'] == stage
+    assert 'Позиции открыты между нашими счетами.' not in '\n'.join(view.lifecycle_lines(state))

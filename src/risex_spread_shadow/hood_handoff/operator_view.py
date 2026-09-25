@@ -183,9 +183,9 @@ def read_lifecycle(path):
                     interval = holding(payload, at)
                     if interval and interval['started_at'] >= state['opening']['at']:
                         state.update(stage='HOLD', holding=interval)
-                elif event == 'CLOSING_PLAN_READY':
+                elif event in {'CLOSING_PLAN_READY', 'CLOSING_PREPARATION_FAILED', 'CLOSING_PREPARATION_RETRY', 'CLOSING_BLOCKED'}:
                     state['stage'] = 'CLOSING'
-                elif event in {'FALLBACK_DISPATCH_INTENT', 'FALLBACK_ATTEMPT_STARTED'}:
+                elif event.startswith('FALLBACK_'):
                     state['stage'] = 'RECOVERY'
                 elif event == 'CYCLE_COMPLETE':
                     state['stage'] = 'COMPLETE'

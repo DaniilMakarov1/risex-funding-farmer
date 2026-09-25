@@ -1,3 +1,7 @@
+# Cycle and closure display correction (2026-09-25)
+
+Telegram `/close` uses a closure-specific acknowledgement and cannot launch `/run`. Every new cycle transition notice captures its command ID and step/total. The controller queues progress and final messages without awaiting delivery on the sequence path; one background sender drains at most 64 queued messages with 10-second per-message timeouts and no replay. Overflow drops the oldest queued display message. Saved reports and execution barriers are unchanged. Closing preparation/retry/block events display CLOSING; fallback evidence displays RECOVERY instead of stale HOLD/PREPARING. No trading engine, pricing, series continuation or reduce-only policy changes.
+
 # Trade timestamp reconciliation
 
 A future-dated receipt is provisional during bounded history reconciliation. It is not counted until a reread has a valid local timestamp; any earlier future receipt must be matched by the same complete receipt, including its original timestamp. Pending future receipts prevent success. This applies to ordinary leg reconciliation and reduce-only residual closure. Existing deadlines, pagination bounds, duplicate/conflict checks and mutation no-replay rules remain. No future-time tolerance is introduced for trade receipts.

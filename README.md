@@ -1,3 +1,9 @@
+# Cycle and close notices — 2026-09-25
+
+`/close` acknowledges only a reduce-only closure and never promises a new cycle. Cycle notices identify the step/total and command ID, announce completion and the next-step check, and distinguish opening, holding, paired closure and residual recovery. A completed flat cycle can proceed to the next requested step even when pairing failed; the existing finite-series checks still apply.
+
+Progress and final notifications use a bounded 64-message FIFO in the separate controller, with a 10-second delivery deadline. Cycle sequencing never awaits delivery. When full, the oldest queued notice is discarded; delayed/missing messages are possible, and saved reports plus `/status` remain authoritative. This adds no notification I/O to the trading child; it does not claim zero shared-host CPU cost or measured exchange latency improvement.
+
 # Receipt reconciliation and controller restarts
 
 A briefly future-dated trade receipt is reread within the existing reconciliation bounds; only an exact reread at a valid time resolves that observation. The same rule applies to residual closing, without resending an uncertain order. Historical cycle journals remain unchanged.
@@ -101,7 +107,7 @@ The configured directory is `spread-shadow-runs/hood-cycle-race-latency-20260920
 
 Each run reserves a new immutable `cycle-NNN` directory and client prefix. It chooses the first account and BUY/SELL uniformly (four combinations), one legal BTC quantity up to four times the smaller fresh available balance in quote notional, and one 20–180 second hold. Roles/quantity/hold never redraw on retry. Both accounts' opening budgets further limit quantity using fresh mark-based margin, fee and adverse entry-loss evidence. For the selected size, it computes the lowest modeled 1x–4x leverage independently for each account, using venue integer margin-fraction precision; 1x is selected when sufficient. If a setting differs, the run submits it once and requires a fresh exact readback before placing an order. A setting rejection stops the cycle; an ambiguous send/readback prevents another `/run` until proved terminal through recovery. A confirmed setting on one account is not automatically rolled back when the other fails. Venue risk/admission rules may still reject a selected order. Both positions must begin exactly flat with no conflicting orders. The first order must rest and pass exact owner/price-priority checks before the other account sends its order. Preparation and safe zero-fill retries share up to 6 opening attempts and 15 paired-closing attempts. These are total attempts including the first, not extra retries. The separately bounded residual-close procedure is unchanged.
 
-HOLD starts only after the full quantity is proved matched between our own orders. Closing reverses the sides and is reduce-only. Known residuals can be closed separately only after complete reconciliation. Unresolved execution stops dependent actions. Normal completion ends the cycle; it never starts the next one automatically.
+HOLD starts only after the full quantity is proved matched between our own orders. Closing reverses the sides and is reduce-only. Known residuals can be closed separately only after complete reconciliation. Unresolved execution stops dependent actions. Normal completion ends a single-cycle command. In an explicitly requested bounded Telegram series, the controller checks the completed flat result and fresh readiness before the next requested cycle.
 
 ## Close current positions explicitly
 

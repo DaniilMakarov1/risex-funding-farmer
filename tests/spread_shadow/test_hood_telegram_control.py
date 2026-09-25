@@ -535,3 +535,20 @@ def test_malformed_last_state_fails_closed_on_load(tmp_path):
     c.store.save()
     with pytest.raises(RuntimeError):
         setup(tmp_path, None)
+
+
+async def test_close_acknowledgement_never_promises_new_opening(tmp_path):
+    calls = []
+    async def launch(): pytest.fail('/close must never open')
+    async def close(): calls.append('close')
+    c = setup(tmp_path, launch)
+    c.close = close
+    await c.handle(update(text='/close'))
+    await c.task
+    await c._notice_task
+    message = c.transport.messages[0][1]
+    assert '/close принята' in message
+    assert 'reduce-only' in message
+    assert 'один реальный цикл' not in message
+    assert 'цикл начнётся' not in message
+    assert calls == ['close']

@@ -338,3 +338,81 @@ async def test_server_series_spawns_five_fixed_children_without_reusing_command(
     assert store.data['offset'] == 12
     assert store.data['active'] is None
     assert store.data['last']['series_completed'] == 5
+
+
+async def test_slow_cycle_notices_do_not_gate_next_cycle_or_final_state(tmp_path):
+    entered, release = asyncio.Event(), asyncio.Event()
+    class Slow:
+        async def send(self, owner, text):
+            if 'Цикл' in text or 'Серия' in text:
+                entered.set()
+                await release.wait()
+    calls = []
+    async def recover(*, require_flat):
+        return proof('READY' if require_flat else 'CLOSE_READY')
+    async def launch(**options):
+        calls.append(len(calls) + 1)
+        cycle_slot(tmp_path, calls[-1])
+        if len(calls) == 1:
+            await asyncio.wait_for(entered.wait(), 1)
+    c = setup(tmp_path, launch, Slow())
+    c.recovery = recover
+    async def close(): pytest.fail('unexpected close')
+    c.close = close
+    try:
+        await c.handle(update(text='/run 2'))
+        await asyncio.wait_for(c.task, 1)
+        assert calls == [1, 2]
+        assert c.store.data['active'] is None
+        assert c.store.data['last']['series_completed'] == 2
+    finally:
+        release.set()
+        if c._notice_task:
+            await c._notice_task
+
+
+async def test_series_notices_identify_each_transition_and_end(tmp_path):
+    async def recover(*, require_flat):
+        return proof('READY' if require_flat else 'CLOSE_READY')
+    async def launch(**options):
+        cycle_slot(tmp_path, c.store.data['active']['series_index'])
+    c = setup(tmp_path, launch)
+    c.recovery = recover
+    async def close(): pytest.fail('unexpected close')
+    c.close = close
+    await c.handle(update(text='/run 2'))
+    await c.task
+    await c._notice_task
+    text = '\n'.join(m for _, m in c.transport.messages)
+    assert 'Цикл 1/2' in text and 'Цикл 2/2' in text
+    assert text.index('Далее проверка следующего цикла') < text.index('перед следующим открытием')
+    assert 'Это последний цикл; серия закончена' in text
+
+
+async def test_notice_queue_is_bounded_and_drops_old_progress(tmp_path):
+    release = asyncio.Event()
+    class Slow:
+        async def send(self, *args): await release.wait()
+    c = setup(tmp_path, None, Slow())
+    for n in range(1000): c.queue_notice(str(n))
+    assert c._notice_queue.qsize() == 64
+    assert c._notice_queue.get_nowait() == '936'
+    release.set()
+    await c._notice_task
+
+
+async def test_notice_timeout_continues_queue_without_replay_or_secret(tmp_path, monkeypatch, capsys):
+    timeout = asyncio.timeout
+    monkeypatch.setattr(bot.asyncio, 'timeout', lambda seconds: timeout(0.01))
+    messages = []
+    class Delayed:
+        async def send(self, owner, text):
+            messages.append(text)
+            if text == 'first': await asyncio.Event().wait()
+    c = setup(tmp_path, None, Delayed())
+    c.queue_notice('first')
+    c.queue_notice('second')
+    await c._notice_task
+    assert messages == ['first', 'second']
+    assert 'timed out' in capsys.readouterr().err
+    assert c.store.data['active'] is None

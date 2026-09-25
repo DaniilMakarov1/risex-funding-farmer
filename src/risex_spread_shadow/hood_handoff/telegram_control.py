@@ -160,6 +160,8 @@ class Controller:
         self.started = now()
         self.task = None
         self._runner_finished = False
+        self._notice_queue = asyncio.Queue(maxsize=64)
+        self._notice_task = None
 
     def slots(self, action='run'):
         prefix = 'close' if action == 'close' else 'cycle'
@@ -366,6 +368,28 @@ class Controller:
             # Never print exception text: a transport URL can contain the token.
             print('Telegram notification delivery failed; command will not be replayed.', file=sys.stderr, flush=True)
 
+    def queue_notice(self, message):
+        """Bounded best-effort display only; never awaited by cycle sequencing."""
+        if self._notice_queue.full():
+            self._notice_queue.get_nowait()
+        self._notice_queue.put_nowait(message)
+        if self._notice_task is None or self._notice_task.done():
+            self._notice_task = asyncio.create_task(self._deliver_notices())
+
+    async def _deliver_notices(self):
+        while not self._notice_queue.empty():
+            message = self._notice_queue.get_nowait()
+            try:
+                async with asyncio.timeout(10):
+                    await self.notify(message)
+            except asyncio.TimeoutError:
+                print('Telegram progress delivery timed out; trading continues.', file=sys.stderr, flush=True)
+
+    def cycle_notice(self, message):
+        active = self.store.data.get('active') or {}
+        index, total = active.get('series_index', 1), active.get('series_total', 1)
+        return f'<b>Цикл {index}/{total}</b> · команда {active.get("update_id", "?")} · ' + message
+
     async def lifecycle_notices(self):
         """Finite stage and per-attempt execution notices, outside the child."""
         sent = set()
@@ -387,12 +411,12 @@ class Controller:
                     for key, notice in await asyncio.to_thread(read_execution_notices, path):
                         if key not in sent:
                             sent.add(key)
-                            await asyncio.wait_for(self.notify(views.execution_message(notice)), timeout=10)
+                            self.queue_notice(self.cycle_notice(views.execution_message(notice)))
                     stage = progress.get('stage') if progress else None
                     if stage in {'HOLD', 'CLOSING', 'RECOVERY'} and stage not in sent:
                         sent.add(stage)
                         # Slow/unavailable delivery cannot hold up the child.
-                        await asyncio.wait_for(self.notify(views.running_message(added, progress)), timeout=10)
+                        self.queue_notice(self.cycle_notice(views.running_message(added, progress)))
             except (Exception, asyncio.TimeoutError):
                 pass
             await asyncio.sleep(0.5)
@@ -408,8 +432,15 @@ class Controller:
                     options = (self.store.data.get('active') or {}).get('launch_options', {})
                     if action == 'run' and (self.store.data.get('active') or {}).get('phase') == 'AUTO_CLOSE':
                         await self._close_before_run()
+                    self.queue_notice(self.cycle_notice('Начинаю подготовку и открытие.') if action == 'run'
+                                      else '<b>Закрытие</b> · Проверяю остатки; ордера только reduce-only.')
                     await (self.close() if action == 'close' else self.launch(**options))
+                    label = self.cycle_notice('')
                     safe = self.finish(retain_active=step < total)
+                    if action == 'run':
+                        self.queue_notice(label + ('Завершён: нулевые позиции подтверждены. '
+                            + ('Далее проверка следующего цикла.' if step < total else 'Это последний цикл; серия закончена.')
+                            if safe else 'Остановлен: безопасное завершение не подтверждено. Продолжения серии нет.'))
                 finally:
                     notices.cancel()
                     await asyncio.gather(notices, return_exceptions=True)
@@ -432,7 +463,7 @@ class Controller:
                                                 'series_completed': active['series_index'] - 1})
             self.store.save()  # Keep durable active intent; never automatically retry.
         self._runner_finished = True
-        await self.notify(self.summary_after_task())
+        self.queue_notice(self.summary_after_task())
 
     async def _prepare_next_series_step(self):
         """Durably claim the next step, then require fresh proof before its child."""
@@ -444,6 +475,7 @@ class Controller:
         self.store.save()
         if self.recovery is None:
             raise RuntimeError('series recovery is unavailable')
+        self.queue_notice(self.cycle_notice('Проверяю позиции и старые ордера перед следующим открытием.'))
         proof = await self.recovery(require_flat=False)
         if not isinstance(proof, dict) or proof.get('status') != 'CLOSE_READY':
             raise RuntimeError('next cycle close readiness is unproved')
@@ -493,6 +525,7 @@ class Controller:
         """One saved /run may close once; never advance on a missing terminal or read."""
         active = self.store.data['active']
         before = set(active['auto_close_before'])
+        self.queue_notice(self.cycle_notice('Перед открытием закрываю существующий остаток reduce-only.'))
         await self.close()
         added = sorted(set(self.slots('close')) - before)
         if len(added) != 1:
@@ -650,8 +683,8 @@ class Controller:
                     details += " MARKET без ожидания WS лимитки; её наличие не подтверждено. Проверка стакана сохранена."
             except Exception:
                 details = ''
-            await self.notify(views.accepted_message(uid, series_total if command == '/run' else 1)
-                              + (details if command == '/run' else ''))
+            await self.notify((views.accepted_message(uid, series_total) + details)
+                              if command == '/run' else views.close_accepted_message(uid))
         elif isinstance(command, str):
             await self.notify(views.unknown_message())
 

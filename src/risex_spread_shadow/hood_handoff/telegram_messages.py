@@ -67,6 +67,12 @@ def accepted_message(number, series_total=1):
             'Ход работы: /status · Итог: /report')
 
 
+def close_accepted_message(number):
+    return (f'<b>📨 Команда /close принята</b> · <code>{text(number, 24)}</code>\n'
+            'Проверю оба счёта и закрою подтверждённые остатки reduce-only. '
+            'Открытие нового цикла этой командой не запрашивается. /status — состояние.')
+
+
 def blocked_message():
     return ('<b>⏳ Сейчас другая операция или нужна сверка</b>\n'
             'Параллельные запуски заблокированы. Дождись завершения текущей операции.\n\n'
