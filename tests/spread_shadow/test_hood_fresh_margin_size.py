@@ -56,10 +56,10 @@ async def test_preparation_reduces_for_either_account_then_rereads(tmp_path,dire
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('barrier',['started','identity','minimum','exhausted'])
+@pytest.mark.parametrize('barrier',['identity','minimum','exhausted'])
 async def test_resize_never_waives_barriers(tmp_path,barrier):
     e,c,j,s,m,initial,client=context(tmp_path,balance='1' if barrier=='minimum' else '9')
-    e._opening_handoff_started=barrier=='started';client.conflict=barrier=='identity'
+    client.conflict=barrier=='identity'
     result=await e._prepare_open_with_retries(c,j,s,m,book(),*initial,_PairAttemptBudget(limit=1 if barrier=='exhausted' else 6))
     assert not isinstance(result,tuple)
     assert result.outcome==Outcome.FAILED_PREFLIGHT_BLOCKED
@@ -75,10 +75,17 @@ async def test_full_cycle_uses_reduced_size_for_both_open_and_close_without_sett
     clock=AdvancingClock();client=Client(clock);rng=FixedRng(40,29)
     result=await run_random_cycle(cycle_config(tmp_path/'cycle',margin_reserve=OpeningMarginReserve(D('.1'),D('.02'))),client,clock=clock,rng=rng)
     assert result.outcome==Outcome.SUCCESS,result.reason
-    assert result.inventory=='CONFIRMED_FLAT' and result.selection.quantity==D('.38')
+    # Independent unit cost at the confirmed source IMF 4968 bps, mark/worst
+    # 100.1 and published maker cap 0.00012 (no adverse loss at the mark).
+    unit=D('100.1')*D('.4968')+D('100.1')*D('.00012')
+    assert (D('19')-D('.10'))/unit>=D('.37')>(D('19')-D('.10'))/unit-D('.01')
+    # .38 would still pass the 0.02 dispatch reserve but not the 0.10 planning
+    # reserve that the original leverage plan also kept.
+    assert D('.38')*unit+D('.02')<=D('19')<D('.38')*unit+D('.10')
+    assert result.inventory=='CONFIRMED_FLAT' and result.selection.quantity==D('.37')
     assert result.selection.hold_seconds==29 and not rng.values
     assert len(client.settings)==2 and len(client.submissions)==4
-    assert all(p.quantity==D('.38') for p in client.submissions)
+    assert all(p.quantity==D('.37') for p in client.submissions)
     assert len({p.client_order_index for p in client.submissions})==4
 
 
@@ -165,7 +172,7 @@ async def test_cancel_after_resize_never_reaches_handoff(tmp_path):
     e.clock.sleep=cancelled
     with pytest.raises(asyncio.CancelledError):
         await e._prepare_open_with_retries(c,j,s,m,book(),*initial,_PairAttemptBudget(limit=6))
-    assert client.reads==2 and not e._opening_handoff_started
+    assert client.reads==2
     assert e._selection.quantity==D('.35')
 
 
@@ -180,3 +187,45 @@ async def test_fixed_pilot_cannot_resize_even_when_smaller_size_would_fit(tmp_pa
     with pytest.raises(PreflightBlocked) as err:
         await e._revalidate_open(pilot,s,m,book(),*initial,journal=j)
     assert not isinstance(err.value,_OpeningQuantityRefresh)
+
+
+@pytest.mark.asyncio
+async def test_resize_after_proved_zero_fill_opening_attempt_then_same_size_close(tmp_path):
+    """Balance falls after a canceled-post-only zero-fill opening attempt."""
+    from test_hood_handoff_random_cycle import PostOnlyCancelClient
+
+    class Client(PostOnlyCancelClient, LeverageClient):
+        async def submit_order(self, plan):
+            receipt = await super().submit_order(plan)
+            if plan.order_type == 'LIMIT' and not plan.reduce_only and self.source_limit_attempts == 1:
+                self.balances[11] = D('19')
+            return receipt
+
+    clock = AdvancingClock(); client = Client(clock, cancel_count=1); rng = FixedRng(40, 29)
+    config = cycle_config(tmp_path / 'cycle', margin_reserve=OpeningMarginReserve(D('.1'), D('.02')))
+    result = await run_random_cycle(config, client, clock=clock, rng=rng)
+    assert result.outcome == Outcome.SUCCESS, result.reason
+    assert result.inventory == 'CONFIRMED_FLAT' and not rng.values
+    rows = [json.loads(l) for l in config.journal_path.read_text().splitlines()]
+    events = [r['event'] for r in rows]
+    assert events.index('PAIR_ATTEMPT_RETRY') < events.index('OPENING_QUANTITY_RECALCULATED')
+    resize = [r['payload'] for r in rows if r['event'] == 'OPENING_QUANTITY_RECALCULATED']
+    assert len(resize) == 1 and resize[0]['old_quantity'] == '0.40'
+    new = D(resize[0]['new_quantity'])
+    fraction = client.settings[0][2]
+    unit = D('100.1') * D(fraction) / 10000 + D('100.1') * D('.00012')
+    assert new * unit + D('.10') <= D('19') < (new + D('.01')) * unit + D('.10')
+    first, *rest = client.submissions
+    assert first.quantity == D('.40') and first.order_type == 'LIMIT'
+    assert rest and all(p.quantity == new for p in rest)  # later opening and closing
+    assert len(client.settings) == 2  # no extra leverage write
+    assert result.selection.quantity == new and result.selection.hold_seconds == 29
+
+
+@pytest.mark.asyncio
+async def test_closing_never_calls_opening_resize(tmp_path):
+    """Structural: paired closing sizes from reconciled positions only."""
+    import inspect
+    from risex_spread_shadow.hood_handoff import random_cycle as rc
+    closing = inspect.getsource(rc.RandomCycleEngine._run_paired_close)
+    assert '_revalidate_open' not in closing and '_OpeningQuantityRefresh' not in closing

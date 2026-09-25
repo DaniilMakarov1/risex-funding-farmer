@@ -47,9 +47,16 @@ async def test_setting_readback_does_not_relabel_original_budget_time(tmp_path, 
         assert D(leg['initial_to_fresh']['available_balance']) == balance_shift
         assert D(leg['available_balance']) - D(original['available_balance']) == balance_shift
     if balance_shift < 0:
-        assert result.outcome is Outcome.FAILED_PREFLIGHT_BLOCKED
         assert [leg['status'] for leg in fresh] == ['INSUFFICIENT', 'INSUFFICIENT']
-        assert not client.submissions
+        # Owner policy 2026-09-25: a proved fresh shortfall reduces quantity at
+        # the confirmed leverage instead of stopping; nothing is sent at 0.40.
+        resize = [row['payload'] for row in rows if row['event'] == 'OPENING_QUANTITY_RECALCULATED']
+        assert len(resize) == 1 and resize[0]['old_quantity'] == '0.40'
+        smaller = D(resize[0]['new_quantity'])
+        assert D('0') < smaller < D('0.40')
+        assert result.outcome is Outcome.SUCCESS, result.reason
+        assert client.submissions and all(plan.quantity == smaller for plan in client.submissions)
+        assert len(client.settings) == 2
     else:
         assert [leg['status'] for leg in fresh] == ['ADMITTED', 'ADMITTED']
         assert client.submissions

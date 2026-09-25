@@ -2066,7 +2066,6 @@ class RandomCycleEngine:
         self._identity_barrier: str | None = None
         self._selection: RandomCycleSelection | None = None
         self._leverage_fractions: dict[int, int] = {}
-        self._opening_handoff_started = False
         self._opening_plan_evidence: dict[str, dict[str, Any]] = {}
         self._last_account_observations: dict[int, AccountSnapshot] = {}
         self._pending_nonces: dict[int, Any] = {}
@@ -2144,7 +2143,6 @@ class RandomCycleEngine:
         self._identity_barrier = None
         self._selection = None
         self._leverage_fractions: dict[int, int] = {}
-        self._opening_handoff_started = False
         self._opening_plan_evidence = {}
         self._last_account_observations = {}
         if not config.operator_execution_opt_in or not config.operator_plan_reviewed:
@@ -2491,7 +2489,6 @@ class RandomCycleEngine:
                     "journal_path": opening_config.journal_path,
                 },
             )
-            self._opening_handoff_started = True
             self._stage = "OPENING"
             opening = await self._run_prepared_handoff(opening_config, metadata, source, receiver)
             self._stage = "OPENING_RECONCILED"
@@ -3001,8 +2998,9 @@ class RandomCycleEngine:
 
         The first quantity/hold draw is already proved in ``selection``.  A
         fresh quote may replace prices and bounds. A proved margin shortfall
-        before the first handoff may reduce quantity, with a durable event and
-        another fresh preparation attempt; never draw again or resize later.
+        while opening positions are still at the initial baseline may reduce
+        quantity, with a durable event and another fresh preparation attempt
+        from the same shared budget; never draw again, grow or resize closing.
         Once this method returns successfully, callers are allowed
         to cross the first-mutation boundary.  Every failure is handled here
         so a terminal preflight result retains the proved selection.
@@ -3409,16 +3407,35 @@ class RandomCycleEngine:
         if selection.quantity_tick < refreshed_bounds.lower_tick:
             raise PreflightBlocked("selected quantity no longer meets a fresh venue minimum")
         if budget_failures or selection.quantity_tick > refreshed_bounds.upper_tick:
-            if not config.confirmed_pilot and not self._opening_handoff_started:
+            # Opening positions are still exactly the initial (flat) baseline
+            # here: the position check above runs on every preparation, and a
+            # retry after an opening handoff is only admitted for a proved
+            # zero-fill.  Quantity may therefore shrink on any opening
+            # preparation, but never grow, never redraw and never in closing.
+            if not config.confirmed_pilot:
                 # Costs are linear in quantity at these exact observed quotes,
                 # fee bounds and confirmed IMF. Round down; never raise leverage.
-                upper_tick = min(selection.quantity_tick, refreshed_bounds.upper_tick)
+                planning_reserve = max(dispatch_reserve, config.margin_reserve.initial_quote
+                                       if config.margin_reserve else dispatch_reserve)
+                unit_costs = []
                 for row in budgets:
                     if row["total_required"] is None or row["observed_imf_bps"] is None:
                         raise PreflightBlocked(reason)
-                    unit_cost = Decimal(row["total_required"]) / selection.quantity
-                    cap = (Decimal(row["available_balance"]) - dispatch_reserve) / unit_cost
-                    upper_tick = min(upper_tick, int((cap / refreshed_bounds.size_step).to_integral_value(rounding=ROUND_FLOOR)))
+                    unit_costs.append((Decimal(row["available_balance"]),
+                                       Decimal(row["total_required"]) / selection.quantity))
+
+                def affordable_tick(reserve: Decimal) -> int:
+                    return min(int(((balance - reserve) / unit / refreshed_bounds.size_step)
+                                   .to_integral_value(rounding=ROUND_FLOOR))
+                               for balance, unit in unit_costs)
+
+                # The new size must fit the dispatch reserve at this quote;
+                # prefer the owner's planning reserve so the next fresh check
+                # keeps the same slack as the original leverage plan.
+                dispatch_tick = min(selection.quantity_tick, refreshed_bounds.upper_tick,
+                                    affordable_tick(dispatch_reserve))
+                upper_tick = min(dispatch_tick, max(affordable_tick(planning_reserve),
+                                                    refreshed_bounds.lower_tick))
                 if refreshed_bounds.lower_tick <= upper_tick < selection.quantity_tick:
                     resized = replace(selection, quantity=upper_tick * refreshed_bounds.size_step,
                                       quantity_tick=upper_tick, bounds=refreshed_bounds)
