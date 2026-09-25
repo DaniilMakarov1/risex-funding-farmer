@@ -840,6 +840,40 @@ class _RetryablePreparationFailure(PreflightBlocked):
     """A bounded read/preparation failure that may become valid on refresh."""
 
 
+class _RateLimitedAccount(_RetryablePreparationFailure):
+    """Fixed, credential-free HTTP 429 context for read-only backoff."""
+
+    def __init__(self, label: str, retry_after: float = 0.0):
+        super().__init__(f"{label} temporarily rate limited (HTTP 429)")
+        self.retry_after = retry_after
+
+
+def _account_rate_limit(exc: Exception, label: str) -> _RateLimitedAccount | None:
+    # SDK bodies/headers can contain credentials: never stringify the exception.
+    try:
+        from lighter.exceptions import ApiException
+    except ImportError:
+        return None
+    if not isinstance(exc, ApiException) or type(exc.status) is not int or exc.status != 429:
+        return None
+    delay = 0.0
+    headers = exc.headers
+    if isinstance(headers, Mapping):
+        raw = next((v for k, v in headers.items() if str(k).lower() == "retry-after"), None)
+        if isinstance(raw, str):
+            try:
+                delay = float(raw)
+            except ValueError:
+                from email.utils import parsedate_to_datetime
+                try:
+                    delay = parsedate_to_datetime(raw).timestamp() - time.time()
+                except (TypeError, ValueError, OverflowError):
+                    delay = 0.0
+    if not math.isfinite(delay) or delay < 0:
+        delay = 0.0
+    return _RateLimitedAccount(label, delay)
+
+
 @dataclass(slots=True)
 class _PairAttemptBudget:
     """One shared lineage budget for preparation and source placements."""
@@ -2756,7 +2790,7 @@ class RandomCycleEngine:
             effective = None
             observed = None
             for attempt in range(min(3, config.max_poll_count)):
-                source, receiver = await self._accounts(config)
+                source, receiver = await self._rate_limited_accounts(config, journal=journal)
                 for account in (source, receiver):
                     before = original[account.account_index]
                     if account.source_identity != before.source_identity or account.signed_position != 0:
@@ -2778,6 +2812,15 @@ class RandomCycleEngine:
         self._opening_plan_evidence = initial_evidence
         self._stage = "PREFLIGHT"
         return source, receiver
+
+    async def _rate_limited_accounts(
+        self, config: RandomCycleConfig, now: float | None = None,
+        *, journal: DurableJournal | None = None,
+    ) -> tuple[AccountSnapshot, AccountSnapshot]:
+        return await self._recovery_read(
+            config, lambda: self._accounts(config, now),
+            "account snapshot", journal, rate_limit_only=True,
+        )
 
     async def _accounts(self, config: RandomCycleConfig, now: float | None = None) -> tuple[AccountSnapshot, AccountSnapshot]:
         source, receiver = await self._parallel_accounts(config)
@@ -2831,6 +2874,10 @@ class RandomCycleEngine:
                 for task in tasks:
                     if not task.cancelled() and isinstance(task.exception(), _AccountIdentityFailure):
                         raise task.exception()
+                rate_limits = [task.exception() for task in tasks if not task.cancelled()
+                               and isinstance(task.exception(), _RateLimitedAccount)]
+                if rate_limits:
+                    raise max(rate_limits, key=lambda error: error.retry_after)
                 for task in tasks:
                     if task.cancelled():
                         continue
@@ -2843,6 +2890,7 @@ class RandomCycleEngine:
     async def _recovery_read(
         self, config: RandomCycleConfig, read: Callable[[], Any],
         label: str, journal: DurableJournal | None = None,
+        *, rate_limit_only: bool = False,
     ) -> Any:
         """Retry only read transport failures; never wrap a mutation here."""
         deadline = _clock_monotonic(self.clock) + config.reconcile_timeout_seconds
@@ -2853,16 +2901,22 @@ class RandomCycleEngine:
             try:
                 return await asyncio.wait_for(read(), timeout=remaining)
             except (_RetryablePreparationFailure, TimeoutError, ConnectionError, OSError) as exc:
+                if rate_limit_only and not isinstance(exc, _RateLimitedAccount):
+                    raise
                 remaining = deadline - _clock_monotonic(self.clock)
-                retry = attempt < config.max_poll_count and remaining > 0
+                delay = config.poll_interval_seconds
+                if isinstance(exc, _RateLimitedAccount):
+                    delay = max(delay, min(8.0, 2.0 ** min(attempt - 1, 3)), exc.retry_after)
+                retry = attempt < config.max_poll_count and remaining > (delay if isinstance(exc, _RateLimitedAccount) else 0)
                 if journal is not None:
                     journal.append("RECOVERY_READ_RETRY", {
                         "operation": label, "attempt": attempt, "will_retry": retry,
                         "reason": _cycle_exception_reason(exc),
+                        "delay_seconds": delay if retry else 0.0,
                     })
                 if not retry:
                     raise
-                await self.clock.sleep(min(config.poll_interval_seconds, remaining))
+                await self.clock.sleep(min(delay, remaining))
 
     async def _recovery_accounts(
         self, config: RandomCycleConfig, journal: DurableJournal | None = None,
@@ -2889,6 +2943,9 @@ class RandomCycleEngine:
         except (TimeoutError, asyncio.TimeoutError, ConnectionError, OSError) as exc:
             raise _RetryablePreparationFailure(f"{label} was transiently unavailable") from exc
         except Exception as exc:
+            limited = _account_rate_limit(exc, label)
+            if limited is not None:
+                raise limited from None
             raise _AccountIdentityFailure("account snapshot read failed") from exc
 
     async def _prepare_open_with_retries(
@@ -3075,7 +3132,7 @@ class RandomCycleEngine:
                 warm_task = asyncio.create_task(warm_once())
         tasks = [
             asyncio.create_task(read_metadata()),
-            asyncio.create_task(self._accounts(config)),
+            asyncio.create_task(self._rate_limited_accounts(config)),
             asyncio.create_task(self._reserve_preflight_nonces(config)),
         ]
         try:

@@ -1,3 +1,7 @@
+# Temporary account rate limits
+
+HTTP 429 during leverage readback or paired preparation now triggers a bounded cooldown and fresh account reads, without resending a leverage setting. The same cooldown applies to residual-recovery account reads. If the exchange remains rate limited, requests cannot fit the existing deadline, or account evidence conflicts, the operation stops. Diagnostics identify HTTP 429; failed series are never automatically replayed. Ordinary successful reads have no added request or sleep.
+
 # Delayed order visibility during cleanup
 
 If an accepted LIMIT is temporarily absent from exact order reads after the receiver is refused, cleanup waits within the existing observation limits instead of abandoning it after one read. A discovered active order is canceled once; a filled order is reconciled and any proved residual uses the existing reduce-only closure. Unknown/conflicting state still stops the series. This cannot guarantee completion during a venue outage and does not resume previously blocked series or send a command at restart.
