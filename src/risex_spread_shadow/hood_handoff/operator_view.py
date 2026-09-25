@@ -353,6 +353,7 @@ def read_execution_notices(path):
             if not 1 <= attempt <= (MAX_OPENING_ATTEMPTS if phase == 'opening' else MAX_CLOSING_ATTEMPTS):
                 continue
             plan = {}
+            rate_notice = False
             for row in journal_rows(child):
                 payload = row['payload']
                 if row['event'] in {'PLAN_READY', 'PLAN_REVIEWED'}:
@@ -364,6 +365,11 @@ def read_execution_notices(path):
                             f'{clean(order.get("side", "?"))} {amount(order.get("quantity"))} по {amount(order.get("price"))}. '
                             'Исполнение и контрагент ещё проверяются.')
                     notices.append((f'{phase}-{attempt}-accepted', text))
+                elif row['event'] == 'RECONCILIATION_RATE_LIMIT' and payload.get('will_retry') is True and not rate_notice:
+                    rate_notice = True
+                    label = 'Открытие' if phase == 'opening' else 'Закрытие'
+                    notices.append((f'{phase}-{attempt}-limited',
+                        f'{label} · Биржа ограничила чтение (HTTP 429). Жду и повторяю сверку; заявки не повторяются.'))
                 elif row['event'] == 'COMPLETE':
                     notices.append((f'{phase}-{attempt}-execution', '\n'.join(execution_lines(
                         payload.get('receipt'), phase=phase, attempt=attempt))))
@@ -373,7 +379,7 @@ def read_execution_notices(path):
     # ordering puts closing before opening and attempt 2 before attempt 1.
     def order(notice):
         phase, attempt, event = notice[0].split('-')
-        return (phase == 'closing', int(attempt), event != 'accepted')
+        return (phase == 'closing', int(attempt), {'accepted': 0, 'limited': 1, 'execution': 2}[event])
     return sorted(notices, key=order)
 
 

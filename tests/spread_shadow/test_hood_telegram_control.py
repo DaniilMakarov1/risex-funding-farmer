@@ -33,7 +33,9 @@ def setup(tmp_path, launch, transport=None):
     tmp_path.chmod(0o700)
     config = tmp_path / 'random-cycle.json'
     store = bot.Store(tmp_path / '.telegram-control', 'binding')
-    return bot.Controller(42, config, store, transport or Transport(), launch, now=lambda: 1000)
+    async def no_series_wait(seconds):
+        assert 5 <= seconds <= 30
+    return bot.Controller(42, config, store, transport or Transport(), launch, now=lambda: 1000, series_sleep=no_series_wait)
 
 
 @pytest.mark.parametrize('change', ['foreign_sender', 'foreign_chat', 'group', 'bot', 'forward',

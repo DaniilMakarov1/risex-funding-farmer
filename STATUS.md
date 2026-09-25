@@ -1,3 +1,11 @@
+# Reconciliation rate limits and inter-cycle pause — candidate, 2026-09-25
+
+Cycle-193 (sixth of twenty; five completed) stopped after a source LIMIT was cancelled and the ACK receiver was not sent. Account HTTP 429 was incorrectly converted into a permanent identity/read barrier; order and history reads also failed. Read-only current recovery independently proved READY, both accounts exactly zero with no active orders. Original journals are unchanged. The accepted-base synthetic counterexample returns UNKNOWN; candidate returns CONFIRMED_FLAT with one cancellation and no mutation replay.
+
+Typed SDK/plain-HTTP 429 now permits bounded reconciliation read cooldown; genuine account identity, authorization and malformed evidence still block. Independently sampled integer 5–30 second pauses occur only between safe completed series cycles, followed by fresh readiness. Background Telegram notices show the pause and one reconciliation rate-limit notice per attempt. Successful trading reads gain no network request or sleep; reporting arithmetic and external-fill accounting are unchanged.
+
+Same-agent self-review and 422 focused checks passed. Earlier focused failures exposed real waits in one server fixture and an external-full-fill fixture that injected only after cancellation; fixtures now inject the new sleep dependency or observed fill without weakening safety assertions. Final clean isolated suite and activation NOT_RUN. Evidence: `spread-shadow-runs/hood-reconcile-cooldown-20260925/solo-v1/`.
+
 # Accepted command without launch — diagnostics verified and active, 2026-09-25
 
 Owner command update 227121308 was accepted for eight cycles at 13:45 Moscow, but no cycle-188, active operation or current-recovery checkpoint was created. Telegram refusal delivery failed at 13:46; the controller discarded its underlying exception. Exact historical cause is NOT_PROVED. Read-only probes now pass the exact production CLOSE_READY and READY checks; getMe/getWebhookInfo return HTTP 200, no webhook, no pending updates. No positions/orders were changed. Current readiness does not retrospectively establish why the earlier request failed.

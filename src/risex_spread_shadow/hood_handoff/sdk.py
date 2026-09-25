@@ -22,6 +22,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Mapping, Protocol
 
+from .read_errors import ReadRateLimited, retry_after_delay
 from .contracts import (
     AccountMarginEvidence,
     AccountSnapshot,
@@ -484,6 +485,8 @@ class PlainAioHttp:
             headers={"Authorization": authorization},
             allow_redirects=False,
         ) as response:
+            if response.status == 429:
+                raise ReadRateLimited(retry_after_delay(response.headers))
             raw = await response.text()
             try:
                 payload = json.loads(raw)

@@ -39,6 +39,7 @@ from .contracts import (
     _bool,
 )
 from .journal import DurableJournal, sanitize_exception
+from .read_errors import read_rate_limit_delay
 
 
 @runtime_checkable
@@ -3053,12 +3054,48 @@ class HandoffEngine:
         journal: DurableJournal,
         unknown_reasons: list[str],
     ) -> LegReconciliation:
+        deadline = self.clock.now() + config.reconcile_timeout_seconds
+        monotonic_deadline = time.monotonic() + config.reconcile_timeout_seconds
+        rate_limit_retries = 0
+        rate_limit_exhausted = False
+
+        async def read_with_cooldown(read, kind):
+            nonlocal rate_limit_retries, rate_limit_exhausted
+            if rate_limit_exhausted:
+                raise TimeoutError("reconciliation rate-limit budget exhausted")
+            while True:
+                remaining = min(deadline - self.clock.now(), monotonic_deadline - time.monotonic())
+                if remaining <= 0:
+                    raise TimeoutError('reconciliation read deadline exceeded')
+                try:
+                    value = await asyncio.wait_for(read(), timeout=remaining)
+                    if self.clock.now() >= deadline or time.monotonic() >= monotonic_deadline:
+                        raise TimeoutError('reconciliation read deadline exceeded')
+                    return value
+                except Exception as exc:
+                    retry_after = read_rate_limit_delay(exc)
+                    if retry_after is None:
+                        raise
+                    rate_limit_retries += 1
+                    delay = max(self._poll_interval, min(8.0, 2.0 ** min(rate_limit_retries - 1, 3)), retry_after)
+                    remaining = min(deadline - self.clock.now(), monotonic_deadline - time.monotonic())
+                    retry = rate_limit_retries < config.max_poll_count and delay < remaining
+                    journal.append('RECONCILIATION_RATE_LIMIT', {
+                        'leg': plan.side, 'kind': kind, 'attempt': rate_limit_retries,
+                        'delay_seconds': delay if retry else 0.0, 'will_retry': retry,
+                    }, run_id=run_id)
+                    if not retry:
+                        rate_limit_exhausted = True
+                        raise
+                    await self._sleep(delay)
+
         local_unknown: list[str] = []
         if expected_identity and before.source_identity != expected_identity:
             local_unknown.append("initial account identity does not match the bound plan")
         if dispatched and order_id is None:
             try:
-                discovered = await self._lookup_order(plan, None, client_order_index=plan.client_order_index)
+                discovered = await read_with_cooldown(
+                    lambda: self._lookup_order(plan, None, client_order_index=plan.client_order_index), 'order_discovery')
             except Exception as exc:
                 discovered = None
                 local_unknown.append(f"{plan.side.lower()} order lookup by client id failed: {sanitize_exception(exc)}")
@@ -3069,7 +3106,6 @@ class HandoffEngine:
         trades: list[TradeReceipt] = []
         seen: dict[tuple[Any, ...], TradeReceipt] = {}
         complete = not (dispatched and order_id is not None)
-        deadline = self.clock.now() + config.reconcile_timeout_seconds
         history_requested = dispatched and order_id is not None
         if dispatched and order_id is None:
             complete = False
@@ -3149,7 +3185,7 @@ class HandoffEngine:
                         break
                     try:
                         page = _as_page(
-                            await self._bounded(
+                            await read_with_cooldown(lambda: self._bounded(
                                 self.client.list_trades(
                                     plan.account_index,
                                     plan.market_id,
@@ -3158,7 +3194,7 @@ class HandoffEngine:
                                     limit=100,
                                 ),
                                 "trade history read",
-                            )
+                            ), 'trade_history')
                         )
                         last_history_error = None
                     except ContractError as exc:
@@ -3210,10 +3246,10 @@ class HandoffEngine:
 
             try:
                 after = _as_account(
-                    await self._bounded(
+                    await read_with_cooldown(lambda: self._bounded(
                         self.client.account_snapshot(plan.account_index, plan.market_id),
                         "final account read",
-                    )
+                    ), 'account')
                 )
                 last_account_error = None
             except ContractError as exc:
@@ -3247,11 +3283,11 @@ class HandoffEngine:
 
             if dispatched:
                 try:
-                    order = await self._lookup_order(
+                    order = await read_with_cooldown(lambda: self._lookup_order(
                         plan,
                         order_id,
                         client_order_index=plan.client_order_index,
-                    )
+                    ), 'order')
                     last_order_error = None
                 except ContractError as exc:
                     order = None
@@ -3348,6 +3384,7 @@ class HandoffEngine:
                 and not order_identity_conflict
                 and not account_identity_conflict
                 and not read_validation_barrier
+                and not rate_limit_exhausted
                 and not any(reason == "trade history cursor repeated" for reason in local_unknown)
             )
             needs_retry = bool(

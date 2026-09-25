@@ -15,6 +15,7 @@ import math
 import os
 from pathlib import Path
 import re
+import random
 import stat
 import sys
 import time
@@ -181,7 +182,7 @@ class Telegram:
 
 
 class Controller:
-    def __init__(self, owner, config, store, transport, launch, *, now=time.time, accounts=None, recovery=None, close=None):
+    def __init__(self, owner, config, store, transport, launch, *, now=time.time, accounts=None, recovery=None, close=None, series_sleep=None, series_delay=None):
         self.owner = owner
         self.config = config
         self.operator = config.parent
@@ -192,6 +193,9 @@ class Controller:
         self.recovery = recovery
         self.close = close
         self._checking = False
+        self._series_sleep = series_sleep or asyncio.sleep
+        self._series_delay = series_delay or (lambda: random.SystemRandom().randint(5, 30))
+        self._series_pause = None
         self.now = now
         self.started = now()
         self.task = None
@@ -381,6 +385,10 @@ class Controller:
         if self._checking:
             return '<b>Проверяю текущие позиции и старые ордера</b>\nНовая операция ещё не отправлялась.'
         active = self.store.data['active']
+        if self._series_pause is not None:
+            return (f'<b>Пауза между циклами: {self._series_pause} сек.</b>\n'
+                    f'Следующий цикл: {active["series_index"]}/{active["series_total"]}. '
+                    'После паузы заново проверю позиции и заявки.')
         refusal = views.admission_refusal_message(self.store.data.get('last_admission'))
         if refusal:
             return refusal
@@ -553,6 +561,15 @@ class Controller:
         for field in ('phase', 'auto_close_before', 'auto_close_slot'):
             active.pop(field, None)
         self.store.save()
+        delay = self._series_delay()
+        if not integer(delay) or not 5 <= delay <= 30:
+            raise RuntimeError('invalid inter-cycle delay')
+        self._series_pause = delay
+        self.queue_notice(self.cycle_notice(f'Пауза перед следующим циклом: {delay} сек.'))
+        try:
+            await self._series_sleep(delay)
+        finally:
+            self._series_pause = None
         if self.recovery is None:
             raise RuntimeError('series recovery is unavailable')
         self.queue_notice(self.cycle_notice('Проверяю позиции и старые ордера перед следующим открытием.'))

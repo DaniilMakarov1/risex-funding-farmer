@@ -56,6 +56,7 @@ from .engine import (
     _as_receipt,
     run_handoff,
 )
+from .read_errors import read_rate_limit_delay
 from .journal import DurableJournal, sanitize_exception
 from .provenance import capture_provenance
 from .local_attempt import select_automatic_prices
@@ -849,29 +850,8 @@ class _RateLimitedAccount(_RetryablePreparationFailure):
 
 
 def _account_rate_limit(exc: Exception, label: str) -> _RateLimitedAccount | None:
-    # SDK bodies/headers can contain credentials: never stringify the exception.
-    try:
-        from lighter.exceptions import ApiException
-    except ImportError:
-        return None
-    if not isinstance(exc, ApiException) or type(exc.status) is not int or exc.status != 429:
-        return None
-    delay = 0.0
-    headers = exc.headers
-    if isinstance(headers, Mapping):
-        raw = next((v for k, v in headers.items() if str(k).lower() == "retry-after"), None)
-        if isinstance(raw, str):
-            try:
-                delay = float(raw)
-            except ValueError:
-                from email.utils import parsedate_to_datetime
-                try:
-                    delay = parsedate_to_datetime(raw).timestamp() - time.time()
-                except (TypeError, ValueError, OverflowError):
-                    delay = 0.0
-    if not math.isfinite(delay) or delay < 0:
-        delay = 0.0
-    return _RateLimitedAccount(label, delay)
+    delay = read_rate_limit_delay(exc)
+    return None if delay is None else _RateLimitedAccount(label, delay)
 
 
 @dataclass(slots=True)
@@ -962,6 +942,10 @@ class _BoundMarketClient:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
+            # A typed transport limit proves no identity mismatch. Preserve it
+            # for bounded read-only reconciliation; never resend the mutation.
+            if read_rate_limit_delay(exc) is not None:
+                raise
             reason = f"{label} account identity/read validation failed"
             if self._identity_failure_callback is not None:
                 self._identity_failure_callback(reason)

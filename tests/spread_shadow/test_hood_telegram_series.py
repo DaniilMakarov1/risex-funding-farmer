@@ -324,7 +324,9 @@ async def test_server_series_spawns_five_fixed_children_without_reusing_command(
     monkeypatch.setattr(bot.aiohttp, 'ClientSession', Session)
     monkeypatch.setattr(bot.asyncio, 'create_subprocess_exec', create)
     real = bot.Controller
-    monkeypatch.setattr(bot, 'Controller', lambda *a, **k: real(*a, **k, now=lambda: 1000))
+    async def no_wait(seconds):
+        assert 5 <= seconds <= 30
+    monkeypatch.setattr(bot, 'Controller', lambda *a, **k: real(*a, **k, now=lambda: 1000, series_sleep=no_wait))
     original_is_file = Path.is_file
     monkeypatch.setattr(Path, 'is_file',
                         lambda p: True if str(p).endswith('.venv-hood/bin/python') else original_is_file(p))

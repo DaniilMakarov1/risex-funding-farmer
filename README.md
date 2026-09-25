@@ -1,3 +1,9 @@
+## Cycle spacing and temporary read limits
+
+Finite Telegram series wait a newly sampled 5–30 seconds after each safely completed cycle before checking accounts for the next cycle. The first cycle starts normally; no extra pause follows the final cycle. Telegram announces the chosen pause and `/status` displays it. Fresh readiness checks follow the pause, so actual spacing can be longer. A restart never resumes the old series automatically.
+
+Temporary HTTP 429 during final reconciliation triggers bounded read-only cooldown and a short background notice. Orders are not resent. If terminal execution or exact flatness still cannot be proved within the configured bounds, the series stops with an honest incomplete result. Existing USD PnL and volume reporting continues to include proved external executions.
+
 # Accepted command but no new cycle
 
 If readiness refuses a command, /status now shows the rejected command ID, check stage, time and safe failure category even when the original Telegram reply was not delivered or the controller restarted. Acceptance means the command was received, not that an order was sent. A fresh /run performs new checks; a consumed command is never replayed. Detailed historic series results remain available through /report. Transport diagnostics deliberately omit tokens, request URLs and response bodies.
