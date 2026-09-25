@@ -841,6 +841,12 @@ class _RetryablePreparationFailure(PreflightBlocked):
     """A bounded read/preparation failure that may become valid on refresh."""
 
 
+class _OpeningQuantityRefresh(_RetryablePreparationFailure):
+    def __init__(self, reason, selection):
+        super().__init__(reason)
+        self.selection = selection
+
+
 class _RateLimitedAccount(_RetryablePreparationFailure):
     """Fixed, credential-free HTTP 429 context for read-only backoff."""
 
@@ -2060,6 +2066,7 @@ class RandomCycleEngine:
         self._identity_barrier: str | None = None
         self._selection: RandomCycleSelection | None = None
         self._leverage_fractions: dict[int, int] = {}
+        self._opening_handoff_started = False
         self._opening_plan_evidence: dict[str, dict[str, Any]] = {}
         self._last_account_observations: dict[int, AccountSnapshot] = {}
         self._pending_nonces: dict[int, Any] = {}
@@ -2137,6 +2144,7 @@ class RandomCycleEngine:
         self._identity_barrier = None
         self._selection = None
         self._leverage_fractions: dict[int, int] = {}
+        self._opening_handoff_started = False
         self._opening_plan_evidence = {}
         self._last_account_observations = {}
         if not config.operator_execution_opt_in or not config.operator_plan_reviewed:
@@ -2483,6 +2491,7 @@ class RandomCycleEngine:
                     "journal_path": opening_config.journal_path,
                 },
             )
+            self._opening_handoff_started = True
             self._stage = "OPENING"
             opening = await self._run_prepared_handoff(opening_config, metadata, source, receiver)
             self._stage = "OPENING_RECONCILED"
@@ -2991,9 +3000,10 @@ class RandomCycleEngine:
         """Refresh all pre-mutation facts inside the shared pair budget.
 
         The first quantity/hold draw is already proved in ``selection``.  A
-        fresh quote may replace only the prices and admissible bounds; it may
-        never trigger another random draw or silently change the selected
-        quantity.  Once this method returns successfully, callers are allowed
+        fresh quote may replace prices and bounds. A proved margin shortfall
+        before the first handoff may reduce quantity, with a durable event and
+        another fresh preparation attempt; never draw again or resize later.
+        Once this method returns successfully, callers are allowed
         to cross the first-mutation boundary.  Every failure is handled here
         so a terminal preflight result retains the proved selection.
         """
@@ -3041,6 +3051,16 @@ class RandomCycleEngine:
                     },
                 )
                 if retryable and budget.available:
+                    if isinstance(exc, _OpeningQuantityRefresh):
+                        journal.append("OPENING_QUANTITY_RECALCULATED", {
+                            "attempt": attempt,
+                            "old_quantity": format(current_selection.quantity, "f"),
+                            "new_quantity": format(exc.selection.quantity, "f"),
+                            "next_attempt": budget.used + 1,
+                            "reason": "fresh quote and confirmed margin budget",
+                        })
+                        current_selection = exc.selection
+                        self._selection = current_selection
                     journal.append(
                         "PREPARATION_RETRY",
                         {
@@ -3366,22 +3386,44 @@ class RandomCycleEngine:
         for row in budgets:
             if row["target_imf_bps"] is not None and row["observed_imf_bps"] != row["target_imf_bps"]:
                 raise PreflightBlocked(f"{row['role']} leverage changed before opening mutation")
+        # Identity is checked before a smaller size can be proposed.
+        for current, initial in ((source, initial_source), (receiver, initial_receiver)):
+            if initial is not None and current.source_identity != initial.source_identity:
+                self._mark_identity_failure("account identity changed before opening mutation")
+                raise PreflightBlocked("account identity changed before opening mutation")
+        reason = "fresh available balance no longer funds the selected quantity"
         if budget_failures:
             label, account_index, shortfall = budget_failures[0]
-            raise PreflightBlocked(
-                f"{label} selected quantity exceeds fresh free-balance margin model "
-                f"(account {account_index}; shortfall {format(shortfall, 'f')} quote)"
-            )
-        refreshed_bounds = compute_quantity_bounds(metadata, source, receiver, proposal.source_limit_price,
-                                                   receiver_bound=proposal.receiver_worst_price, direction=config.direction,
-                                                   initial_reserve_quote=(config.margin_reserve.dispatch_quote
-                                                                          if config.margin_reserve else Decimal(0)))
+            reason = (f"{label} selected quantity exceeds fresh free-balance margin model "
+                      f"(account {account_index}; shortfall {format(shortfall, 'f')} quote)")
+        try:
+            refreshed_bounds = compute_quantity_bounds(metadata, source, receiver, proposal.source_limit_price,
+                receiver_bound=proposal.receiver_worst_price, direction=config.direction,
+                initial_reserve_quote=dispatch_reserve)
+        except PreflightBlocked:
+            if budget_failures:
+                raise PreflightBlocked(reason) from None
+            raise
         if refreshed_bounds.size_step != selection.bounds.size_step:
             raise PreflightBlocked("opening size grid changed before mutation")
-        if selection.quantity_tick < refreshed_bounds.minimum_base_tick or selection.quantity_tick < refreshed_bounds.minimum_quote_tick:
+        if selection.quantity_tick < refreshed_bounds.lower_tick:
             raise PreflightBlocked("selected quantity no longer meets a fresh venue minimum")
-        if not refreshed_bounds.lower_tick <= selection.quantity_tick <= refreshed_bounds.upper_tick:
-            raise PreflightBlocked("fresh available balance no longer funds the selected quantity")
+        if budget_failures or selection.quantity_tick > refreshed_bounds.upper_tick:
+            if not config.confirmed_pilot and not self._opening_handoff_started:
+                # Costs are linear in quantity at these exact observed quotes,
+                # fee bounds and confirmed IMF. Round down; never raise leverage.
+                upper_tick = min(selection.quantity_tick, refreshed_bounds.upper_tick)
+                for row in budgets:
+                    if row["total_required"] is None or row["observed_imf_bps"] is None:
+                        raise PreflightBlocked(reason)
+                    unit_cost = Decimal(row["total_required"]) / selection.quantity
+                    cap = (Decimal(row["available_balance"]) - dispatch_reserve) / unit_cost
+                    upper_tick = min(upper_tick, int((cap / refreshed_bounds.size_step).to_integral_value(rounding=ROUND_FLOOR)))
+                if refreshed_bounds.lower_tick <= upper_tick < selection.quantity_tick:
+                    resized = replace(selection, quantity=upper_tick * refreshed_bounds.size_step,
+                                      quantity_tick=upper_tick, bounds=refreshed_bounds)
+                    raise _OpeningQuantityRefresh(reason, resized)
+            raise PreflightBlocked(reason)
         if config.confirmed_pilot:
             self._pilot_notional_guard(selection.quantity, proposal.source_limit_price,
                                        proposal.receiver_worst_price)

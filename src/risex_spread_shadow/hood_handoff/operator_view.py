@@ -146,7 +146,7 @@ def read_lifecycle(path):
     path = Path(path)
     if path.is_symlink():
         return None
-    state = {'stage': 'PREPARING', 'binding': {}, 'opening': {}, 'holding': {}}
+    state = {'stage': 'PREPARING', 'binding': {}, 'opening': {}, 'holding': {}, 'size_updates': []}
     run_id = None
     previous_at = -1
     total = 0
@@ -175,6 +175,9 @@ def read_lifecycle(path):
                 event, payload = row.get('event'), mapping(row.get('payload'))
                 if event == 'CYCLE_STARTED':
                     state['binding'] = dict(mapping(payload.get('binding')))
+                elif event == 'OPENING_QUANTITY_RECALCULATED':
+                    if len(state['size_updates']) < 6:
+                        state['size_updates'].append({k: payload.get(k) for k in ('attempt', 'old_quantity', 'new_quantity')})
                 elif event == 'INITIAL_SPREAD_WAIT':
                     state['stage'] = 'SPREAD_WAIT'
                 elif event == 'INITIAL_SPREAD_READY':

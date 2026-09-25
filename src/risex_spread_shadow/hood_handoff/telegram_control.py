@@ -500,6 +500,13 @@ class Controller:
                         if key not in sent:
                             sent.add(key)
                             self.queue_notice(self.cycle_notice(views.execution_message(notice)))
+                    for resized in (progress or {}).get('size_updates', []):
+                        key = f'size-{resized.get("attempt")}'
+                        if key not in sent:
+                            sent.add(key)
+                            self.queue_notice(self.cycle_notice(
+                                f'Пересчитал объём по свежей марже: {views.amount(resized.get("old_quantity"))} → '
+                                f'{views.amount(resized.get("new_quantity"))}. Проверяю перед открытием.'))
                     stage = progress.get('stage') if progress else None
                     if stage in {'SPREAD_WAIT', 'HOLD', 'CLOSING', 'RECOVERY'} and stage not in sent:
                         sent.add(stage)
