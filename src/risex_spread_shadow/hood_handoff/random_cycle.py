@@ -841,6 +841,27 @@ class _RetryablePreparationFailure(PreflightBlocked):
     """A bounded read/preparation failure that may become valid on refresh."""
 
 
+def _pre_source_stream_transient(result: HandoffResult) -> bool:
+    guard = result.priority_guard if isinstance(result.priority_guard, Mapping) else {}
+    return bool(result.retryable_pair and guard.get("pre_source_stream") == "TRANSIENT")
+
+
+def _stream_settle_payload(result: HandoffResult, config: "RandomCycleConfig") -> dict[str, Any]:
+    if not _pre_source_stream_transient(result):
+        return {}
+    return {"stream_settle_seconds": config.poll_interval_seconds}
+
+
+async def _stream_settle(clock: Any, result: HandoffResult, config: "RandomCycleConfig") -> None:
+    """Give the local stream one poll interval to deliver pending terminal events.
+
+    Used only after a proved zero-mutation pre-source refusal; the following
+    attempt still performs its own complete fresh preparation and checks.
+    """
+    if _pre_source_stream_transient(result):
+        await clock.sleep(config.poll_interval_seconds)
+
+
 class _OpeningQuantityRefresh(_RetryablePreparationFailure):
     def __init__(self, reason, selection):
         super().__init__(reason)
@@ -2518,8 +2539,10 @@ class RandomCycleEngine:
                     "reason": opening.reason,
                     "guard": opening.priority_guard,
                     "lineage": {"used": pair_budget.used, "limit": pair_budget.limit},
+                    **_stream_settle_payload(opening, config),
                 },
             )
+            await _stream_settle(self.clock, opening, config)
             retry_prepared = await self._prepare_open_with_retries(
                 config,
                 journal,
@@ -3737,8 +3760,10 @@ class RandomCycleEngine:
                         "reason": closing.reason,
                         "guard": closing.priority_guard,
                         "lineage": {"used": budget.used, "limit": budget.limit},
+                        **_stream_settle_payload(closing, config),
                     },
                 )
+                await _stream_settle(self.clock, closing, config)
             return blocked(f"paired closing shared pair-attempt budget exhausted ({budget.used}/{budget.limit})")
         except asyncio.CancelledError:
             raise

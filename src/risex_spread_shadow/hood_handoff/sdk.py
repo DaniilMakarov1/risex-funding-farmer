@@ -27,6 +27,7 @@ from .contracts import (
     AccountMarginEvidence,
     AccountSnapshot,
     ContractError,
+    TransientStreamContractError,
     HandoffConfig,
     HistoryPage,
     LeverageNotSent,
@@ -732,9 +733,9 @@ class LighterSdkClient:
         if state.observer.malformed or state.observer.order_conflicts or state.reads.invalid_orders:
             raise ContractError("WS admission stream contains invalid order evidence")
         if state.reads.book(time.monotonic(), 0.5) is None:
-            raise ContractError("WS admission book is stale or unavailable")
+            raise TransientStreamContractError("WS admission book is stale or unavailable")
         if any(order.active for order, _ in state.reads.orders.values()):
-            raise ContractError("WS admission observed an active order before source dispatch")
+            raise TransientStreamContractError("WS admission observed an active order before source dispatch")
         return {"owner": self, "state": state, "epoch": state.observer.epoch,
                 "versions": dict(state.order_versions),
                 "malformed": state.observer.malformed, "conflicts": state.observer.order_conflicts}

@@ -36,6 +36,7 @@ from .contracts import (
     Phase,
     PreflightBlocked,
     TradeReceipt,
+    TransientStreamContractError,
     _bool,
 )
 from .journal import DurableJournal, sanitize_exception
@@ -1048,12 +1049,17 @@ class HandoffEngine:
         ack_admission = paired_mode and config.receiver_admission == "ack"
         stream_admission = paired_mode and config.receiver_admission in ("ws_confirmed", "ack")
         ws_anchor = None
+        pre_source_stream: str | None = None
         if stream_admission and not unknown_reasons:
             try:
                 if not prepared_dispatch_enabled:
                     raise PreflightBlocked("WS admission requires both orders prepared before LIMIT")
                 ws_anchor = self.client.begin_ws_admission()
             except Exception as exc:
+                # Only an explicitly typed convergence refusal may later be
+                # retried; a dead/invalid stream or any other failure may not.
+                pre_source_stream = ("TRANSIENT" if isinstance(exc, TransientStreamContractError)
+                                     else "UNAVAILABLE")
                 unknown_reasons.append(f"WS_ADMISSION_STOP: pre-source stream unavailable: {sanitize_exception(exc)}")
         try:
             if not unknown_reasons:
@@ -1228,9 +1234,13 @@ class HandoffEngine:
 
         if ack_admission and source_receipt is not None:
             source_order_id = source_receipt.order_id
-        if ack_admission and (source_receipt is None or not source_receipt.accepted
-                              or type(source_receipt.response_code) is not int or source_receipt.response_code != 200
-                              or source_receipt.error is not None):
+        if ack_admission and source_dispatch_attempted and (
+                source_receipt is None or not source_receipt.accepted
+                or type(source_receipt.response_code) is not int or source_receipt.response_code != 200
+                or source_receipt.error is not None):
+            # A refusal before the source send already explains the stop; an
+            # extra "ACK not proved" would turn a proved zero-mutation attempt
+            # into UNKNOWN and suppress the existing reduce-only recovery.
             unknown_reasons.append("ACK_ADMISSION_STOP: positive application ACK is not proved")
         if stream_admission and not unknown_reasons and (source_order is not None or ack_admission):
             local_started = time.perf_counter()
@@ -1658,6 +1668,8 @@ class HandoffEngine:
                     "book_observed_at": first_book.get("observed_at"),
                 }
             priority_guard["admission_reasons"] = list(unknown_reasons[:8])
+            if pre_source_stream is not None:
+                priority_guard["pre_source_stream"] = pre_source_stream
             journal.append(
                 "PRE_RECEIVER_GUARD",
                 {
@@ -2775,6 +2787,22 @@ class HandoffEngine:
     ) -> bool:
         if priority_guard is None:
             return False
+        if priority_guard.get("pre_source_stream") == "TRANSIENT":
+            # Proved zero-mutation attempt: the local stream view had not
+            # converged before the source send.  Retry only when nothing was
+            # sent on either account and both legs reconcile unchanged.
+            return (
+                len(unknown_reasons) == 1
+                and str(unknown_reasons[0]).startswith("WS_ADMISSION_STOP: pre-source stream unavailable: ")
+                and not source.dispatched and not receiver.dispatched
+                and source.order is None and receiver.order is None
+                and not source.trades and not receiver.trades
+                and source.filled_quantity == 0 and receiver.filled_quantity == 0
+                and source.history_complete and receiver.history_complete
+                and not source.unknown_reasons and not receiver.unknown_reasons
+                and source.position_after == source.position_before
+                and receiver.position_after == receiver.position_before
+            )
         ws_liquidity_veto = (
             (priority_guard.get("status"), priority_guard.get("receiver_admission"))
             in {("WS_REFUSED", "ws_confirmed"), ("ACK_REFUSED", "ack")}

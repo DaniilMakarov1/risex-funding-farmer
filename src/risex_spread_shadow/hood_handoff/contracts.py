@@ -132,6 +132,16 @@ class PreflightBlocked(ContractError):
     """A required pre-mutation condition is not proven."""
 
 
+class TransientStreamContractError(ContractError):
+    """The local private-stream view has not converged before the source send.
+
+    Raised only before any order is sent (for example a stale book frame or a
+    previously cancelled own order that REST already proved terminal but whose
+    WS terminal event has not arrived yet).  Nothing was mutated; the caller may
+    retry within its existing attempt budget after fresh preparation.
+    """
+
+
 class LeverageNotSent(ContractError):
     """The leverage adapter proved that transport was never entered."""
 
