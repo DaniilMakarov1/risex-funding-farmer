@@ -217,7 +217,7 @@ async def test_series_without_new_slot_never_reuses_previous_cycle_card(tmp_path
     assert any('Серия' in m for m in messages)
 
 
-async def test_single_run_sends_one_card_instead_of_long_summary(tmp_path):
+async def test_single_run_sends_start_and_one_card_instead_of_long_summary(tmp_path):
     async def launch(**options):
         cycle_slot(tmp_path, 1)
     c = setup(tmp_path, launch)
@@ -225,8 +225,9 @@ async def test_single_run_sends_one_card_instead_of_long_summary(tmp_path):
     await c.task
     await c._notice_task
     messages = [m for _, m in c.transport.messages]
-    assert len(messages) == 2 and 'Принято: один цикл' in messages[0]
-    assert '<b>Цикл</b> · <code>cycle-001</code>' in messages[1]
+    assert len(messages) == 3 and 'Принято: один цикл' in messages[0]
+    assert messages[1].startswith('▶️ <b>Цикл</b> · начинаю')
+    assert '<b>Цикл</b> · <code>cycle-001</code>' in messages[2]
 
 
 def journal_row(sequence, event, payload=None, at=None):
@@ -234,26 +235,92 @@ def journal_row(sequence, event, payload=None, at=None):
                        'event': event, 'payload': payload or {}}) + '\n'
 
 
-async def test_rare_alerts_only_including_resize_and_429(tmp_path, monkeypatch):
+async def test_live_steps_and_alerts_are_pushed_once_each(tmp_path, monkeypatch):
     slot = tmp_path / 'cycle-001'
     slot.mkdir()
     (slot / 'cycle.jsonl').write_text(
         journal_row(1, 'CYCLE_STARTED', {'binding': {}}) + journal_row(2, 'INITIAL_SPREAD_WAIT')
         + journal_row(3, 'OPENING_QUANTITY_RECALCULATED', {'attempt': 1, 'old_quantity': '0.00087',
-                                                             'new_quantity': '0.00070'})
-        + journal_row(4, 'HOLD_ANCHORED', {'hold_seconds': 20}))
-    monkeypatch.setattr(bot, 'read_execution_notices', lambda path: [
-        ('opening-1-accepted', 'LIMIT'), ('opening-1-limited', '429'), ('opening-1-execution', 'done')])
+                                                             'new_quantity': '0.00070'}))
+    steps = [('opening-1-accepted', '⏳', 'открываю: LIMIT'), ('opening-1-limited', '⚠️', 'открытие: HTTP 429'),
+             ('opening-1-execution', '🟢', 'открыто: 🤝 свои счета')]
+    seen = []
+    def fake(path, progress):
+        seen.append(path)
+        return steps
+    monkeypatch.setattr(bot, 'phase_notices', fake)
     c = setup(tmp_path, None)
     c.store.data['active'] = {'action': 'run', 'before': [], 'series_index': 1, 'series_total': 2}
     task = asyncio.create_task(c.lifecycle_notices())
-    await asyncio.sleep(0.8)
+    await asyncio.sleep(1.2)
     c.store.data['active'] = None
     await asyncio.wait_for(task, 2)
     await c._notice_task
     messages = [m for _, m in c.transport.messages]
-    assert len(messages) == 3
-    assert any(m.startswith('↘️ <b>Цикл 1/2</b> · объём уменьшен по свежей марже: 0.00087 → 0.0007 BTC') for m in messages)
-    assert any(m.startswith('⏳ <b>Цикл 1/2</b> · жду спред') for m in messages)
-    assert any('HTTP 429' in m and m.startswith('⚠️') for m in messages)
-    assert not any('LIMIT' in m or 'done' in m for m in messages)
+    assert len(seen) >= 2 and all(path == slot for path in seen)  # Polled repeatedly, sent once.
+    assert messages.count('⏳ <b>Цикл 1/2</b> · открываю: LIMIT') == 1
+    assert messages.count('⚠️ <b>Цикл 1/2</b> · открытие: HTTP 429') == 1
+    assert messages.count('🟢 <b>Цикл 1/2</b> · открыто: 🤝 свои счета') == 1
+    assert sum(m.startswith('↘️ <b>Цикл 1/2</b> · объём уменьшен по свежей марже: 0.00087 → 0.0007 BTC')
+               for m in messages) == 1
+    assert sum(m.startswith('⏳ <b>Цикл 1/2</b> · жду спред') for m in messages) == 1
+    assert len(messages) == 5
+
+
+def test_phase_notices_follow_attempt_order_and_survive_partial_writes(tmp_path):
+    from risex_spread_shadow.hood_handoff.telegram_cards import phase_notices
+    cycle_slot(tmp_path, 1, fixture='007')
+    slot = tmp_path / 'cycle-001'
+    with (slot / 'opening-attempt-003.jsonl').open('a') as stream:
+        stream.write('{"sequence":')  # The child is still writing.
+    keys = [key for key, _, _ in phase_notices(slot)]
+    assert keys[:4] == ['opening-1-accepted', 'opening-1-execution', 'opening-2-accepted', 'opening-2-execution']
+    assert 'opening-3-accepted' in keys
+    notices = {key: (icon, message) for key, icon, message in phase_notices(slot)}
+    assert notices['opening-2-accepted'][1].startswith('открываю (попытка 2): LIMIT 11 SELL 0.0002 BTC по ')
+    # Old fixture receipts do not prove counterparties: never shown as own fills.
+    assert notices['opening-1-execution'] == ('❔', 'открытие: исполнение не доказано')
+
+
+def leg(*trades):
+    from types import SimpleNamespace
+    items = [SimpleNamespace(quantity=Decimal(q), counterparty_account_index=peer) for q, peer in trades]
+    return SimpleNamespace(trades=items, filled_quantity=sum((t.quantity for t in items), Decimal(0)))
+
+
+PLANS = {'source': {'account_index': 11}, 'receiver': {'account_index': 22}}
+LATENCY = {'source_to_receiver_intent_seconds': 0.3184, 'receiver_submit_ack_seconds': 0.3221}
+
+
+@pytest.mark.parametrize('case', ['own_open', 'own_close', 'external', 'mixed', 'empty', 'unproved'])
+def test_execution_step_text_is_truthful_and_brief(monkeypatch, case):
+    from risex_spread_shadow.hood_handoff import operator_view
+    from risex_spread_shadow.hood_handoff.telegram_cards import execution_text
+    legs = {'own_open': ({'source': leg(('0.0007', 22)), 'receiver': leg(('0.0007', 11))}, Decimal('0.0007')),
+            'own_close': ({'source': leg(('0.0007', 22)), 'receiver': leg(('0.0007', 11))}, Decimal('0.0007')),
+            'external': ({'source': leg(('0.00055', 26085)), 'receiver': leg()}, Decimal(0)),
+            'mixed': ({'source': leg(('0.0003', 22), ('0.0002', 3026)), 'receiver': leg(('0.0003', 11))}, Decimal('0.0003')),
+            'empty': ({'source': leg(), 'receiver': leg()}, Decimal(0)),
+            'unproved': ({'source': None, 'receiver': None}, Decimal(0))}[case]
+    monkeypatch.setattr(operator_view, 'execution_legs', lambda receipt: (legs[0], legs[1], PLANS))
+    receipt = {'latency': LATENCY}
+    if case == 'empty':
+        receipt = {'latency': {'source_to_receiver_decision_seconds': 0.349},
+                   'priority_guard': {'priority_reason': 'WS_ADMISSION_STOP: L2 shows better-priced volume'}}
+    progress = {'stage': 'HOLD', 'holding': {'seconds': 85, 'started_at': 1790398259.0,
+                                             'planned_closing_at': 1790398344.0}}
+    phase = 'closing' if case in ('own_close', 'external') else 'opening'
+    icon, message = execution_text(phase, 2 if case == 'mixed' else 1, receipt, progress)
+    expected = {
+        'own_open': ('🟢', 'открыто: 🤝 свои счета 0.0007 BTC\n'
+                           'LIMIT→MARKET 318 мс · ответ MARKET 322 мс · удержание 1 мин 25 с (закрытие ≈ 07:52:24)'),
+        'own_close': ('✅', 'закрыто: 🤝 свои счета 0.0007 BTC\nLIMIT→MARKET 318 мс · ответ MARKET 322 мс'),
+        'external': ('⚠️', 'закрытие: LIMIT взяли чужие 0.00055 (счёт 26085)\nLIMIT→MARKET 318 мс · ответ MARKET 322 мс'),
+        'mixed': ('⚠️', 'открытие (попытка 2): 🤝 свои счета 0.0003 BTC; LIMIT взяли чужие 0.0002 (счёт 3026)\n'
+                        'LIMIT→MARKET 318 мс · ответ MARKET 322 мс'),
+        'empty': ('∅', 'открытие не состоялось: сделок нет\nВстречный MARKET остановлен: в стакане появилась '
+                       'более выгодная цена. · LIMIT→решение 349 мс; MARKET не отправлен'),
+        'unproved': ('❔', 'открытие: исполнение не доказано\nLIMIT→MARKET 318 мс · ответ MARKET 322 мс'),
+    }[case]
+    assert (icon, message) == expected
+    valid(message)

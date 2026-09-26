@@ -387,14 +387,16 @@ async def test_series_notices_identify_each_transition_and_end(tmp_path):
     await c.task
     await c._notice_task
     messages = [m for _, m in c.transport.messages]
-    # Accepted, one card per cycle and one final summary: no routine progress.
-    assert len(messages) == 4
+    # Accepted, a start step and a card per cycle, then one final summary.
+    assert len(messages) == 6
     assert 'Принято: серия из 2 циклов' in messages[0]
-    assert '<b>Цикл 1/2</b> · <code>cycle-001</code>' in messages[1]
-    assert 'Следующий цикл через' in messages[1]
-    assert '<b>Цикл 2/2</b> · <code>cycle-002</code>' in messages[2]
-    assert 'Следующий цикл через' not in messages[2]
-    assert 'Серия завершена: 2/2' in messages[3] and 'Итого' in messages[3]
+    assert messages[1].startswith('▶️ <b>Цикл 1/2</b> · начинаю')
+    assert '<b>Цикл 1/2</b> · <code>cycle-001</code>' in messages[2]
+    assert 'Следующий цикл через' in messages[2]
+    assert messages[3].startswith('▶️ <b>Цикл 2/2</b> · начинаю: проверяю счета')
+    assert '<b>Цикл 2/2</b> · <code>cycle-002</code>' in messages[4]
+    assert 'Следующий цикл через' not in messages[4]
+    assert 'Серия завершена: 2/2' in messages[5] and 'Итого' in messages[5]
 
 
 async def test_notice_queue_is_bounded_and_drops_old_progress(tmp_path):

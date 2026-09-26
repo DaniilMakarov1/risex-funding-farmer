@@ -248,8 +248,12 @@ def ws_admission_notice(reason):
     return 'Встречный MARKET остановлен: актуальное согласованное WS-состояние не подтверждено.'
 
 
-def execution_lines(result, *, phase, attempt=1):
-    """Describe exact terminal legs; never infer own matching from positions."""
+def execution_legs(result):
+    """Validated terminal legs, own matched quantity and plans of one attempt.
+
+    A leg that cannot be proved from its own receipts is None; own matching is
+    never inferred from positions.
+    """
     from .contracts import LegReconciliation, OrderPlan, OrderSnapshot, TradeReceipt
     from .engine import _joint_trade_match
     from .random_cycle import _fallback_order_mismatch_map
@@ -294,6 +298,13 @@ def execution_lines(result, *, phase, attempt=1):
             and mapping(plans.get('source')).get('market_id') == mapping(plans.get('receiver')).get('market_id')
             and mapping(plans.get('source')).get('side') != mapping(plans.get('receiver')).get('side')):
         _, matched, _ = _joint_trade_match(legs['source'], legs['receiver'], number(plans.get('quantity')) or Decimal(0))
+    return legs, matched, plans
+
+
+def execution_lines(result, *, phase, attempt=1):
+    """Describe exact terminal legs; never infer own matching from positions."""
+    result = mapping(result)
+    legs, matched, plans = execution_legs(result)
     label = 'Открытие' if phase == 'opening' else 'Закрытие'
     lines = [f'{label} · попытка {clean(attempt, 8)}']
     for role, kind in (('source', 'LIMIT'), ('receiver', 'MARKET')):

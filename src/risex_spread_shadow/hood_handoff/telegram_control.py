@@ -26,7 +26,8 @@ import aiohttp
 
 from .keychain import MacOSKeychainBackend, read_hidden_secret
 from .offline_report import load_saved_cycle_report
-from .operator_view import amount, read_lifecycle, read_execution_notices, read_launch_failure
+from .operator_view import amount, read_lifecycle, read_launch_failure
+from .telegram_cards import phase_notices
 from .operator_control import exclusive_lock
 from . import telegram_messages as views
 
@@ -521,15 +522,13 @@ class Controller:
                 if len(added) == 1:
                     path = self.operator / added[0] / 'cycle.jsonl'
                     progress = await asyncio.to_thread(read_lifecycle, path)
-                    # Routine progress is summarized by one card after the
-                    # cycle; only rare events are pushed while it runs.
-                    for key, _ in await asyncio.to_thread(read_execution_notices, path):
-                        if key.endswith('-limited') and key not in sent:
+                    # Short phase steps (LIMIT accepted, attempt result with
+                    # LIMIT→MARKET time, 429 cooldown) read from saved journals
+                    # in a worker thread; never awaited by the trading child.
+                    for key, icon, message in await asyncio.to_thread(phase_notices, path.parent, progress):
+                        if key not in sent:
                             sent.add(key)
-                            phase = 'открытие' if key.startswith('opening') else 'закрытие'
-                            self.queue_notice(self.cycle_notice(
-                                f'{phase}: биржа временно ограничила чтение (HTTP 429). '
-                                'Жду и перепроверяю; ордера не повторяются.', '⚠️'))
+                            self.queue_notice(self.cycle_notice(message, icon))
                     for resized in (progress or {}).get('size_updates', []):
                         key = f'size-{resized.get("attempt")}'
                         if key not in sent:
@@ -564,6 +563,8 @@ class Controller:
                         await self._close_before_run()
                     if action == 'close':
                         self.queue_notice('<b>Закрытие</b> · Проверяю остатки; ордера только reduce-only.')
+                    elif step == 1:
+                        self.queue_notice(self.cycle_notice('начинаю: плечо, цена и объём по свежим данным.', '▶️'))
                     await (self.close() if action == 'close' else self.launch(**options))
                     before = set((self.store.data.get('active') or {}).get('before', []))
                     safe = self.finish(retain_active=step < total)
@@ -625,6 +626,7 @@ class Controller:
             self._series_pause = None
         if self.recovery is None:
             raise RuntimeError('series recovery is unavailable')
+        self.queue_notice(self.cycle_notice('начинаю: проверяю счета, затем плечо, цена и объём.', '▶️'))
         proof = await self.recovery(require_flat=False)
         if not isinstance(proof, dict) or proof.get('status') != 'CLOSE_READY':
             raise RuntimeError('next cycle close readiness is unproved')

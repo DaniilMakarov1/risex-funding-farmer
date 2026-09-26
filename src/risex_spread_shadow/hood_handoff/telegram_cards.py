@@ -70,6 +70,117 @@ def clock(value):
         return None
 
 
+def ms(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+        return None
+    return f'{value * 1000:.0f} мс'
+
+
+def accepted_text(phase, attempt, plan):
+    """The exchange accepted our LIMIT: the phase has started."""
+    plan = mapping(plan)
+    source, receiver = mapping(plan.get('source')), mapping(plan.get('receiver'))
+    verb = 'открываю' if phase == 'opening' else 'закрываю'
+    retry = f' (попытка {attempt})' if attempt > 1 else ''
+    return (f'{verb}{retry}: LIMIT {text(source.get("account_index", "?"), 24)} {text(source.get("side", "?"), 8)} '
+            f'{text(btc(source.get("quantity")), 24)} BTC по {text(amount(source.get("price")), 32)} → '
+            f'MARKET {text(receiver.get("account_index", "?"), 24)}')
+
+
+def execution_text(phase, attempt, receipt, progress=None):
+    """(icon, text) for one completed paired attempt from its own validated receipts."""
+    from .operator_view import execution_legs
+    receipt = mapping(receipt)
+    legs, matched, plans = execution_legs(receipt)
+    parts, filled, uncertain, foreign = [], False, False, False
+    if matched:
+        parts.append(f'🤝 свои счета {text(amount(matched), 24)} BTC')
+    for role, label in (('source', 'LIMIT взяли чужие'), ('receiver', 'MARKET исполнился о чужие')):
+        leg = legs.get(role)
+        if leg is None:
+            uncertain = True
+            continue
+        filled = filled or bool(leg.trades)
+        peer = mapping(plans.get('receiver' if role == 'source' else 'source')).get('account_index')
+        outside = [t for t in leg.trades if t.counterparty_account_index is not None
+                   and peer is not None and t.counterparty_account_index != peer]
+        external = sum((t.quantity for t in outside), Decimal(0))
+        if external:
+            foreign = True
+            ids = sorted({str(t.counterparty_account_index) for t in outside})[:3]
+            parts.append(f'{label} {text(amount(external), 24)} (счёт {text(", ".join(ids), 60)})')
+        unproved = max(Decimal(0), leg.filled_quantity - external - matched)
+        if unproved:
+            uncertain = True
+            parts.append(f'контрагент не доказан {text(amount(unproved), 24)}')
+    done = 'открыто' if phase == 'opening' else 'закрыто'
+    retry = f' (попытка {attempt})' if attempt > 1 else ''
+    if uncertain and not parts:
+        icon, head = '❔', f'{"открытие" if phase == "opening" else "закрытие"}{retry}: исполнение не доказано'
+    elif not filled:
+        icon, head = '∅', f'{"открытие" if phase == "opening" else "закрытие"}{retry} не состоялось: сделок нет'
+    elif foreign or uncertain:
+        icon, head = '⚠️', f'{"открытие" if phase == "opening" else "закрытие"}{retry}: ' + '; '.join(parts)
+    else:
+        icon, head = ('🟢' if phase == 'opening' else '✅'), f'{done}{retry}: ' + '; '.join(parts)
+    details = []
+    notice = ws_admission_notice(mapping(receipt.get('priority_guard')).get('priority_reason'))
+    if notice:
+        details.append(text(notice, 200))
+    latency = mapping(receipt.get('latency'))
+    gap, response = ms(latency.get('source_to_receiver_intent_seconds')), ms(latency.get('receiver_submit_ack_seconds'))
+    decision = ms(latency.get('source_to_receiver_decision_seconds'))
+    if gap:
+        details.append(f'LIMIT→MARKET {gap}' + (f' · ответ MARKET {response}' if response else ''))
+    elif decision:
+        details.append(f'LIMIT→решение {decision}; MARKET не отправлен')
+    progress = mapping(progress)
+    holding = mapping(progress.get('holding'))
+    if phase == 'opening' and icon == '🟢' and progress.get('stage') in ('HOLD', 'CLOSING') and holding:
+        hold, closing = seconds(holding.get('seconds')), clock(holding.get('planned_closing_at'))
+        if hold:
+            details.append(f'удержание {hold}' + (f' (закрытие ≈ {closing})' if closing else ''))
+    return icon, head + ('\n' + ' · '.join(details) if details else '')
+
+
+def phase_notices(slot, progress=None):
+    """(key, icon, text) per accepted LIMIT, completed attempt and 429 cooldown.
+
+    Reads only this cycle's saved phase journals in the controller's worker
+    thread; a trailing partial write is simply read again at the next poll.
+    """
+    from .operator_recovery import journal_rows
+    from .random_cycle import MAX_CLOSING_ATTEMPTS, MAX_OPENING_ATTEMPTS
+    notices = []
+    for child in sorted(Path(slot).glob('*.jsonl')):
+        match = re.fullmatch(r'(opening|closing)(?:-attempt-([0-9]{3}))?\.jsonl', child.name)
+        if not match or child.is_symlink():
+            continue
+        phase, attempt = match[1], int(match[2] or 1)
+        if not 1 <= attempt <= (MAX_OPENING_ATTEMPTS if phase == 'opening' else MAX_CLOSING_ATTEMPTS):
+            continue
+        plan, limited = {}, False
+        try:
+            for row in journal_rows(child):
+                event, payload = row['event'], mapping(row['payload'])
+                if event in {'PLAN_READY', 'PLAN_REVIEWED'}:
+                    plan = mapping(payload.get('plan', payload))
+                elif event == 'SOURCE_DISPATCH_RESULT' and payload.get('accepted') is True:
+                    notices.append((f'{phase}-{attempt}-accepted', '⏳', accepted_text(phase, attempt, plan)))
+                elif event == 'RECONCILIATION_RATE_LIMIT' and payload.get('will_retry') is True and not limited:
+                    limited = True
+                    notices.append((f'{phase}-{attempt}-limited', '⚠️',
+                                    f'{"открытие" if phase == "opening" else "закрытие"}: биржа временно ограничила '
+                                    'чтение (HTTP 429). Жду и перепроверяю; ордера не повторяются.'))
+                elif event == 'COMPLETE':
+                    icon, message = execution_text(phase, attempt, payload.get('receipt'), progress)
+                    notices.append((f'{phase}-{attempt}-execution', icon, message))
+        except Exception:
+            continue  # Incomplete trailing write or unproved row: retried at the next poll.
+    rank = {'accepted': 0, 'limited': 1, 'execution': 2}
+    return sorted(notices, key=lambda n: (n[0].startswith('closing'), int(n[0].split('-')[1]), rank[n[0].split('-')[2]]))
+
+
 def phase_row(report, phase):
     rows = mapping(report.get('paired_execution')).get('direct_counterparty_match')
     rows = rows if isinstance(rows, list) else []
@@ -305,7 +416,7 @@ def cycle_card(card, report, slot=None):
     for phase, label in (('opening', 'Открытие'), ('closing', 'Закрытие')):
         line = f'{label}: {phase_details(report, phase)}'
         if phase in gaps and phase_kind(report, phase) not in ('skipped', 'empty'):
-            line += f' · LIMIT→MARKET {gaps[phase]:.2f} с'
+            line += f' · LIMIT→MARKET {ms(gaps[phase])}'
         tries = attempts(report, phase)
         if tries > 1:
             line += f' · попыток {tries}'
