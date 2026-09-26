@@ -329,7 +329,7 @@ async def test_stop_during_a_running_cycle_lets_it_close_then_proves_zero(tmp_pa
     async def close():
         pytest.fail('the cycle closed its own positions')
     c, notices = controller(tmp_path, launch, recover=flat_recovery(calls), close=close)
-    await c.handle(update(1, '/run'))
+    await c.handle(update(1, '/run 1'))
     await entered.wait()
     await c.handle(update(2, '/stop'))
     assert 'Идущий цикл не отправит новых ордеров' in c.transport.messages[-1][1]
@@ -432,7 +432,7 @@ async def test_stop_during_admission_never_launches(tmp_path):
             await release.wait()
         return proof('READY' if require_flat else 'CLOSE_READY')
     c, notices = controller(tmp_path, recover=recover, close=lambda: pytest.fail('no close'))
-    await c.handle(update(1, '/run'))
+    await c.handle(update(1, '/run 1'))
     await entered.wait()
     await c.handle(update(2, '/stop'))
     release.set()
@@ -530,7 +530,7 @@ async def test_run_removes_a_leftover_marker_and_the_old_stop_result(tmp_path):
     tmp_path.chmod(0o700)
     write_stop_request(tmp_path, {'update_id': 0, 'requested_at': 1.0})
     c.store.data['last_stop'] = {'result': 'FLAT', 'completed_at': 1.0}
-    await c.handle(update(1, '/run'))
+    await c.handle(update(1, '/run 1'))
     await c.task
     assert launches == [False] and c.store.data['last_stop'] is None
 
@@ -540,7 +540,7 @@ async def test_run_is_refused_when_the_leftover_marker_cannot_be_removed(tmp_pat
     marker = tmp_path / STOP_REQUEST_NAME
     marker.mkdir()
     (marker / 'x').write_text('')
-    await c.handle(update(1, '/run'))
+    await c.handle(update(1, '/run 1'))
     assert c.task is None and 'Новая операция не начата' in c.transport.messages[-1][1]
 
 
@@ -568,4 +568,5 @@ async def test_stop_texts_are_fixed_and_escaped():
     failed = views.stop_result_message({'result': 'NOT_PROVED', 'reason': 'x' * 400})
     assert 'нулевые позиции не подтверждены' in failed and len(failed) < 600
     assert views.stop_status(None) == '' and 'Выполняется /stop' in views.stop_status(None, running=True)
-    assert '/stop' in views.help_message()
+    assert '/stop' in views.commands_message()
+    assert {'text': '/stop'} in views.RUNNING_MENU['keyboard'][0]

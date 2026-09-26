@@ -1,3 +1,11 @@
+## Telegram menu: `/run` asks how many cycles, `/report` is the last 24 hours
+
+The buttons under the chat now follow what the bot is doing. When nothing runs you see `/run`, `/close`, `/report` and `/accounts`; while a check, cycle, series, pause, close or stop runs you see `/stop`, `/report` and `/accounts`. `/status` and `/help` are gone (the bot answers them like an unknown command and lists the commands).
+
+`/run` always means ACK with a one-tick improvement. The bot asks "Сколько циклов сделать?"; reply with a number, for example `10`, and the series starts with the usual checks. The question waits 5 minutes; after that, after a controller restart, or when you press `/close` or `/stop`, a number starts nothing (press `/run` again). `/accounts` and `/report` keep the question open. A number sent without the question never starts trading. The typed forms still work as before: `/run ack 1 20` starts at once, `/run ws 5 3` uses WS with 5 ticks, and `/run 20` uses the mode and ticks saved in `random-cycle.json` (currently WS, 5 ticks).
+
+`/report` totals the last 24 hours (window shown in Moscow time): number of cycles (✅ paired, 🟡 closed but pair incomplete, ⛔ needs checking, with the ⛔ cycles named), cycles that did not start, turnover, PnL before and after fees and fees. A cycle whose result is not proved is left out, and the sum then says how many cycles it covers, e.g. "— по 102 из 104 циклов". A cycle that is running right now is named and counted after it finishes; separate `/close` or pre-cycle closes are counted but not included in PnL or turnover. The report reads only saved journals; nothing is sent to the exchange. The end-of-series summary is still sent automatically. It now counts every cycle of a wallet-pool series: before, a cycle on a different wallet pair than the first was shown as ⛔ with "PnL ?" (16 of 18 cycles in the 17:09 series). The footnote about USD/USDG, funding and turnover is gone from all messages, and clock times say "МСК".
+
 ## Why cycles 312 and 317 left positions open on 2026-09-26, and what changed
 
 These were the first runs with four wallets, but the wallets themselves were not the cause. In cycle-312 the exchange's live data connection dropped during the hold, so the normal paired close could not start and the system switched to closing each account with reduce-only MARKET orders. It closed 34019 but could not start the order on 27331: the unsent paired-close order still held that account's order number (nonce), and the exchange kept handing out the same number, so +0.00039 BTC stayed open until `/close`. In cycle-317 the connection to the exchange was very slow for about 50 seconds; by the time the closing prices were read, the reserved order number had expired, nothing was sent, but the system treated this as "result unknown", made no further attempt and left both positions (+0.00076 / −0.00076 BTC) open until `/close`.
@@ -239,20 +247,19 @@ After interruption preserve journals/state. A new `/run` checks current position
 
 ## Telegram
 
-Only a fresh exact `/run` or `/close` from the configured numeric owner in their private chat confirms one real operation. `/run` accepts only the documented mode, tick and bounded cycle count; credentials and shell commands are never accepted in chat.
+Only a fresh owner `/run` answered with a cycle count, an explicit `/run …` form or `/close` from the configured numeric owner in their private chat confirms one real operation. `/run` accepts only the documented mode, tick and cycle count; credentials and shell commands are never accepted in chat.
 
 | Command | Action |
 | --- | --- |
-| `/run` | Recheck current readiness; close proved BTC inventory once if present, verify exact flatness, then start one real cycle under the same local configuration. |
-| `/run ack 1 5` | Request five sequential real cycles with ACK admission and one tick. Each next cycle requires a complete, flat prior result and fresh account checks; any uncertainty stops the series. |
-| `/run 5` | Request five sequential cycles with the saved mode and tick settings. Any positive integer count is accepted; for example `/run 20`. |
-| `/close` | Check both configured accounts and close existing positions of this market with bounded reduce-only MARKET/IOC orders. Zero positions send no orders. |
-| `/status` | Short progress or latest saved result, including a terminal-launched cycle when idle. |
-| `/report` | Saved result plus last position times, per-account fees/PnL and bounded diagnostics. |
-| `/accounts` | Current read-only available balance, selected-market position/orders and observation time for fixed A/B accounts. Other markets are not checked. |
-| `/help` | Explain the commands. |
+| `/run` | Ask for the number of cycles (ACK, one tick); a plain number reply within 5 minutes starts that many cycles. Each cycle rechecks readiness, closes proved BTC inventory once if present and verifies exact flatness first. |
+| `/run ack 1 5` | Start five sequential real cycles with ACK admission and one tick at once. Each next cycle requires a complete, flat prior result and fresh account checks; any uncertainty stops the series. |
+| `/run 5` | Start five sequential cycles with the saved mode and tick settings. Any positive integer count is accepted; for example `/run 20`. |
+| `/close` | Check all configured accounts (every pool wallet) and close existing positions of this market with bounded reduce-only MARKET/IOC orders. Zero positions send no orders. |
+| `/stop` | Stop new cycles, end a running one early at a safe point and prove every wallet flat. |
+| `/report` | Totals of the last 24 hours from saved journals: cycles, turnover, PnL, fees. |
+| `/accounts` | Current read-only available balance, selected-market position/orders and observation time. Other markets are not checked. |
 
-Automatic progress notices identify accepted LIMITs and then who filled each LIMIT/MARKET: the exact paired own order, external accounts or unproved counterparties. Opening and closing are separate; dispatch intervals are shown when measured. Notices also cover confirmed HOLD, closing and separate residual recovery while a controller-owned cycle runs. Delivery failures/slowness do not cancel or replay trading. Short stages can finish between observations; the final saved report is authoritative. `/status` and `/report` make no venue requests; `/accounts` does not unlock execution or treat missing/stale observations as zero.
+The keyboard shows `/run` and `/close` when nothing runs and `/stop` while an operation runs. Automatic progress notices identify accepted LIMITs and then who filled each LIMIT/MARKET: the exact paired own order, external accounts or unproved counterparties. Opening and closing are separate; dispatch intervals are shown when measured. Notices also cover confirmed HOLD, closing and separate residual recovery while a controller-owned cycle runs. Delivery failures/slowness do not cancel or replay trading. Short stages can finish between observations; the final saved report is authoritative. `/report` makes no venue requests; `/accounts` does not unlock execution or treat missing/stale observations as zero.
 
 If the bot is not already provisioned, run locally with the owner's numeric ID:
 

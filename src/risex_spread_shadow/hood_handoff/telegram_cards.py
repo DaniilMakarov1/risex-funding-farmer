@@ -20,8 +20,6 @@ from .telegram_messages import mapping, text
 
 ICONS = {'own': '🤝', 'external': '👥', 'mixed': '🔀', 'empty': '∅', 'skipped': '—', 'unknown': '❔'}
 LEGEND = '🤝 свои счета · 👥 внешние · 🔀 смешанно · ∅ без сделок · — не было · ❔ не доказано · 🛠 закрыт остаток'
-FOOTNOTE = ('USD — номинал USDG без пересчёта курса; фандинг не включён; '
-            'оборот = покупки + продажи обоих счетов, включая закрытие остатков.')
 
 
 def usd(value, *, signed=False):
@@ -139,7 +137,7 @@ def execution_text(phase, attempt, receipt, progress=None):
     if phase == 'opening' and icon == '🟢' and progress.get('stage') in ('HOLD', 'CLOSING') and holding:
         hold, closing = seconds(holding.get('seconds')), clock(holding.get('planned_closing_at'))
         if hold:
-            details.append(f'удержание {hold}' + (f' (закрытие ≈ {closing})' if closing else ''))
+            details.append(f'удержание {hold}' + (f' (закрытие ≈ {closing} МСК)' if closing else ''))
     return icon, head + ('\n' + ' · '.join(details) if details else '')
 
 
@@ -572,7 +570,7 @@ def headline(card, report):
     start, terminal, span, _ = cycle_times(report) if report else (None, None, None, {})
     when = ''
     if clock(start) and clock(terminal) and seconds(span):
-        when = f'\n{clock(start)} → {clock(terminal)} · {seconds(span)}'
+        when = f'\n{clock(start)} → {clock(terminal)} МСК · {seconds(span)}'
     return f'{icon} <b>{title}</b> · <code>{name}</code>{note}{when}'
 
 
@@ -582,7 +580,7 @@ def cycle_card(card, report, slot=None):
     lines = [headline(card, report)]
     if report is None:
         lines.append('Итог не удалось прочитать из сохранённого журнала.')
-        lines.append('/status — состояние · /accounts — счета')
+        lines.append('/accounts — счета')
         return '\n'.join(lines)
     binding = mapping(report.get('binding'))
     quantity = planned_quantity(report)
@@ -651,7 +649,7 @@ def cycle_card(card, report, slot=None):
         for role in ('source', 'receiver'):
             lines.append(text(position_line(binding.get(f'{role}_account_index', role), inventory.get(role),
                                             binding.get('market_symbol', '')), 120))
-        lines.append('/accounts — проверить счета · /close — закрыть остаток · /report — подробно')
+        lines.append('/accounts — проверить счета · /close — закрыть остаток')
     pause = card.get('pause')
     if kind != 'stop' and type(pause) is int and not isinstance(pause, bool):
         lines.append(f'⏸ Следующий цикл через {pause} с')

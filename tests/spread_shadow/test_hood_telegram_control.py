@@ -16,15 +16,18 @@ from risex_spread_shadow.hood_handoff.operator_control import exclusive_lock
 class Transport:
     def __init__(self, fail=False):
         self.messages = []
+        self.markups = []
         self.fail = fail
 
-    async def send(self, owner, text):
+    async def send(self, owner, text, markup=None):
         if self.fail:
             raise RuntimeError('synthetic delivery failure')
         self.messages.append((owner, text))
+        self.markups.append(markup)
 
 
-def update(number=1, text='/run'):
+# '/run 1' is one cycle with the saved mode and ticks (a bare /run asks for a count).
+def update(number=1, text='/run 1'):
     return {'update_id': number, 'message': {'date': 1000, 'text': text,
             'from': {'id': 42, 'is_bot': False}, 'chat': {'id': 42, 'type': 'private'}}}
 
@@ -67,7 +70,7 @@ async def test_small_telegram_clock_skew_answers_once_without_launch(tmp_path, s
     calls = []
     async def launch(): calls.append(True)
     c = setup(tmp_path, launch)
-    message = update(text='/status')
+    message = update(text='/start')
     message['message']['date'] = 1000 + skew
     await c.handle(message)
     assert len(c.transport.messages) == 1
@@ -99,7 +102,7 @@ async def test_failed_notification_is_visible_without_exception_secrets(tmp_path
         async def send(self, *args):
             raise RuntimeError('https://example.invalid/botSECRET')
     c = setup(tmp_path, None, SecretFailure())
-    await c.handle(update(text='/status'))
+    await c.handle(update(text='/start'))
     error = capsys.readouterr().err
     assert 'notification delivery failed' in error
     assert 'SECRET' not in error
@@ -137,8 +140,9 @@ async def test_duplicate_and_parallel_run_have_one_durable_launch(tmp_path):
     await c.handle(update())
     await c.handle(update(2))
     assert calls == [True]
-    await c.handle(update(3, '/status'))
-    assert 'выполняется' in c.transport.messages[-1][1]
+    await c.handle(update(3, '/run'))
+    assert 'другая операция' in c.transport.messages[-1][1]
+    assert c._count_prompt is None
     release.set()
     await c.task
     assert c.store.data['active'] is None
@@ -257,7 +261,7 @@ def test_token_binding_is_separate_from_trading_keys():
     assert bot.BotBinding().record_account == 'hood-telegram-control-v1'
 
 
-@pytest.mark.parametrize('command,entry', [('/run','simple'),('/close','close-positions')])
+@pytest.mark.parametrize('command,entry', [('/run 1','simple'),('/close','close-positions')])
 async def test_server_discards_backlog_and_uses_fixed_detached_child(tmp_path, monkeypatch, command, entry):
     tmp_path.chmod(0o700)
     config = tmp_path / 'random-cycle.json'
@@ -319,7 +323,7 @@ async def test_server_discards_backlog_and_uses_fixed_detached_child(tmp_path, m
     monkeypatch.setattr(Path, 'is_file', lambda p: True if str(p).endswith('.venv-hood/bin/python') else original_is_file(p))
     with pytest.raises(Stop):
         await bot.serve(SimpleNamespace(config=config, owner_id=42), store, 99, 'synthetic-token-not-used')
-    assert checks == ([False, True] if command == '/run' else [False])
+    assert checks == ([False, True] if command == '/run 1' else [False])
     assert len(calls) == 1
     argv, kwargs = calls[0]
     assert argv[1:5] == ('-m', 'risex_spread_shadow.hood_handoff.cli', entry, '--keychain')
@@ -405,7 +409,7 @@ async def test_nonflat_close_recovery_keeps_run_guard(tmp_path):
     c.recovery = recover
 
     await c.reconcile_idle(require_flat=False)
-    await c.handle(update(2, '/run'))
+    await c.handle(update(2, '/run 1'))
     await c.task
     assert calls == [False, True]
     assert launches == []
@@ -479,7 +483,7 @@ async def test_changed_config_does_not_start_a_child(tmp_path, monkeypatch):
                 return [update()]
             await finished.wait()
             raise Stop()
-        async def send(self, owner, text):
+        async def send(self, owner, text, markup=None):
             if 'Новая операция пока не начата' in text: finished.set()
     class Session:
         def __init__(self, **kwargs): pass

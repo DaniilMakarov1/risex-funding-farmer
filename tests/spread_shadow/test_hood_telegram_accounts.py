@@ -170,7 +170,7 @@ async def test_serve_accounts_bound_configuration(tmp_path, monkeypatch, changed
                 if changed: (path if changed == 'config' else evidence).write_text('{"changed":true}')
                 return [update(text='/accounts')]
             raise Stop()
-        async def send(self, owner, text): messages.append(text)
+        async def send(self, owner, text, markup=None): messages.append(text)
     class Session:
         def __init__(self, **kw): pass
         async def __aenter__(self): return self

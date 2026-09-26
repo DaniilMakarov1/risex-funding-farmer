@@ -389,7 +389,7 @@ async def test_three_incomplete_reads_stop_with_a_durable_stage_record(tmp_path,
     assert fresh.data['last']['stop'] == last['stop']
     stop = [n for n in notices if isinstance(n, str) and n.startswith('⛔')]
     assert stop == ['⛔ <b>Цикл 2/30</b> · остановлено (проверка позиций и старых ордеров перед циклом, '
-                    'попыток: 3): ошибка READ_TIMEOUT. Серия не продолжается; /status — состояние.']
+                    'попыток: 3): ошибка READ_TIMEOUT. Серия не продолжается; /accounts — позиции.']
     err = capsys.readouterr().err
     assert 'Telegram run stopped:' in err and '"stage": "SERIES_CLOSE_READY"' in err
     assert err.count('Telegram run check retry:') == 2
@@ -538,7 +538,7 @@ async def test_stop_record_names_the_trading_stage_without_attempts(tmp_path):
     async def no_close():
         pytest.fail('flat run must not close')
     c.close = no_close
-    await c.handle(update(text='/run'))
+    await c.handle(update(text='/run 1'))
     await c.task
     stop = c.store.data['last']['stop']
     assert stop['stage'] == 'LAUNCH' and stop['category'] == 'CHECK_FAILED' and 'attempts' not in stop

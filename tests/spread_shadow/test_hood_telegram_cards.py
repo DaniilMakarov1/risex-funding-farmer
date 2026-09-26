@@ -221,7 +221,7 @@ async def test_single_run_sends_start_and_one_card_instead_of_long_summary(tmp_p
     async def launch(**options):
         cycle_slot(tmp_path, 1)
     c = setup(tmp_path, launch)
-    await c.handle(update(text='/run'))
+    await c.handle(update(text='/run 1'))
     await c.task
     await c._notice_task
     messages = [m for _, m in c.transport.messages]
@@ -315,7 +315,7 @@ def test_execution_step_text_is_truthful_and_brief(monkeypatch, case):
     icon, message = execution_text(phase, 2 if case == 'mixed' else 1, receipt, progress)
     expected = {
         'own_open': ('🟢', 'открыто: 🤝 свои счета 0.0007 BTC\n'
-                           'LIMIT→MARKET 318 мс · ответ MARKET 322 мс · удержание 1 мин 25 с (закрытие ≈ 07:52:24)'),
+                           'LIMIT→MARKET 318 мс · ответ MARKET 322 мс · удержание 1 мин 25 с (закрытие ≈ 07:52:24 МСК)'),
         'own_close': ('✅', 'закрыто: 🤝 свои счета 0.0007 BTC\nLIMIT→MARKET 318 мс · ответ MARKET 322 мс'),
         'external': ('⚠️', 'закрытие: LIMIT взяли чужие 0.00055 (счёт 26085)\nLIMIT→MARKET 318 мс · ответ MARKET 322 мс'),
         'mixed': ('⚠️', 'открытие (попытка 2): 🤝 свои счета 0.0003 BTC; LIMIT взяли чужие 0.0002 (счёт 3026)\n'

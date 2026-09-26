@@ -345,7 +345,7 @@ async def test_server_series_spawns_five_fixed_children_without_reusing_command(
 async def test_slow_cycle_notices_do_not_gate_next_cycle_or_final_state(tmp_path):
     entered, release = asyncio.Event(), asyncio.Event()
     class Slow:
-        async def send(self, owner, text):
+        async def send(self, owner, text, markup=None):
             if 'Цикл' in text or 'Серия' in text:
                 entered.set()
                 await release.wait()
@@ -422,7 +422,7 @@ async def test_notice_timeout_continues_queue_without_replay_or_secret(tmp_path,
     monkeypatch.setattr(bot.asyncio, 'timeout', lambda seconds: timeout(0.01))
     messages = []
     class Delayed:
-        async def send(self, owner, text):
+        async def send(self, owner, text, markup=None):
             messages.append(text)
             if text == 'first': await asyncio.Event().wait()
     c = setup(tmp_path, None, Delayed())

@@ -47,7 +47,7 @@ def test_exact_negative_positive_and_zero_pnl_no_account_double_count():
     assert 'Комиссии: 0.0300 $' in result
     assert result.count('🤝/🤝') == 3
     assert 'Циклы: ✅ 3 · 🟡 0 · ⛔ 0' in result
-    assert 'фандинг не включён' in result
+    assert 'фандинг' not in result and 'USDG' not in result
     assert add_exact(Decimal('123456789012345678901234567890'), Decimal('0.00000001')) == Decimal('123456789012345678901234567890.00000001')
 
 
@@ -128,12 +128,15 @@ async def test_more_than_five_cycles_persist_membership_and_recover_report(tmp_p
     assert c.store.data['last']['series_completed'] == count
     assert len(c.store.data['last']['series_slots']) == count
     assert c.store.data['active'] is None
+    # The final report arrived once at the end; after a restart /report is the 24-hour total.
+    final = '\n'.join(text for _, text in c.transport.messages)
+    assert final.count('Итого') == 1
+    assert all(name in final for name in c.store.data['last']['series_slots'])
     reloaded = setup(tmp_path, launch)
     await reloaded.handle(update(2, '/report'))
     await reloaded._notice_task
     output = '\n'.join(text for _, text in reloaded.transport.messages)
-    assert 'Итого' in output
-    assert all(name in output for name in c.store.data['last']['series_slots'])
+    assert 'Итог за сутки' in output and 'Итого' not in output
 
 
 def test_slot_sorting_after_999(tmp_path):
@@ -252,7 +255,7 @@ def test_usd_pnl_and_total_two_account_open_close_external_and_residual_volume()
     assert 'PnL после комиссий: неизвестен' in result
     assert '1. cycle-001 · 🤝/🤝 · +0.0200 $' in result
     assert '2. cycle-002 · 🤝/🤝 🛠 · −0.0700 $ до ком.' in result
-    assert 'USD — номинал USDG' in result
+    assert 'USDG' not in result and 'оборот = покупки' not in result
     # Fills without fee evidence never become a zero-fee net value.
     assert 'Комиссии: неизвестны' in result and 'тариф' not in result
 
@@ -336,10 +339,13 @@ def test_turnover_product_preserves_low_order_digits():
     assert executed_turnover(r, set()) == Decimal('12345678901.234567890123456789')
 
 
-def test_single_cycle_view_also_identifies_usd_nominal():
+def test_single_cycle_view_has_no_usd_footnote_but_names_foreign_quote():
     from risex_spread_shadow.hood_handoff.operator_view import result_lines
     result = '\n'.join(result_lines(report()))
-    assert 'PnL указан в USD по номиналу USDG' in result
+    assert 'USDG' not in result and 'фандинг' not in result and 'валюте котировки' not in result
+    foreign = report()
+    foreign['binding']['market_symbol'] = 'ETH'
+    assert 'PnL указан в валюте котировки.' in '\n'.join(result_lines(foreign))
 
 
 @pytest.mark.parametrize('supported', [True, False])
@@ -355,3 +361,27 @@ def test_real_saved_report_preserves_only_supported_public_usd_binding(tmp_path,
     saved = load_saved_cycle_report(path.parent)
     assert nominal_usd(saved['binding']) is supported
     assert 'SECRET_VALUE' not in json.dumps(saved)
+
+
+def test_wallet_pool_series_sums_every_pair_independently():
+    # cycles 318-335 shape: every cycle settled and flat on its own drawn pair.
+    def pooled(source, receiver, gross, trade):
+        value = report(gross, gross)
+        value['binding'].update(source_account_index=source, receiver_account_index=receiver)
+        value['confirmed_fills'] = [fill(source, trade, '0.001', '60000'),
+                                    fill(receiver, trade, '0.001', '60000', 'SELL')]
+        return value
+    result = render({'cycle-318': pooled(27331, 34019, '-0.0023', 'a'),
+                     'cycle-319': pooled(27337, 34020, '-0.0058', 'b'),
+                     'cycle-326': pooled(34019, 34020, '0', 'c')})
+    assert 'Циклы: ✅ 3 · 🟡 0 · ⛔ 0' in result and 'PnL ?' not in result
+    # 6 fills x 0.001 x 60000; -0.0023 - 0.0058 + 0.
+    assert 'Оборот обоих счетов: 360.00 $' in result
+    assert 'PnL до комиссий: −0.0081 $' in result and 'PnL после комиссий: −0.0081 $' in result
+
+
+def test_cycle_with_one_account_on_both_sides_is_never_summed():
+    same = report()
+    same['binding'].update(source_account_index=11, receiver_account_index=11)
+    result = render({'cycle-001': report(), 'cycle-002': same})
+    assert 'Циклы: ✅ 1 · 🟡 0 · ⛔ 1' in result and 'PnL до комиссий: неизвестен' in result

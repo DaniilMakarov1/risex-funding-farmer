@@ -32,6 +32,10 @@ from .operator_control import clear_stop_request, exclusive_lock, write_stop_req
 from . import telegram_messages as views
 
 MAX_COMMAND_FUTURE_SKEW_SECONDS = 5
+# Bare /run asks for the number of cycles; only a plain number sent within this
+# time answers it (in memory only: a restart drops an unanswered question).
+COUNT_PROMPT_SECONDS = 300
+ACK_ONE_TICK = {'receiver_admission': 'ack', 'price_improvement_ticks': 1}
 
 
 @dataclass(frozen=True)
@@ -299,13 +303,13 @@ class Telegram:
             # aiohttp exception strings can include the credential-bearing URL.
             raise TelegramFailure('TIMEOUT' if isinstance(exc, TimeoutError) else 'CONNECTION_FAILED') from None
 
-    async def send(self, owner, text):
+    async def send(self, owner, text, markup=None):
         # Never cut HTML inside an entity or tag. Views bound dynamic fields;
         # an unexpected oversized view degrades to a complete, valid message.
         if len(text.encode('utf-16-le')) // 2 > 4000:
-            text = '<b>Сообщение слишком длинное</b>\nОткрой полный отчёт локально. /status — краткое состояние.'
+            text = '<b>Сообщение слишком длинное</b>\nОткрой полный отчёт локально.'
         return await self.call('sendMessage', chat_id=owner, text=text, parse_mode='HTML',
-                              protect_content=True, reply_markup=views.READ_MENU,
+                              protect_content=True, reply_markup=markup or views.IDLE_MENU,
                               link_preview_options={'is_disabled': True})
 
 
@@ -333,12 +337,23 @@ class Controller:
         self._stop_event = None
         self._pending_card = None
         self._send_lock = None
+        # Unanswered bare /run ({'update_id', 'at'}); never persisted.
+        self._count_prompt = None
         self.now = now
         self.started = now()
         self.task = None
         self._runner_finished = False
         self._notice_queue = asyncio.Queue(maxsize=64)
         self._notice_task = None
+
+    def busy(self):
+        """An owner operation (admission, cycle, series step, pause, close or stop) is running."""
+        return (self.task is not None and not self.task.done()
+                and (not self._runner_finished or self._stop is not None))
+
+    def menu(self):
+        """Keyboard for the state when a message is sent: /stop while busy, else /run and /close."""
+        return views.RUNNING_MENU if self.busy() else views.IDLE_MENU
 
     def pooled(self):
         """Display only: whether a wallet-pool file is present next to the config."""
@@ -552,7 +567,7 @@ class Controller:
             if active.get('action') == 'close' or active.get('phase') == 'AUTO_CLOSE':
                 return prefix + ('<b>⏳ Закрытие позиций выполняется</b>\nПроверяю и закрываю остатки '
                                  + ('на всех кошельках пула' if self.pooled() else 'на двух настроенных счетах')
-                                 + '. /status — состояние')
+                                 + '.')
             progress = read_lifecycle(self.operator / added[0] / 'cycle.jsonl') if len(added) == 1 else None
             return prefix + views.running_message(added, progress)
         blocked = active is not None
@@ -588,13 +603,14 @@ class Controller:
             message += views.later_close_message(later[1], later[2], later[3])
         return prefix + message
 
-    async def notify(self, text):
-        # One FIFO send path keeps replies and background steps in order.
+    async def notify(self, text, markup=None):
+        # One FIFO send path keeps replies and background steps in order. The
+        # keyboard is chosen at send time, so the latest message shows the state.
         if self._send_lock is None:
             self._send_lock = asyncio.Lock()
         try:
             async with self._send_lock:
-                await self.transport.send(self.owner, text)
+                await self.transport.send(self.owner, text, markup or self.menu())
         except Exception as exc:
             # Only a fixed category, never URLs, response bodies or exception text.
             category = exc.category if isinstance(exc, TelegramFailure) else 'UNCLASSIFIED'
@@ -622,6 +638,9 @@ class Controller:
             message = self._notice_queue.get_nowait()
             if isinstance(message, dict) and message.get('kind') == 'cycle':
                 await self._deliver_notice(await asyncio.to_thread(self.render_cycle_card, message))
+                continue
+            if isinstance(message, dict) and message.get('kind') == 'day':
+                await self._deliver_notice(await asyncio.to_thread(self.render_day_report, message))
                 continue
             if isinstance(message, dict):
                 from .telegram_series_report import report_pages
@@ -670,6 +689,26 @@ class Controller:
             return cycle_card(card, self.report(name), None if slot is None or slot.is_symlink() else slot)
         except Exception:
             return cycle_card(card, None)
+
+    def day_request(self):
+        """/report snapshot taken now: the window end and a cycle this controller is running."""
+        request = {'kind': 'day', 'until': self.now(), 'running': None, 'step': None}
+        active = self.store.data.get('active')
+        if (self.task is not None and not self.task.done() and not self._runner_finished
+                and isinstance(active, dict) and active.get('action', 'run') == 'run'):
+            added = sorted(set(self.slots()) - set(active.get('before', [])), key=lambda n: int(n.split('-')[1]))
+            request['running'] = added[-1] if added else None
+            request['step'] = (active.get('series_index', 1), active.get('series_total', 1))
+        return request
+
+    def render_day_report(self, request):
+        """Worker-thread rendering of /report from saved journals; display only, never raises."""
+        from .telegram_day_report import day_report
+        try:
+            return day_report(self.operator, request['until'], self.report,
+                              running=request.get('running'), step=request.get('step'))
+        except Exception:
+            return views.day_report_unavailable_message()
 
     def _flush_card(self, pause=None):
         card, self._pending_card = self._pending_card, None
@@ -761,7 +800,7 @@ class Controller:
             self._flush_card()
             self.queue_notice(self.step_notice(
                 f'остановлено{self._stop_where(stop)}: {stop_reason(exc)}. '
-                'Серия не продолжается; /status — состояние.', '⛔'))
+                'Серия не продолжается; /accounts — позиции.', '⛔'))
             active = self.store.data.get('active') or {}
             close_before = active.get('auto_close_before') if active.get('phase') == 'AUTO_CLOSE' else None
             close_added = (sorted(set(self.slots('close')) - set(close_before))
@@ -1115,6 +1154,7 @@ class Controller:
                     await self.reconcile_idle(require_flat=action == 'run')
                     self.queue_notice(self.step_notice('проверка пройдена', '✓'))
             elif self.store.data['active'] is not None:
+                self._runner_finished = True  # Nothing runs: the reply shows /run and /close.
                 await self.notify(views.blocked_message())
                 return
             stage = 'PERSISTENCE'
@@ -1138,6 +1178,7 @@ class Controller:
             except Exception:
                 print('Telegram admission refusal persistence failed.', file=sys.stderr, flush=True)
             await self._drain_notices()  # Steps already queued precede the refusal.
+            self._runner_finished = True  # Nothing runs: the refusal shows /run and /close.
             await self.notify(views.admission_refusal_message(record))
             return
         finally:
@@ -1179,27 +1220,26 @@ class Controller:
                               'Отправьте новую команду. Если отказ повторится, проверьте часы компьютера.')
             return
         command = message.get('text')
-        launch_options = {}
-        series_total = 1
+        if isinstance(command, str) and not command.startswith('/'):
+            await self._answer_count(uid, command)
+            return
+        if isinstance(command, str) and command not in ('/report', '/accounts'):
+            self._count_prompt = None  # Any other command cancels an unanswered /run question.
+        explicit = None
         if isinstance(command, str) and len(command) <= 4096:
             count_match = re.fullmatch(r'/run ([1-9][0-9]*)', command)
             option_match = re.fullmatch(r'/run (ws|ack)(?: ([1-5])(?: ([1-9][0-9]*))?)?', command)
             if count_match:
-                series_total = int(count_match[1])
-                command = '/run'
+                explicit = ({}, int(count_match[1]))
             elif option_match:
-                launch_options['receiver_admission'] = 'ws_confirmed' if option_match[1] == 'ws' else 'ack'
+                options = {'receiver_admission': 'ws_confirmed' if option_match[1] == 'ws' else 'ack'}
                 if option_match[2]:
-                    launch_options['price_improvement_ticks'] = int(option_match[2])
-                if option_match[3]:
-                    series_total = int(option_match[3])
-                command = '/run'
-        if command in ('/start', '/help'):
-            await self.notify(views.help_message())
-        elif command in ('/status', '/report'):
-            if command == '/report' and not (self.task is not None and not self.task.done()) and self.queue_series_report():
-                return
-            await self.notify(self.summary(detailed=command == '/report'))
+                    options['price_improvement_ticks'] = int(option_match[2])
+                explicit = (options, int(option_match[3]) if option_match[3] else 1)
+        if command == '/start':
+            await self.notify(views.commands_message())
+        elif command == '/report':
+            self.queue_notice(self.day_request())
         elif command == '/accounts':
             try:
                 result = await self.accounts() if self.accounts is not None else None
@@ -1209,42 +1249,75 @@ class Controller:
             await self.notify(response)
         elif command == '/stop':
             await self.request_stop(uid)
-        elif command in ('/run', '/close'):
-            if self.task is not None and not self.task.done():
-                await self.notify(views.blocked_message())
-                return
-            if command == '/close' and self.close is None:
-                await self.notify(views.recovery_refused_message('Команда закрытия не настроена.'))
-                return
-            if self.recovery is None and self.store.data['active'] is not None:
-                await self.notify(views.blocked_message())
-                return
-            if command == '/run':
-                # A fresh /run supersedes a finished or interrupted /stop.  The
-                # marker is removed before the task exists, so a later /stop
-                # always writes after this removal.
-                try:
-                    clear_stop_request(self.operator)
-                except Exception:
-                    await self.notify(views.stop_marker_refusal_message())
-                    return
-            self._stop_event = asyncio.Event()
-            self._runner_finished = False
-            self._checking = True
-            self.task = asyncio.create_task(self._with_stop(self.admit(command[1:], uid, launch_options, series_total)))
-            try:
-                selected = json.loads(self.config.read_text())
-                selected.update(launch_options)
-                mode = selected.get('receiver_admission', 'strict')
-                ticks = selected.get('price_improvement_ticks')
-                details = {'ack': 'ACK', 'ws_confirmed': 'WS'}.get(mode, views.text(mode, 24))
-                details += f' · +{views.text(ticks, 8)} тик' if ticks is not None else ' · старое правило цены'
-            except Exception:
-                details = None
-            await self.notify(views.accepted_message(uid, series_total, details)
-                              if command == '/run' else views.close_accepted_message(uid))
+        elif explicit is not None:
+            await self._start(uid, 'run', *explicit)
+        elif command == '/run':
+            await self._ask_count(uid)
+        elif command == '/close':
+            await self._start(uid, 'close', {}, 1)
         elif isinstance(command, str):
             await self.notify(views.unknown_message())
+
+    async def _ask_count(self, uid):
+        """Bare /run means ACK with one tick; the owner answers with the number of cycles."""
+        if (self.task is not None and not self.task.done()
+                or self.recovery is None and self.store.data['active'] is not None):
+            await self.notify(views.blocked_message())
+            return
+        self._count_prompt = {'update_id': uid, 'at': self.now()}
+        await self.notify(views.count_prompt_message(COUNT_PROMPT_SECONDS // 60), views.COUNT_PROMPT)
+
+    async def _answer_count(self, uid, text):
+        """A plain owner message answers an open /run question; nothing else launches."""
+        prompt, self._count_prompt = self._count_prompt, None
+        number = re.fullmatch(r'\s*([1-9][0-9]*)\s*', text) if len(text) <= 4096 else None
+        if prompt is None:
+            await self.notify(views.count_without_prompt_message() if number else views.unknown_message())
+            return
+        if not 0 <= self.now() - prompt['at'] <= COUNT_PROMPT_SECONDS:
+            await self.notify(views.count_expired_message(COUNT_PROMPT_SECONDS // 60))
+            return
+        if number is None:
+            self._count_prompt = prompt  # Still waiting for a number.
+            await self.notify(views.count_invalid_message(), views.COUNT_PROMPT)
+            return
+        await self._start(uid, 'run', dict(ACK_ONE_TICK), int(number[1]))
+
+    async def _start(self, uid, action, launch_options, series_total):
+        """Admit one owner /run or /close; the check and the operation run in a task."""
+        if self.task is not None and not self.task.done():
+            await self.notify(views.blocked_message())
+            return
+        if action == 'close' and self.close is None:
+            await self.notify(views.recovery_refused_message('Команда закрытия не настроена.'))
+            return
+        if self.recovery is None and self.store.data['active'] is not None:
+            await self.notify(views.blocked_message())
+            return
+        if action == 'run':
+            # A fresh /run supersedes a finished or interrupted /stop.  The
+            # marker is removed before the task exists, so a later /stop
+            # always writes after this removal.
+            try:
+                clear_stop_request(self.operator)
+            except Exception:
+                await self.notify(views.stop_marker_refusal_message())
+                return
+        self._stop_event = asyncio.Event()
+        self._runner_finished = False
+        self._checking = True
+        self.task = asyncio.create_task(self._with_stop(self.admit(action, uid, launch_options, series_total)))
+        try:
+            selected = json.loads(self.config.read_text())
+            selected.update(launch_options)
+            mode = selected.get('receiver_admission', 'strict')
+            ticks = selected.get('price_improvement_ticks')
+            details = {'ack': 'ACK', 'ws_confirmed': 'WS'}.get(mode, views.text(mode, 24))
+            details += f' · +{views.text(ticks, 8)} тик' if ticks is not None else ' · старое правило цены'
+        except Exception:
+            details = None
+        await self.notify(views.accepted_message(uid, series_total, details)
+                          if action == 'run' else views.close_accepted_message(uid))
 
 
 async def serve(args, store, lock_fd, token):

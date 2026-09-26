@@ -33,11 +33,13 @@ def valid(message):
     return parser.plain
 
 
-@pytest.mark.parametrize('message', [views.help_message(), views.startup_message(),
+@pytest.mark.parametrize('message', [views.commands_message(), views.startup_message(),
     views.accepted_message(123), views.blocked_message(), views.unknown_message(),
     views.running_message([]), views.running_message(['cycle-008']),
     views.empty_message(), views.empty_message(True), views.unavailable_message(),
-    views.unavailable_message(True), views.unavailable_message(not_launched=True)])
+    views.unavailable_message(True), views.unavailable_message(not_launched=True),
+    views.count_prompt_message(5), views.count_invalid_message(), views.count_expired_message(5),
+    views.count_without_prompt_message(), views.day_report_unavailable_message()])
 def test_every_operator_state_has_balanced_bounded_html(message):
     assert valid(message)
 
@@ -93,18 +95,21 @@ async def test_transport_uses_html_and_readonly_keyboard_without_cutting_tags():
             payloads.append(kwargs['json'])
             return Response()
     api = Telegram(Session(), '123456:'+'syntheticCanary'*3)
-    assert await api.send(42, views.help_message()) == {'message_id':123}
+    assert await api.send(42, views.commands_message()) == {'message_id':123}
     await api.send(42, '<b>' + '🚀'*3000 + '</b>')
+    await api.send(42, views.blocked_message(), views.RUNNING_MENU)
+    await api.send(42, views.count_prompt_message(5), views.COUNT_PROMPT)
     for payload in payloads:
         assert payload['parse_mode'] == 'HTML'
         assert payload['chat_id'] == 42
         assert payload['protect_content'] is True
         assert payload['link_preview_options']['is_disabled'] is True
         valid(payload['text'])
-        buttons = [b['text'] for row in payload['reply_markup']['keyboard'] for b in row]
-        assert buttons == ['/status','/report','/accounts','/help']
-        assert '/run' not in buttons
-    assert 'слишком длинное' in payloads[-1]['text']
+    keyboards = [[b['text'] for row in p['reply_markup']['keyboard'] for b in row] for p in payloads[:3]]
+    # Without an explicit keyboard the idle menu is sent; /stop only while busy.
+    assert keyboards == [['/run', '/close', '/report', '/accounts']] * 2 + [['/stop', '/report', '/accounts']]
+    assert payloads[3]['reply_markup'] == {'force_reply': True, 'input_field_placeholder': 'Число циклов, например 10'}
+    assert 'слишком длинное' in payloads[1]['text']
 
 
 @pytest.mark.parametrize('status,body', [(429, {'ok':False}), (500, {}), (200, {'ok':False}), (200, [])])
@@ -120,5 +125,5 @@ async def test_api_failures_are_sanitized_and_not_retried(status, body):
             return response
     api = Telegram(Session(), '123456:'+'syntheticCanary'*3)
     with pytest.raises(RuntimeError, match='transport unavailable'):
-        await api.send(42, views.help_message())
+        await api.send(42, views.commands_message())
     assert len(calls) == 1

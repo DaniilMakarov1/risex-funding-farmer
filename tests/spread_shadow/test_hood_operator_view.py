@@ -87,11 +87,11 @@ def spread_then_hold():
 async def test_slow_progress_delivery_cannot_delay_child_completion_or_replay(tmp_path):
     notified, child_done = asyncio.Event(), asyncio.Event()
     class Slow(Transport):
-        async def send(self, owner, text):
+        async def send(self, owner, text, markup=None):
             if 'жду спред' in text:
                 notified.set()
                 await asyncio.Event().wait()
-            await super().send(owner, text)
+            await super().send(owner, text, markup)
     calls = []
     async def launch():
         calls.append(True)
@@ -113,8 +113,8 @@ async def test_slow_progress_delivery_cannot_delay_child_completion_or_replay(tm
 async def test_one_notice_per_stage_and_live_status_uses_same_observations(tmp_path):
     received = asyncio.Event()
     class Notify(Transport):
-        async def send(self, owner, text):
-            await super().send(owner, text)
+        async def send(self, owner, text, markup=None):
+            await super().send(owner, text, markup)
             if 'жду спред' in text: received.set()
     release = asyncio.Event()
     async def launch():
@@ -128,7 +128,7 @@ async def test_one_notice_per_stage_and_live_status_uses_same_observations(tmp_p
     await c.handle(update())
     await asyncio.wait_for(received.wait(), 2)
     await asyncio.sleep(0.6)
-    assert '56 с' in c.summary()  # /status still shows the live hold on demand.
+    assert '56 с' in c.summary()  # The internal state view still shows the live hold.
     release.set()
     await c.task
     sent = [text for _, text in c.transport.messages]

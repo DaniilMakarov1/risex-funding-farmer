@@ -5,8 +5,14 @@ from html import escape
 from .journal import sanitize
 from .operator_view import lifecycle_lines, result_lines, timestamp, close_result_lines
 
-READ_MENU = {'keyboard': [[{'text': '/status'}, {'text': '/report'}], [{'text': '/accounts'}, {'text': '/help'}]],
+# Reply keyboards: /run and /close only while nothing runs, /stop while an
+# owner operation runs. The controller chooses one when each message is sent.
+IDLE_MENU = {'keyboard': [[{'text': '/run'}, {'text': '/close'}], [{'text': '/report'}, {'text': '/accounts'}]],
              'resize_keyboard': True, 'is_persistent': True}
+RUNNING_MENU = {'keyboard': [[{'text': '/stop'}], [{'text': '/report'}, {'text': '/accounts'}]],
+                'resize_keyboard': True, 'is_persistent': True}
+# The /run question: Telegram opens a reply to it; the keyboard stays available.
+COUNT_PROMPT = {'force_reply': True, 'input_field_placeholder': 'Число циклов, например 10'}
 
 
 def text(value, limit=80):
@@ -22,44 +28,49 @@ def mapping(value):
     return value if isinstance(value, Mapping) else {}
 
 
-def help_message():
-    return ('<b>Управление торговым циклом</b>\n'
-            'Одна команда запускает указанное положительное число последовательных циклов по локальной конфигурации.\n\n'
-            '<b>Просмотр</b>\n'
-            '/status — краткое состояние\n'
-            '/report — последний результат и наблюдения\n'
-            '/accounts — балансы и позиции на счетах (всех кошельках пула)\n'
-            '/help — эта инструкция\n\n'
-            '<b>Запуск реальной торговли</b>\n'
-            '<code>/run</code> — проверить позиции, при остатке один раз закрыть его reduce-only, '
-            'подтвердить ноль и затем начать один Mainnet-цикл. '
-            'Первый счёт и сторона лимитки выбираются случайно: четыре равновероятных варианта. Объём и время удержания — по текущей конфигурации. '
-            'Если на компьютере создан пул кошельков (<code>./wallet add НОМЕР</code>), каждый цикл сначала случайно берёт два разных готовых кошелька; '
-            'неготовые (мало баланса, есть позиция, нет ключа) пропускаются и перечисляются, при менее чем двух готовых цикл не начинается.\n\n'
-            '<code>/run ws 5</code> — ждать WS, улучшение на 5 тиков.\n'
-            '<code>/run ack 5</code> — MARKET по ACK без ожидания LIMIT; проверка стакана остаётся.\n'
-            '<code>/run ack 1 20</code> — двадцать циклов подряд: ACK, улучшение на 1 тик.\n'
-            '<code>/run 10</code> — десять циклов с настройками по умолчанию.\n'
-            'Число циклов — любое положительное целое; без него запускается один. Режим и улучшение на 1–5 тиков '
-            'действуют для каждого цикла серии и его парного закрытия. Следующий цикл требует '
-            'завершённого результата, нулевых позиций и новой проверки; ошибка останавливает серию. В конце — результат каждого цикла и общий PnL; /report повторяет итог.\n\n'
-            '<code>/close</code> — проверить оба счёта (с пулом — все кошельки) и закрыть текущие позиции настроенного рынка MARKET reduce-only.\n\n'
-            '<code>/stop</code> — остановить всё: новые циклы не начнутся; идущий цикл не отправит новых ордеров, '
-            'прервёт удержание и закроет позиции своим обычным закрытием (уже отправленный ордер не обрывается); '
-            'затем бот проверит все кошельки, при остатке один раз закроет его reduce-only и подтвердит ноль. '
-            'Бот остаётся на связи; /run снова запускает торговлю.\n\n'
-            '<i>Если закрытие или повторная проверка не подтверждены, цикл не начнётся. '
-            'После ошибки новая /run заново проверяет счета и старые ордера. '
-            'После ручного закрытия постоянной блокировки нет. '
-            'Пока операция выполняется или прежний ордер не выяснен, новые ордера не отправляются.</i>')
+def commands_text():
+    return ('/run — запустить циклы: ACK, +1 тик, число циклов спрошу\n'
+            '/close — проверить и закрыть открытые позиции\n'
+            '/stop — остановить циклы и закрыть позиции\n'
+            '/report — итог за последние 24 часа\n'
+            '/accounts — балансы и позиции')
 
 
 def startup_message():
     return ('<b>🟢 Контроллер подключён</b>\n'
-            'Старые команды из очереди отброшены.\n'
-            'Посмотреть состояние: /status\n'
-            'Команды и порядок работы: /help\n\n'
+            'Старые команды из очереди отброшены.\n\n'
+            + commands_text() + '\n\n'
             '<i>Подключение бота само по себе не запускает торговлю.</i>')
+
+
+def commands_message():
+    return '<b>Команды</b>\n' + commands_text()
+
+
+def count_prompt_message(minutes):
+    return ('▶️ <b>Запуск: ACK · +1 тик</b>\n'
+            'Сколько циклов сделать? Отправь число сообщением, например <code>10</code>.\n'
+            f'<i>Жду ответ {text(minutes, 8)} мин. /close или /stop отменяют запуск.</i>')
+
+
+def count_invalid_message():
+    return ('<b>Нужно целое число больше нуля</b>, например <code>10</code>.\n'
+            'Отправь число циклов или выбери другую команду.')
+
+
+def count_expired_message(minutes):
+    return (f'<b>Ответ на /run опоздал</b>: число принимается {text(minutes, 8)} мин после вопроса. '
+            'Ничего не запущено. Нажми /run ещё раз.')
+
+
+def day_report_unavailable_message():
+    return ('<b>📊 Итог за сутки недоступен</b>\n'
+            'Сохранённые журналы не удалось прочитать. Торговля этим не затронута; повтори /report позже.')
+
+
+def count_without_prompt_message():
+    return ('<b>Ничего не запущено</b>\n'
+            'Число циклов принимается только в ответ на /run. Нажми /run, затем отправь число.')
 
 
 def accepted_message(number, series_total=1, details=None):
@@ -68,19 +79,19 @@ def accepted_message(number, series_total=1, details=None):
     return (f'📨 <b>Принято: {request}</b>{mode}\n'
             'Перед каждым циклом проверю нулевые позиции и старые ордера; при остатке сначала закрою его reduce-only. '
             'Кратко сообщу шаги: открываю → открыто → закрываю → закрыто, затем карточка цикла; в конце серии — итог.\n'
-            f'<i>Это ещё не исполнение ордеров.</i> Команда <code>{text(number, 24)}</code> · /status — ход работы')
+            f'<i>Это ещё не исполнение ордеров.</i> Команда <code>{text(number, 24)}</code> · /stop — остановить')
 
 
 def close_accepted_message(number):
     return (f'<b>📨 Команда /close принята</b> · <code>{text(number, 24)}</code>\n'
             'Проверю счета (с пулом — все кошельки) и закрою подтверждённые остатки reduce-only. '
-            'Открытие нового цикла этой командой не запрашивается. /status — состояние.')
+            'Открытие нового цикла этой командой не запрашивается.')
 
 
 def blocked_message():
     return ('<b>⏳ Сейчас другая операция или нужна сверка</b>\n'
             'Параллельные запуски заблокированы. Дождись завершения текущей операции.\n\n'
-            '/status — состояние · /accounts — позиции · /close — проверить и закрыть остаток. '
+            '/stop — остановить · /accounts — позиции. '
             'Следующая /run снова проверит возможность запуска.')
 
 
@@ -116,35 +127,32 @@ def recovery_checkpoint(proof):
 
 
 def unknown_message():
-    return ('<b>Команда не распознана</b>\n'
-            'Используй /accounts, /status, /report, /help или /stop.\n'
-            'Пример серии: <code>/run ack 1 5</code> (число циклов можно увеличить).')
+    return '<b>Команда не распознана</b>\n' + commands_text()
 
 
 def running_message(names, progress=None):
     name = text(', '.join(names[:3])) if names else 'слот ещё не создан'
     details = '\n'.join(text(line, 500) for line in lifecycle_lines(progress))
     return (f'<b>⏳ Цикл выполняется</b> · <code>{name}</code>\n{details}\n'
-            'Новые запуски временно заблокированы. /status — обновить')
+            'Новые запуски временно заблокированы. /stop — остановить')
 
 
 def empty_message(blocked=False):
     if blocked:
         return blocked_message()
     return ('<b>Готов к приёму команды</b>\n'
-            'Запусков через этот контроллер ещё нет.\n\n'
-            '/help — порядок работы\n'
+            'Запусков через этот контроллер ещё нет.\n'
             '<i>Готовность контроллера не означает, что счета и рынок прошли проверку.</i>')
 
 
 def unavailable_message(blocked=False, not_launched=False):
     if not_launched and not blocked:
         return ('<b>Цикл не запущен</b>\nНовый слот не создан. '
-                'Это не успешное исполнение. Проверь локальную конфигурацию перед новой командой.\n\n/help — порядок работы')
+                'Это не успешное исполнение. Проверь локальную конфигурацию перед новой командой.')
     return ('<b>⚠️ Отчёт недоступен</b>\n'
             'Состояние ордеров и позиций по этому ответу определить нельзя. '
             'Проверь сохранённый журнал локально.\n\n' +
-            ('Следующая /run проверит текущую готовность; /close — закрыть остаток.' if blocked else '/status — состояние контроллера'))
+            ('Следующая /run проверит текущую готовность; /close — закрыть остаток.' if blocked else '/accounts — текущие счета'))
 
 
 def launch_failure_message(name, code, *, blocked=False, detail=None):
@@ -180,7 +188,7 @@ def saved_message(name, report, *, blocked=False, detailed=False):
     if blocked:
         lines.append('<b>⚠️ Прошлый исход требует сверки</b> · /run проверит готовность заново; /close — закрыть остаток.')
     lines.extend(text(line, 500) for line in result_lines(report, detailed=detailed))
-    lines.append('/status — кратко · /report — подробно · /accounts — текущие счета')
+    lines.append('/accounts — текущие счета')
     return '\n'.join(lines)
 
 
@@ -233,7 +241,7 @@ def _pool_accounts_message(result):
     return '\n'.join(header + [''] + lines + tail + [
         '', '<i>Доступный баланс не равен полной стоимости счёта. Снимки получены отдельно и могут измениться; '
             'другие рынки не проверены. Проверка не снимает блокировку запуска.</i>',
-        '/accounts — обновить · /help — команды'])
+        '/accounts — обновить'])
 
 
 def accounts_message(result):
@@ -265,7 +273,7 @@ def accounts_message(result):
             lines += ['⚠️ Биржа не подтверждает активный статус счёта.']
     lines += ['', '<i>Доступный баланс не равен полной стоимости счёта. '
               'Снимки получены отдельно и могут измениться; другие рынки не проверены. '
-              'Проверка не снимает блокировку запуска.</i>', '/accounts — обновить · /help — команды']
+              'Проверка не снимает блокировку запуска.</i>', '/accounts — обновить']
     return '\n'.join(lines)
 
 
@@ -304,11 +312,11 @@ def stop_accepted_message(*, running, marker=True):
         body = 'Сейчас ничего не выполняется: проверю позиции на всех кошельках и при остатке закрою его reduce-only.'
     warning = ('' if marker else '\n<b>Отметку остановки для идущего цикла записать не удалось</b>: он завершится '
                'обычным порядком, после чего позиции будут проверены и закрыты.')
-    return f'<b>⏹ Команда /stop принята</b>\n{body}{warning}\n/status — ход остановки.'
+    return f'<b>⏹ Команда /stop принята</b>\n{body}{warning}\nРезультат пришлю отдельным сообщением.'
 
 
 def stop_pending_message():
-    return '<b>⏹ Остановка уже выполняется</b>\n/status — ход остановки.'
+    return '<b>⏹ Остановка уже выполняется</b>\nРезультат пришлю отдельным сообщением.'
 
 
 def stop_marker_refusal_message():
@@ -331,7 +339,7 @@ def stop_result_message(record, positions=None):
 
 
 def stop_status(record, *, running=False):
-    """Short /status line for a running or the latest completed /stop."""
+    """Short state line for a running or the latest completed /stop."""
     if running:
         return ('<b>⏹ Выполняется /stop</b> · новые циклы не начнутся; '
                 'идущий цикл закрывает позиции, затем проверка всех кошельков.\n')
