@@ -40,7 +40,7 @@ Every cycle then draws two different ready wallets with equal probability and, a
 
 ## Telegram messages: one card per cycle
 
-A series produces one short acceptance, a brief message for every step (account checks and positions found, launch, selection, leverage, each LIMIT/MARKET attempt, hold end, residual closure, stops), one card after each cycle and one final summary. The card shows the result (✅ paired, 🟡 closed but pair incomplete, ⛔ needs checking), BTC size and two-account turnover in USD, whether each phase was filled between our own accounts (🤝), by external accounts (👥, with their IDs) or mixed (🔀), LIMIT→MARKET time, how long preparation/hold/closing took, PnL and fees, and the pause before the next cycle. Robinhood charges 0% (owner-confirmed) and its trade receipts carry no fee, so when every fill of a settled cycle has an empty fee the card shows fees 0 and PnL after fees equal to gross, marked "тариф биржи 0%". Any nonzero fee value keeps fees unknown. While a cycle runs, brief steps arrive in real time: start, "открываю" (LIMIT accepted), "открыто" (own or external fills and LIMIT→MARKET time), "закрываю", "закрыто", plus waiting for spread, HTTP 429 cooldown, size reduction and residual closure. Use `/status` for live progress and `/report` for details; both are unchanged. Messages are rendered by the controller in the background and add no work to order sending.
+A series produces one short acceptance, a brief message for every step (account checks and positions found, launch, selection, leverage, each LIMIT/MARKET attempt, hold end, residual closure, stops), one card after each cycle and one final summary. The card shows the result (✅ paired, 🟡 closed but pair incomplete, ⛔ needs checking), BTC size and two-account turnover in USD, whether each phase was filled between our own accounts (🤝), by external accounts (👥, with their IDs) or mixed (🔀), LIMIT→MARKET time, how long preparation/hold/closing took, PnL and fees, and the pause before the next cycle. Robinhood charges 0% (owner-confirmed) and its trade receipts carry no fee, so when every fill of a settled cycle has an empty fee the card shows fees 0 and PnL after fees equal to gross, marked "тариф биржи 0%". Any nonzero fee value keeps fees unknown. While a cycle runs, brief steps arrive in real time: start, "открываю" (LIMIT accepted), "открыто" (own or external fills and LIMIT→MARKET time), "закрываю", "закрыто", plus waiting for spread, HTTP 429 cooldown, size reduction and residual closure. `/report` gives the 24-hour totals. Messages are rendered by the controller in the background and add no work to order sending.
 
 ## Why /run was refused after 16:57 on 2026-09-25, and what changed
 
@@ -59,13 +59,13 @@ It runs the full test suite in a clean temporary environment first and stops if 
 
 ## Cycle spacing and temporary read limits
 
-Finite Telegram series wait a newly sampled 5–30 seconds after each safely completed cycle before checking accounts for the next cycle. The first cycle starts normally; no extra pause follows the final cycle. Telegram announces the chosen pause and `/status` displays it. Fresh readiness checks follow the pause, so actual spacing can be longer. A restart never resumes the old series automatically.
+Finite Telegram series wait a newly sampled 5–30 seconds after each safely completed cycle before checking accounts for the next cycle. The first cycle starts normally; no extra pause follows the final cycle. Telegram announces the chosen pause. Fresh readiness checks follow the pause, so actual spacing can be longer. A restart never resumes the old series automatically.
 
 Temporary HTTP 429 during final reconciliation triggers bounded read-only cooldown and a short background notice. Orders are not resent. If terminal execution or exact flatness still cannot be proved within the configured bounds, the series stops with an honest incomplete result. Existing USD PnL and volume reporting continues to include proved external executions.
 
 # Accepted command but no new cycle
 
-If readiness refuses a command, /status now shows the rejected command ID, check stage, time and safe failure category even when the original Telegram reply was not delivered or the controller restarted. Acceptance means the command was received, not that an order was sent. A fresh /run performs new checks; a consumed command is never replayed. Detailed historic series results remain available through /report. Transport diagnostics deliberately omit tokens, request URLs and response bodies.
+If readiness refuses a command, the reply shows the rejected command ID, check stage, time and safe failure category; the same record stays in the saved controller state after a restart. Acceptance means the command was received, not that an order was sent. A fresh /run performs new checks; a consumed command is never replayed. Saved cycle results remain on disk; `/report` totals the last 24 hours. Transport diagnostics deliberately omit tokens, request URLs and response bodies.
 
 # Waiting for room inside the spread
 
@@ -93,19 +93,19 @@ Missing/incomplete volume evidence remains unknown, with any proven subtotal lab
 
 The five-cycle cap is removed: `/run 20` requests twenty cycles with saved settings; `/run ack 1 20` uses ACK admission and one tick for each. Counts must be positive decimal integers (no signs, fractions or leading zeroes) within the Telegram command length. Tick offsets remain 1–5. This is a finite request, never an endless loop or a restart-resumable campaign.
 
-At completion or early stop the bot reports each recorded cycle: paired, external, mixed, unfilled or unproved opening/closing, plus residual execution when present. The final page sums execution PnL across both accounts and all recorded cycles, including in-cycle residual closures. Gross and net are separate; missing fees leave net unknown, incomplete cycles leave the aggregate unknown, and any known subtotal is labelled as a partial sum. Funding and separately initiated pre-cycle closures of old positions are excluded. Long reports paginate outside the trading task; `/report` repeats the latest saved series summary after restart. Old commands without a saved membership list have no reconstructed series total.
+At completion or early stop the bot reports each recorded cycle: paired, external, mixed, unfilled or unproved opening/closing, plus residual execution when present. The final page sums execution PnL across both accounts and all recorded cycles, including in-cycle residual closures. Gross and net are separate; missing fees leave net unknown, incomplete cycles leave the aggregate unknown, and any known subtotal is labelled as a partial sum. Funding and separately initiated pre-cycle closures of old positions are excluded. Long reports paginate outside the trading task; `/report` shows the last 24 hours instead of repeating a series summary. Old commands without a saved membership list have no reconstructed series total.
 
 # Cycle and close notices — 2026-09-25
 
 `/close` acknowledges only a reduce-only closure and never promises a new cycle. Cycle notices identify the step/total and command ID, announce completion and the next-step check, and distinguish opening, holding, paired closure and residual recovery. A completed flat cycle can proceed to the next requested step even when pairing failed; the existing finite-series checks still apply.
 
-Progress and final notifications use a bounded 64-message FIFO in the separate controller, with a 10-second delivery deadline. Cycle sequencing never awaits delivery. When full, the oldest queued notice is discarded; delayed/missing messages are possible, and saved reports plus `/status` remain authoritative. This adds no notification I/O to the trading child; it does not claim zero shared-host CPU cost or measured exchange latency improvement.
+Progress and final notifications use a bounded 64-message FIFO in the separate controller, with a 10-second delivery deadline. Cycle sequencing never awaits delivery. When full, the oldest queued notice is discarded; delayed/missing messages are possible, and saved reports remain authoritative. This adds no notification I/O to the trading child; it does not claim zero shared-host CPU cost or measured exchange latency improvement.
 
 # Receipt reconciliation and controller restarts
 
 A briefly future-dated trade receipt is reread within the existing reconciliation bounds; only an exact reread at a valid time resolves that observation. The same rule applies to residual closing, without resending an uncertain order. Historical cycle journals remain unchanged.
 
-The current manually started Telegram controller does not survive a laptop reboot. Start it again with the existing controller command after login. Startup does not replay queued trading commands or automatically open positions; inspect `/status` and `/accounts` first.
+The current manually started Telegram controller does not survive a laptop reboot. Start it again with the existing controller command after login. Startup does not replay queued trading commands or automatically open positions; inspect `/accounts` first.
 
 # Telegram responsiveness
 
