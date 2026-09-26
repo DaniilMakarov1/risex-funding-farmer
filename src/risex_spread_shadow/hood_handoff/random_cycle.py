@@ -855,19 +855,27 @@ def _pre_source_stream_transient(result: HandoffResult) -> bool:
     return bool(result.retryable_pair and guard.get("pre_source_stream") == "TRANSIENT")
 
 
+def _pre_dispatch_transient(result: HandoffResult) -> bool:
+    """A retryable attempt that stopped before its source send (cycle-317)."""
+    guard = result.priority_guard if isinstance(result.priority_guard, Mapping) else {}
+    return bool(result.retryable_pair and guard.get("pre_dispatch") == "TRANSIENT")
+
+
 def _stream_settle_payload(result: HandoffResult, config: "RandomCycleConfig") -> dict[str, Any]:
-    if not _pre_source_stream_transient(result):
+    if not (_pre_source_stream_transient(result) or _pre_dispatch_transient(result)):
         return {}
     return {"stream_settle_seconds": config.poll_interval_seconds}
 
 
 async def _stream_settle(clock: Any, result: HandoffResult, config: "RandomCycleConfig") -> None:
-    """Give the local stream one poll interval to deliver pending terminal events.
+    """Wait one poll interval before retrying a proved zero-mutation attempt.
 
-    Used only after a proved zero-mutation pre-source refusal; the following
-    attempt still performs its own complete fresh preparation and checks.
+    Used only after a pre-source stream refusal (the local stream may deliver
+    pending terminal events) or a transient stop before the source send (slow
+    reads or an expired nonce reservation); the following attempt still
+    performs its own complete fresh preparation and checks.
     """
-    if _pre_source_stream_transient(result):
+    if _pre_source_stream_transient(result) or _pre_dispatch_transient(result):
         await clock.sleep(config.poll_interval_seconds)
 
 

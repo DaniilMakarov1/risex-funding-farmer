@@ -382,6 +382,9 @@ class HandoffEngine:
         self._cancel_nonce_task: asyncio.Task | None = None
         self._prepared_cancel: Any | None = None
         self._cancel_preparation_order_id: str | None = None
+        # Every order preparation of the current attempt; the unsent ones are
+        # invalidated when the attempt ends (see _release_unsent_orders).
+        self._attempt_prepared: list[Any] = []
 
     def _stream_milestone(self, name: str, plan: OrderPlan,
                           order_id: str | None = None) -> None:
@@ -447,6 +450,28 @@ class HandoffEngine:
             release = getattr(self.client, "invalidate_reserved_nonce", None)
             if values and not isinstance(values[0], BaseException) and callable(release):
                 await release(values[0])
+
+    async def _release_unsent_orders(self) -> None:
+        """Invalidate every order this attempt prepared but never sent.
+
+        A stop before the source send (pre-source stream refusal, quote expiry,
+        a failed guard) leaves the prepared source order unsent.  Its nonce
+        stays reserved inside the SDK, and with API nonce management the venue
+        keeps returning that same next nonce, so every later reservation on the
+        account (a retry, reduce-only recovery) would be refused.  A sent order
+        was consumed before the transport; invalidating it changes nothing.
+        """
+        prepared, self._attempt_prepared = list(self._attempt_prepared), []
+        for item in prepared:
+            try:
+                await self._invalidate_prepared(item)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # Best effort: a failed release only keeps the earlier,
+                # conservative state (later reservations are refused); it must
+                # never replace the attempt's own result.
+                continue
 
     async def _read_public_book(
         self,
@@ -840,13 +865,17 @@ class HandoffEngine:
                 unknown_reasons=(reason,),
                 operation_mode=config.operation_mode,
             )
+        self._attempt_prepared = []
         try:
             return await self._execute_locked(config, journal)
         finally:
             try:
-                await self._finish_cancel_preparation()
+                await self._release_unsent_orders()
             finally:
-                journal.release_attempt()
+                try:
+                    await self._finish_cancel_preparation()
+                finally:
+                    journal.release_attempt()
 
     async def _execute_locked(self, config: HandoffConfig, journal: DurableJournal) -> HandoffResult:
         self._source_dispatch_monotonic = None
@@ -963,6 +992,7 @@ class HandoffEngine:
         receiver_receipt: MutationReceipt | None = None
         receiver_order: OrderSnapshot | None = None
         unknown_reasons: list[str] = []
+        pre_dispatch_transient = True
         source_dispatch_attempted = False
         receiver_dispatch_attempted = False
         priority_guard: dict[str, Any] | None = None
@@ -1033,6 +1063,11 @@ class HandoffEngine:
                 if prepared_receiver is not None:
                     await self._invalidate_prepared(prepared_receiver)
                 unknown_reasons.append(f"order preparation failed before source exposure: {sanitize_exception(exc)}")
+                # Nothing was sent.  A timeout (an expired pre-quote nonce
+                # reservation, a slow nonce read or signing) or a connection
+                # failure is transient; any other preparation failure is not.
+                if not isinstance(exc, (TimeoutError, asyncio.TimeoutError, ConnectionError, OSError)):
+                    pre_dispatch_transient = False
             finally:
                 latency["paired_preparation_seconds"] = max(
                     0.0,
@@ -1670,6 +1705,12 @@ class HandoffEngine:
             priority_guard["admission_reasons"] = list(unknown_reasons[:8])
             if pre_source_stream is not None:
                 priority_guard["pre_source_stream"] = pre_source_stream
+            if (not source_dispatch_attempted and unknown_reasons
+                    and all(_is_pre_dispatch_reason(reason) for reason in unknown_reasons)
+                    and not any(str(reason).startswith("WS_ADMISSION_STOP: ") for reason in unknown_reasons)):
+                # A stop before the source send that the stream did not cause:
+                # the zero-mutation proof after reconciliation decides retry.
+                priority_guard["pre_dispatch"] = "TRANSIENT" if pre_dispatch_transient else "FAILED"
             journal.append(
                 "PRE_RECEIVER_GUARD",
                 {
@@ -2003,7 +2044,9 @@ class HandoffEngine:
             raise ContractError("prepared dispatch client lacks order preparation")
         token = None if self._preflight_context is None else self._preflight_context.reserved_nonces.get(plan.account_index)
         operation = method(plan) if token is None else method(plan, reserved_nonce=token)
-        return await self._bounded(operation, "order preparation")
+        prepared = await self._bounded(operation, "order preparation")
+        self._attempt_prepared.append(prepared)
+        return prepared
 
     async def _prepare_pair(
         self,
@@ -2778,6 +2821,22 @@ class HandoffEngine:
         }
 
     @staticmethod
+    def _zero_mutation(source: LegReconciliation, receiver: LegReconciliation) -> bool:
+        """Both legs reconciled complete and unchanged with nothing sent."""
+        return (
+            not source.dispatched and not receiver.dispatched
+            and source.order is None and receiver.order is None
+            and not source.trades and not receiver.trades
+            and source.filled_quantity == 0 and receiver.filled_quantity == 0
+            and source.history_complete and receiver.history_complete
+            and not source.unknown_reasons and not receiver.unknown_reasons
+            and source.position_before is not None
+            and receiver.position_before is not None
+            and source.position_after == source.position_before
+            and receiver.position_after == receiver.position_before
+        )
+
+    @staticmethod
     def _retryable_pair_after_guard(
         plan: HandoffPlan,
         source: LegReconciliation,
@@ -2793,15 +2852,21 @@ class HandoffEngine:
             # sent on either account and both legs reconcile unchanged.
             return (
                 len(unknown_reasons) == 1
-                and str(unknown_reasons[0]).startswith("WS_ADMISSION_STOP: pre-source stream unavailable: ")
-                and not source.dispatched and not receiver.dispatched
-                and source.order is None and receiver.order is None
-                and not source.trades and not receiver.trades
-                and source.filled_quantity == 0 and receiver.filled_quantity == 0
-                and source.history_complete and receiver.history_complete
-                and not source.unknown_reasons and not receiver.unknown_reasons
-                and source.position_after == source.position_before
-                and receiver.position_after == receiver.position_before
+                and str(unknown_reasons[0]).startswith(PRE_SOURCE_STREAM_REASON)
+                and HandoffEngine._zero_mutation(source, receiver)
+            )
+        if priority_guard.get("pre_dispatch") == "TRANSIENT":
+            # Proved zero-mutation attempt that stopped before the source send
+            # for a transient reason (cycle-317: the pre-quote nonce
+            # reservation expired while slow reads finished).  Retry within
+            # the shared pair budget only when every reason is such a stop
+            # and nothing was sent on either account.
+            return (
+                bool(unknown_reasons)
+                and all(_is_pre_dispatch_reason(reason)
+                        and not str(reason).startswith("WS_ADMISSION_STOP: ")
+                        for reason in unknown_reasons)
+                and HandoffEngine._zero_mutation(source, receiver)
             )
         ws_liquidity_veto = (
             (priority_guard.get("status"), priority_guard.get("receiver_admission"))
@@ -3689,14 +3754,12 @@ class HandoffEngine:
         receiver: LegReconciliation,
         unknown_reasons: Sequence[str],
     ) -> Outcome:
-        if (unknown_reasons and all(r.startswith("WS_ADMISSION_STOP: pre-source") for r in unknown_reasons)
-                and not source.dispatched and not receiver.dispatched
-                and source.order is None and receiver.order is None
-                and not source.trades and not receiver.trades
-                and not source.unknown_reasons and not receiver.unknown_reasons
-                and source.history_complete and receiver.history_complete
-                and source.position_after == source.position_before
-                and receiver.position_after == receiver.position_before):
+        # A stop before the source send (pre-source stream refusal, order
+        # preparation failure, quote expiry) with proved zero mutation on both
+        # legs sent nothing: it is a refused attempt, never UNKNOWN, so the
+        # caller's retry or reduce-only recovery may act on the proved legs.
+        if (unknown_reasons and all(_is_pre_dispatch_reason(r) for r in unknown_reasons)
+                and self._zero_mutation(source, receiver)):
             return Outcome.FAILED_PREFLIGHT_BLOCKED
         known_partial_reasons = {
             "source fill observed before receiver dispatch",
@@ -4068,6 +4131,18 @@ def _account_from_client(client: HandoffClient, role: str) -> int:
 def _safe_preflight_reason(exc: BaseException) -> str:
     """Expose only named, non-sensitive contract conflicts to the operator."""
     return sanitize_exception(exc)
+
+
+PRE_SOURCE_STREAM_REASON = "WS_ADMISSION_STOP: pre-source stream unavailable: "
+PRE_DISPATCH_PREPARATION_REASON = "order preparation failed before source exposure: "
+PRE_DISPATCH_QUOTE_EXPIRED_REASON = "source quote latency budget expired before dispatch"
+
+
+def _is_pre_dispatch_reason(reason: Any) -> bool:
+    """A stop the engine records before the source order can reach the transport."""
+    text = str(reason)
+    return (text.startswith(("WS_ADMISSION_STOP: pre-source", PRE_DISPATCH_PREPARATION_REASON))
+            or text == PRE_DISPATCH_QUOTE_EXPIRED_REASON)
 
 
 def _client_order_index(run_id: str, leg: str) -> int:

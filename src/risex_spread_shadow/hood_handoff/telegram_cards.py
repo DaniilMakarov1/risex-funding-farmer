@@ -433,7 +433,11 @@ def residual_details(report):
         peer = fill.get('counterparty_account_index')
         labels.add('контрагент неизвестен' if type(peer) is not int else
                    'свой счёт' if peer in accounts else 'внешние участники')
-    return 'остаток закрыт reduce-only: ' + ', '.join(sorted(labels))
+    # cycle-312: one account was closed while the other stayed open; never
+    # claim the whole residual closed unless the inventory is proved flat.
+    flat = mapping(report.get('inventory')).get('status') == 'CONFIRMED_FLAT'
+    return ('остаток закрыт reduce-only: ' if flat else
+            'остаток закрыт reduce-only не полностью: ') + ', '.join(sorted(labels))
 
 
 def planned_quantity(report):

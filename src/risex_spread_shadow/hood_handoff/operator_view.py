@@ -134,7 +134,10 @@ def position_line(account, position, symbol):
     q = number(position)
     if q is None:
         return f'Счёт {clean(account, 24)}: позиция неизвестна ({clean(position, 48)}).'
-    side = 'LONG' if q > 0 else 'SHORT' if q < 0 else 'закрыта'
+    if q == 0:
+        # "закрыта 0 BTC" read as "nothing was closed" on the cycle-312 card.
+        return f'Счёт {clean(account, 24)}: позиции нет.'
+    side = 'LONG' if q > 0 else 'SHORT'
     return f'Счёт {clean(account, 24)}: {side} {amount(abs(q))} {clean(symbol, 24)}.'
 
 
