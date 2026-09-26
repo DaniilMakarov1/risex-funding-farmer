@@ -344,6 +344,9 @@ class RandomCycleConfig:
     margin_reserve: OpeningMarginReserve | None = None
     confirmed_pilot: bool = False
     pilot_allow_leverage_update: bool = False
+    # Fan-out (owner request 2026-09-26): receivers 2..k of one source LIMIT.
+    # Empty keeps the unchanged 1 -> 1 cycle.
+    extra_receiver_account_indices: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
         if self.price_improvement_ticks is not None:
@@ -455,6 +458,26 @@ class RandomCycleConfig:
             or self.margin_reserve != OpeningMarginReserve(Decimal("0.10"), Decimal("0.02"))
         ):
             raise ContractError("confirmed pilot requires the authorized BTC accounts and reserve")
+        extras = self.extra_receiver_account_indices
+        if not isinstance(extras, (tuple, list)):
+            raise ContractError("extra_receiver_account_indices must be a list of account indices")
+        extras = tuple(_int(value, "extra_receiver_account_index") for value in extras)
+        if extras:
+            if len(extras) + 1 > 16:
+                raise ContractError("fan-out allows at most 16 receivers")
+            if (len(set(extras)) != len(extras)
+                    or {self.source_account_index, self.receiver_account_index} & set(extras)):
+                raise ContractError("fan-out receiver accounts must all differ from each other and the source")
+            if self.receiver_admission not in ("ack", "ws_confirmed"):
+                raise ContractError("fan-out supports only ACK or WS receiver admission")
+            if self.confirmed_pilot:
+                raise ContractError("confirmed pilot cannot use fan-out")
+        object.__setattr__(self, "extra_receiver_account_indices", extras)
+
+    @property
+    def receiver_account_indices(self) -> tuple[int, ...]:
+        """Every receiver of the cycle: the configured receiver first."""
+        return (self.receiver_account_index, *self.extra_receiver_account_indices)
 
     @property
     def opening_journal_path(self) -> Path:
@@ -495,6 +518,8 @@ class RandomCycleConfig:
             }} if self.margin_reserve is not None else {}),
             **{name: getattr(self, name) for name in ("max_quote_age_seconds", "max_source_to_receiver_seconds")
                if getattr(self, name) is not None},
+            **({"extra_receiver_account_indices": list(self.extra_receiver_account_indices)}
+               if self.extra_receiver_account_indices else {}),
         }
 
 
@@ -1424,8 +1449,10 @@ def _validate_account(
     *,
     expected_position: Decimal | None = None,
 ) -> None:
-    account_index = config.source_account_index if label == "source" else config.receiver_account_index
-    if snapshot.account_index != account_index or snapshot.market_id != config.market_id:
+    # A fan-out cycle has several receivers; 1 -> 1 keeps exactly one.
+    allowed = ((config.source_account_index,) if label == "source"
+               else config.receiver_account_indices)
+    if snapshot.account_index not in allowed or snapshot.market_id != config.market_id:
         raise PreflightBlocked(f"{label} account identity/market does not match cycle binding")
     if not snapshot.authorized or not snapshot.ready:
         raise PreflightBlocked(f"{label} account authorization/readiness is unproven")
@@ -5272,6 +5299,9 @@ async def run_random_cycle(
     rng: Any | None = None,
     stop_requested: Callable[[], bool] | None = None,
 ) -> RandomCycleResult:
+    if config.extra_receiver_account_indices:
+        from .fanout_cycle import FanoutCycleEngine
+        return await FanoutCycleEngine(client, clock=clock, rng=rng, stop_requested=stop_requested).execute(config)
     return await RandomCycleEngine(client, clock=clock, rng=rng, stop_requested=stop_requested).execute(config)
 
 
