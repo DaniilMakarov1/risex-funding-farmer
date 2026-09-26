@@ -1,3 +1,11 @@
+# ACK/fan-out audit and approved idle activation — completed
+
+State: **DONE**. The finite audit and the owner's explicitly authorized application/restart are complete. This disposition supersedes the earlier READY_FOR_REVIEW, NOT_RUN and WIP records below. Accepted code/tests are `4af6b0b`, integrated unchanged through `0b8f30f` and this documentation-only completion record. Remote main and the audit branch were verified at `0b8f30f` before this record. The final clean Python 3.11.5 suite passed **6244 tests**, with **3 existing skips**; all 306 code/test hashes and 177 immutable evidence inputs were checked again after activation.
+
+Fresh all-wallet READY at **22:46:47 Moscow, 2026-09-26** proved exactly zero positions and no active orders on all four accounts. Under the operator/instance handoff safeguards, the idle controller was restarted as PID **63928**, with unchanged configuration, no active cycle and no agent financial command. Separate private activation evidence is in `spread-shadow-runs/hood-ack-fanout-audit-20260926/v3/`; audit and tests are in `v1/`, and the earlier unexecuted approval-review rejection is preserved in `v2/`. Process owner remains this agent; no delegation occurred.
+
+No new trading campaign, financial command, server deployment or credential migration is authorized by this completion. Those are separate owner decisions. The audit's measured disk improvements do not promise exchange latency or own-order matching priority. Reconciliation stays sequential; the rejected parallel-readback proposal was not applied. Preserve the branch, worktree and evidence. No further implementation remains assigned under this finite task.
+
 # Verified ACK/fan-out candidate — current handoff boundary
 
 State: **READY_FOR_REVIEW**. The finite audit, fixes, adverse regressions, complete diff self-review and final clean Python 3.11.5 validation are DONE at code commit `4af6b0b` on `codex/ack-fanout-audit`: 6244 passed, 3 existing skipped, exit 0, unchanged source/test hashes. Private evidence: `spread-shadow-runs/hood-ack-fanout-audit-20260926/v1/AUDIT.md` and `final-4af6b0b/`. Process owner remains this agent; no delegate exists. This disposition supersedes the WIP/NOT_RUN validation notes below.
