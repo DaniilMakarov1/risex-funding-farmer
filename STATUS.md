@@ -1,4 +1,14 @@
-# ACK/fan-out audit — candidate awaiting final validation, 2026-09-26
+# ACK/fan-out audit — verified candidate, live integration pending, 2026-09-26
+
+Current disposition (supersedes the work-in-progress notes below): **READY_FOR_REVIEW**. Implementation and self-review DONE. Final code commit `4af6b0b` on `codex/ack-fanout-audit`, from accepted main `b8f0d55`. Clean isolated Python 3.11.5 full suite: **6244 passed, 3 existing skipped, 2 dependency deprecation warnings, exit 0**, 181.52 s. Source/test hashes before and after are identical. Later documentation-only commits do not change the tested implementation. All changes are confined to active hood_handoff, its tests and the four English documents; AGENTS and frozen modules are unchanged.
+
+Evidence package: owner-only, outside Git, `spread-shadow-runs/hood-ack-fanout-audit-20260926/v1/` in the main checkout. `AUDIT.md` explains defects, counterexamples, limits and provenance; `final-4af6b0b/final-validation.json` and `final-full-suite.txt` bind the final verification; baseline probes reproduce both principal defects on accepted imports. Synthetic three-MARKET benchmark with 50 ms per fsync: five post-ACK waits become one, ACK-to-first-MARKET about 296–303 ms becomes 58–61 ms; total cycle fsync count 59 becomes 18. No live speedup or own-priority guarantee is claimed.
+
+Real evidence: cycles 341–354 have seven SUCCESS/seven PARTIAL results, all complete and confirmed flat. Cycle 355 is separately UNKNOWN after closing-history timeouts; its misleading flatness explanation is corrected for future cycles, without rewriting its old evidence. A separate read-only check at 22:28:56 Moscow proved READY, exact zero positions and zero active orders on all four accounts. Later owner-started series mean that snapshot is not perpetual readiness. Initial read-only readiness failure and earlier validation-environment failures are preserved, not hidden.
+
+Integration/activation: **NOT_RUN**. Main and the live controller have been left at `b8f0d55` because the owner continues real series (including a new seven-cycle series after 355). Preserve the attached worktree and candidate branch. Next action after the owner provides a pause between series: recheck idle state and fresh all-wallet READY, integrate the unchanged verified candidate and apply it without launching a new trading cycle. Server deployment, credential migration and agent financial commands: NOT_RUN / 0. Final reconciliation remains sequential; the separately rejected parallel-readback edit was not applied.
+
+# ACK/fan-out audit — preceding work-in-progress record
 
 Current state: WIP_NOT_ACCEPTED on `codex/ack-fanout-audit`, based on accepted main `b8f0d55`. Work is isolated from the live checkout and performed by one agent with self-review. Current NEXT_TASK/SYSTEM_SPEC/README top sections supersede the older admission and dust claims below. No live financial command, server deployment or credential migration was performed.
 
