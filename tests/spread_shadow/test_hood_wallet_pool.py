@@ -1118,3 +1118,45 @@ def test_later_pool_close_is_matched_to_a_drawn_pair(tmp_path, monkeypatch, case
         assert '✅ нулевые позиции подтверждены' in plain
     else:
         assert '❔ итог закрытия не подтверждён' in plain
+
+
+@pytest.mark.asyncio
+async def test_selection_retries_only_typed_rate_limits_within_bounds(tmp_path):
+    from risex_spread_shadow.hood_handoff.read_errors import ReadRateLimited
+
+    clock = AdvancingClock()
+    config = cycle_config(tmp_path, max_poll_count=4, reconcile_timeout_seconds=60)
+    failures = {'market': 1, 33: 2, 44: 9}
+
+    class Limited(SelectionClient):
+        async def market_metadata(self, market_id):
+            if failures['market']:
+                failures['market'] -= 1
+                raise ReadRateLimited(0.5)
+            return await super().market_metadata(market_id)
+
+        async def public_account_state(self, index, market_id):
+            if failures.get(index):
+                failures[index] -= 1
+                raise ReadRateLimited(1.5)
+            if index == 55:
+                raise RuntimeError('not a rate limit')
+            return await super().public_account_state(index, market_id)
+
+    states = {index: ('1000', '0', True) for index in (11, 22, 33, 44, 55)}
+    client = Limited(clock, states)
+    sleeps = []
+
+    async def sleep(seconds):
+        sleeps.append(seconds)
+
+    pool = wp.WalletPool(active=(11, 22, 33, 44, 55), from_file=True)
+    record = await wp.select_wallet_pair(config, pool, client, has_key=lambda _: True,
+                                         rng=EnumeratingRng([0, 0]), clock=clock.now, sleep=sleep)
+    assert record['eligible'] == [11, 22, 33]
+    assert record['skipped'] == [{'account_index': 44, 'reason': 'UNAVAILABLE'},
+                                 {'account_index': 55, 'reason': 'UNAVAILABLE'}]
+    # Market: one retry at max(poll, 1, 0.5); wallet 33: 1.5 then max(2, 1.5);
+    # wallet 44 exhausts max_poll_count=4 (three cooldowns) and is skipped.
+    assert sorted(sleeps) == sorted([1.0, 1.5, 2.0, 1.5, 2.0, 4.0])
+    assert failures[44] == 5

@@ -259,6 +259,30 @@ def draw_pair(eligible: Sequence[int], rng: Any = None) -> tuple[int, int]:
     return ordered[first], ordered[second]
 
 
+async def _rate_limited_read(read: Callable[[], Any], config: Any, sleep: Callable[[float], Any]) -> Any:
+    """One public read; only a typed HTTP 429 is retried, within the configured bounds."""
+
+    from .read_errors import read_rate_limit_delay
+
+    timeout = float(config.request_timeout_seconds)
+    deadline = time.monotonic() + float(config.reconcile_timeout_seconds)
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            return await asyncio.wait_for(read(), timeout)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            delay = read_rate_limit_delay(exc)
+            if delay is None or attempt >= int(config.max_poll_count):
+                raise
+            wait = max(float(config.poll_interval_seconds), min(8.0, 2.0 ** min(attempt - 1, 3)), float(delay))
+            if time.monotonic() + wait > deadline:
+                raise
+            await sleep(wait)
+
+
 async def select_wallet_pair(
     config: Any,
     pool: WalletPool,
@@ -267,26 +291,28 @@ async def select_wallet_pair(
     has_key: Callable[[int], bool],
     rng: Any = None,
     clock: Callable[[], float] = time.time,
+    sleep: Callable[[float], Any] = asyncio.sleep,
 ) -> dict[str, Any]:
     """Read public state for each active wallet and draw one eligible pair.
 
     Returns the durable selection record; ``pair`` is None when fewer than two
     wallets are eligible.  Market reads failing propagate (no cycle starts).
+    A typed HTTP 429 on any read is retried with the engine's bounded cooldown.
     """
 
     from .random_cycle import _as_book, _as_market
 
-    timeout = float(config.request_timeout_seconds)
-    metadata = _as_market(await asyncio.wait_for(client.market_metadata(config.market_id), timeout))
-    book = _as_book(await asyncio.wait_for(client.order_book(config.market_id), timeout), metadata)
+    metadata = _as_market(await _rate_limited_read(
+        lambda: client.market_metadata(config.market_id), config, sleep))
+    book = _as_book(await _rate_limited_read(lambda: client.order_book(config.market_id), config, sleep), metadata)
     requirement = wallet_requirement(metadata, book, config)
     semaphore = asyncio.Semaphore(SELECTION_READ_CONCURRENCY)
 
     async def state(index: int) -> WalletState | None:
         async with semaphore:
             try:
-                value = await asyncio.wait_for(
-                    client.public_account_state(index, config.market_id), timeout)
+                value = await _rate_limited_read(
+                    lambda: client.public_account_state(index, config.market_id), config, sleep)
             except asyncio.CancelledError:
                 raise
             except Exception:
