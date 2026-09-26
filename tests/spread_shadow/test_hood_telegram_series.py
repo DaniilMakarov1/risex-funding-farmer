@@ -387,16 +387,22 @@ async def test_series_notices_identify_each_transition_and_end(tmp_path):
     await c.task
     await c._notice_task
     messages = [m for _, m in c.transport.messages]
-    # Accepted, a start step and a card per cycle, then one final summary.
-    assert len(messages) == 6
-    assert 'Принято: серия из 2 циклов' in messages[0]
-    assert messages[1].startswith('▶️ <b>Цикл 1/2</b> · начинаю')
-    assert '<b>Цикл 1/2</b> · <code>cycle-001</code>' in messages[2]
-    assert 'Следующий цикл через' in messages[2]
-    assert messages[3].startswith('▶️ <b>Цикл 2/2</b> · начинаю: проверяю счета')
-    assert '<b>Цикл 2/2</b> · <code>cycle-002</code>' in messages[4]
-    assert 'Следующий цикл через' not in messages[4]
-    assert 'Серия завершена: 2/2' in messages[5] and 'Итого' in messages[5]
+    # Every controller step in order, one card per cycle and one final summary.
+    expected = ['📨 <b>Принято: серия из 2 циклов',
+                '🔎 <b>Проверка</b> · проверяю позиции и старые ордера',
+                '✓ <b>Проверка</b> · позиций нет (счёт 11: 0; счёт 22: 0)',
+                '🔎 <b>Проверка</b> · подтверждаю готовность к открытию',
+                '✓ <b>Проверка</b> · счета готовы — запускаю цикл',
+                '▶️ <b>Цикл 1/2</b> · начинаю',
+                '🟡 <b>Цикл 1/2</b> · <code>cycle-001</code>',
+                '▶️ <b>Цикл 2/2</b> · начинаю: проверяю позиции',
+                '✓ <b>Цикл 2/2</b> · позиций нет (счёт 11: 0; счёт 22: 0); подтверждаю готовность',
+                '✓ <b>Цикл 2/2</b> · счета готовы — запускаю цикл',
+                '🟡 <b>Цикл 2/2</b> · <code>cycle-002</code>',
+                '🏁 <b>Серия завершена: 2/2</b>']
+    assert len(messages) == len(expected)
+    assert all(m.startswith(e) for m, e in zip(messages, expected)), messages
+    assert 'Следующий цикл через' in messages[6] and 'Следующий цикл через' not in messages[10]
 
 
 async def test_notice_queue_is_bounded_and_drops_old_progress(tmp_path):

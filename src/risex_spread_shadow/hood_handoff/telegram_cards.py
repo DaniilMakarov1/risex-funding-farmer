@@ -144,7 +144,7 @@ def execution_text(phase, attempt, receipt, progress=None):
 
 
 def phase_notices(slot, progress=None):
-    """(key, icon, text) per accepted LIMIT, completed attempt and 429 cooldown.
+    """(key, at, icon, text) per accepted LIMIT, completed attempt and 429 cooldown.
 
     Reads only this cycle's saved phase journals in the controller's worker
     thread; a trailing partial write is simply read again at the next poll.
@@ -166,19 +166,130 @@ def phase_notices(slot, progress=None):
                 if event in {'PLAN_READY', 'PLAN_REVIEWED'}:
                     plan = mapping(payload.get('plan', payload))
                 elif event == 'SOURCE_DISPATCH_RESULT' and payload.get('accepted') is True:
-                    notices.append((f'{phase}-{attempt}-accepted', '⏳', accepted_text(phase, attempt, plan)))
+                    notices.append((f'{phase}-{attempt}-accepted', row['at'], '⏳', accepted_text(phase, attempt, plan)))
                 elif event == 'RECONCILIATION_RATE_LIMIT' and payload.get('will_retry') is True and not limited:
                     limited = True
-                    notices.append((f'{phase}-{attempt}-limited', '⚠️',
+                    notices.append((f'{phase}-{attempt}-limited', row['at'], '⚠️',
                                     f'{"открытие" if phase == "opening" else "закрытие"}: биржа временно ограничила '
                                     'чтение (HTTP 429). Жду и перепроверяю; ордера не повторяются.'))
                 elif event == 'COMPLETE':
                     icon, message = execution_text(phase, attempt, payload.get('receipt'), progress)
-                    notices.append((f'{phase}-{attempt}-execution', icon, message))
+                    notices.append((f'{phase}-{attempt}-execution', row['at'], icon, message))
         except Exception:
             continue  # Incomplete trailing write or unproved row: retried at the next poll.
     rank = {'accepted': 0, 'limited': 1, 'execution': 2}
     return sorted(notices, key=lambda n: (n[0].startswith('closing'), int(n[0].split('-')[1]), rank[n[0].split('-')[2]]))
+
+
+def leverage(bps):
+    try:
+        return f'{Decimal(10000) / Decimal(int(bps)):.2f}x'
+    except (ArithmeticError, TypeError, ValueError):
+        return '?'
+
+
+def reason(value, limit=160):
+    return text(value if value else 'причина не сохранена', limit)
+
+
+def positions_text(proof):
+    """Both accounts' current positions and active orders from a readiness proof."""
+    parts = []
+    for role in ('source', 'receiver'):
+        row = mapping(mapping(proof).get(role))
+        account = text(row.get('account_index', '?'), 24)
+        quantity = number(row.get('signed_position'))
+        if quantity is None:
+            state = 'позиция неизвестна'
+        elif not quantity:
+            state = '0'
+        else:
+            state = f'{"LONG" if quantity > 0 else "SHORT"} {text(amount(abs(quantity)), 24)} BTC'
+        orders = row.get('active_orders')
+        if isinstance(orders, list) and orders:
+            state += f', активных ордеров {len(orders)}'
+        parts.append(f'счёт {account}: {state}')
+    return '; '.join(parts)
+
+
+PHASES = {'opening': 'открытие', 'closing': 'закрытие', 'PAIRED_OPENING': 'открытие', 'PAIRED_CLOSING': 'закрытие'}
+STOPS = {'CLOSING_BLOCKED': 'закрытие остановлено', 'CYCLE_EXECUTION_UNKNOWN': 'исполнение не доказано',
+         'FALLBACK_BLOCKED_IDENTITY_BARRIER': 'закрытие остатка остановлено',
+         'FALLBACK_RECONCILIATION_UNKNOWN': 'итог закрытия остатка не доказан'}
+
+
+def cycle_steps(slot):
+    """(key, at, icon, text) for the trading child's own cycle journal events."""
+    from .operator_recovery import journal_rows
+    steps, binding = [], {}
+    try:
+        for row in journal_rows(Path(slot) / 'cycle.jsonl'):
+            event, payload, at = row.get('event'), mapping(row['payload']), row['at']
+            key = f'cycle-{row["sequence"]}'
+            if event == 'CYCLE_STARTED':
+                binding = mapping(payload.get('binding'))
+                steps.append((key, at, '⚙️', 'торговый процесс запущен: читаю рынок и счета'))
+            elif event == 'SELECTION_PROVED':
+                selection = mapping(payload.get('selection'))
+                sides = {'LONG': ('SELL', 'BUY'), 'SHORT': ('BUY', 'SELL')}.get(binding.get('direction'), ('?', '?'))
+                hold = seconds(selection.get('hold_seconds'))
+                steps.append((key, at, '🎲', f'выбрано: LIMIT {text(binding.get("source_account_index", "?"), 24)} {sides[0]} → '
+                              f'MARKET {text(binding.get("receiver_account_index", "?"), 24)} {sides[1]} · '
+                              f'{text(btc(selection.get("quantity")), 24)} BTC' + (f' · удержание {hold}' if hold else '')))
+            elif event == 'LEVERAGE_PLAN':
+                target, observed = mapping(payload.get('target_fraction_bps')), mapping(payload.get('observed_fraction_bps'))
+                parts = ', '.join(f'{text(account, 24)} {leverage(bps)}' for account, bps in list(target.items())[:2])
+                changed = any(observed.get(account) != bps for account, bps in target.items())
+                steps.append((key, at, '⚙️', ('ставлю плечо: ' if changed else 'плечо уже подходит: ') + parts))
+            elif event == 'LEVERAGE_UPDATE_CONFIRMED':
+                steps.append((key, at, '✓', f'плечо счёта {text(payload.get("account_index", "?"), 24)} → '
+                              f'{leverage(payload.get("fraction_bps"))} подтверждено'))
+            elif event == 'INITIAL_SPREAD_WAIT':
+                steps.append((key, at, '⏳', 'жду спред под заданный отступ цены; ордера ещё не отправлены.'))
+            elif event == 'INITIAL_SPREAD_READY':
+                steps.append((key, at, '✓', 'спред подходит — продолжаю'))
+            elif event == 'OPENING_QUANTITY_RECALCULATED':
+                steps.append((key, at, '↘️', f'объём уменьшен по свежей марже: {text(amount(payload.get("old_quantity")), 24)} → '
+                              f'{text(amount(payload.get("new_quantity")), 24)} BTC; проверяю перед открытием.'))
+            elif event in ('PREPARATION_RETRY', 'CLOSING_PREPARATION_RETRY'):
+                what = 'подготовка открытия' if event == 'PREPARATION_RETRY' else 'подготовка закрытия'
+                steps.append((key, at, '⚠️', f'{what}: повтор — {reason(payload.get("reason"))}'))
+            elif event in ('PREPARATION_FAILED', 'CLOSING_PREPARATION_FAILED'):
+                what = 'подготовка открытия' if event == 'PREPARATION_FAILED' else 'подготовка закрытия'
+                steps.append((key, at, '⚠️', f'{what} не прошла: {reason(payload.get("reason"))}'))
+            elif event == 'PREPARATION_BLOCKED':
+                steps.append((key, at, '⛔', f'подготовка открытия остановлена: {reason(payload.get("reason"))}'))
+            elif event == 'PAIR_ATTEMPT_RETRY':
+                steps.append((key, at, '🔁', f'повторяю {PHASES.get(payload.get("phase"), "попытку")}: '
+                              f'попытка {text(payload.get("next_attempt", "?"), 8)}'))
+            elif event == 'PAIR_ATTEMPT_EXHAUSTED':
+                steps.append((key, at, '⛔', f'{PHASES.get(payload.get("phase"), "фаза")}: попытки исчерпаны '
+                              f'({text(payload.get("maximum_attempts", "?"), 8)}) — {reason(payload.get("reason"))}'))
+            elif event == 'CLOSING_PLAN_READY' and payload.get('attempt') in (None, 1):
+                steps.append((key, at, '⏱', 'удержание закончилось — начинаю закрытие'))
+            elif event == 'FALLBACK_DISPATCH_INTENT':
+                plan = mapping(payload.get('plan'))
+                steps.append((key, at, '🛠', f'закрываю остаток reduce-only: счёт {text(payload.get("account_index", "?"), 24)} '
+                              f'{text(plan.get("side", "?"), 8)} {text(btc(plan.get("quantity")), 24)} BTC'))
+            elif event == 'FALLBACK_RECONCILED':
+                after = number(mapping(payload.get('after')).get('signed_position'))
+                ok = payload.get('outcome') == 'SUCCESS'
+                steps.append((key, at, '✓' if ok else '⚠️', f'остаток счёта {text(payload.get("account_index", "?"), 24)}: '
+                              f'{text(payload.get("outcome", "?"), 24)}' + (f', позиция {text(amount(after), 24)}' if after is not None else '')))
+            elif event == 'RECOVERY_READ_RETRY':
+                steps.append((key, at, '⚠️', f'повтор чтения ({text(payload.get("operation", "?"), 40)}): {reason(payload.get("reason"))}'))
+            elif event in STOPS:
+                steps.append((key, at, '⛔', f'{STOPS[event]}: {reason(payload.get("reason"))}'))
+            elif event == 'CYCLE_PREFLIGHT_BLOCKED':
+                steps.append((key, at, '⛔', f'цикл остановлен до ордеров: {reason(payload.get("opening_reason"))}'))
+    except Exception:
+        pass  # A trailing partial write is read again at the next poll.
+    return steps
+
+
+def live_steps(slot, progress=None):
+    """Cycle and phase steps in journal-time order; display only."""
+    return sorted(cycle_steps(slot) + phase_notices(slot, progress), key=lambda step: step[1])
 
 
 def phase_row(report, phase):

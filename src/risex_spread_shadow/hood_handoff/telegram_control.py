@@ -27,7 +27,7 @@ import aiohttp
 from .keychain import MacOSKeychainBackend, read_hidden_secret
 from .offline_report import load_saved_cycle_report
 from .operator_view import amount, read_lifecycle, read_launch_failure
-from .telegram_cards import phase_notices
+from .telegram_cards import live_steps, positions_text
 from .operator_control import exclusive_lock
 from . import telegram_messages as views
 
@@ -49,6 +49,28 @@ def validate_token(value):
     if not isinstance(value, str) or not re.fullmatch(r'[0-9]{1,20}:[A-Za-z0-9_-]{20,256}', value):
         raise RuntimeError('invalid Telegram bot token')
     return value
+
+
+STOP_REASONS = {
+    'next cycle close readiness is unproved': 'сверка позиций перед следующим циклом не подтверждена',
+    'next cycle flatness is unproved': 'нулевые позиции перед следующим циклом не подтверждены',
+    'next cycle close is unavailable': 'закрытие остатка недоступно',
+    'series recovery is unavailable': 'проверка счетов недоступна',
+    'invalid inter-cycle delay': 'неверная пауза между циклами',
+    'pre-cycle close slot is ambiguous': 'закрытие старого остатка неоднозначно',
+    'pre-cycle close is not confirmed flat': 'старый остаток не подтверждён закрытым',
+    'fresh post-close flatness is unproved': 'нулевые позиции после закрытия не подтверждены',
+    'current account proof is incomplete': 'данные счетов неполные',
+    'current position is invalid': 'позиция счёта некорректна',
+    'current account identities conflict': 'счета не совпадают с настройкой',
+}
+
+
+def stop_reason(exc):
+    """Fixed, credential-free wording: never exception text from libraries."""
+    if type(exc) is RuntimeError and str(exc) in STOP_REASONS:
+        return STOP_REASONS[str(exc)]
+    return 'ошибка ' + admission_failure_category(exc)
 
 
 class Store:
@@ -201,6 +223,7 @@ class Controller:
         self._series_delay = series_delay or (lambda: random.SystemRandom().randint(5, 30))
         self._series_pause = None
         self._pending_card = None
+        self._send_lock = None
         self.now = now
         self.started = now()
         self.task = None
@@ -436,8 +459,12 @@ class Controller:
         return prefix + message
 
     async def notify(self, text):
+        # One FIFO send path keeps replies and background steps in order.
+        if self._send_lock is None:
+            self._send_lock = asyncio.Lock()
         try:
-            await self.transport.send(self.owner, text)
+            async with self._send_lock:
+                await self.transport.send(self.owner, text)
         except Exception as exc:
             # Only a fixed category, never URLs, response bodies or exception text.
             category = exc.category if isinstance(exc, TelegramFailure) else 'UNCLASSIFIED'
@@ -445,6 +472,12 @@ class Controller:
                 category = 'UNCLASSIFIED'
             print('Telegram notification delivery failed; command will not be replayed. category=' + category,
                   file=sys.stderr, flush=True)
+
+    async def _drain_notices(self, timeout=5):
+        """Bounded wait for queued display only; used where nothing is being traded."""
+        task = self._notice_task
+        if task is not None and not task.done():
+            await asyncio.wait({task}, timeout=timeout)
 
     def queue_notice(self, message):
         """Bounded best-effort display only; never awaited by cycle sequencing."""
@@ -484,6 +517,13 @@ class Controller:
         title = f'Цикл {index}/{total}' if total != 1 else 'Цикл'
         return f'{icon} <b>{title}</b> · ' + message
 
+    def step_notice(self, message, icon='🔎'):
+        """Controller-side step; named by cycle once a run is admitted."""
+        active = self.store.data.get('active')
+        if isinstance(active, dict) and active.get('action', 'run') == 'run':
+            return self.cycle_notice(message, icon)
+        return f'{icon} <b>Проверка</b> · {message}'
+
     def render_cycle_card(self, card):
         """Worker-thread rendering of one finished cycle; display only, never raises."""
         from .telegram_cards import cycle_card
@@ -522,27 +562,13 @@ class Controller:
                 if len(added) == 1:
                     path = self.operator / added[0] / 'cycle.jsonl'
                     progress = await asyncio.to_thread(read_lifecycle, path)
-                    # Short phase steps (LIMIT accepted, attempt result with
-                    # LIMIT→MARKET time, 429 cooldown) read from saved journals
-                    # in a worker thread; never awaited by the trading child.
-                    for key, icon, message in await asyncio.to_thread(phase_notices, path.parent, progress):
+                    # Every journaled step of the trading child, read from its
+                    # saved journals in a worker thread and pushed once; the
+                    # child never waits for this display.
+                    for key, _, icon, message in await asyncio.to_thread(live_steps, path.parent, progress):
                         if key not in sent:
                             sent.add(key)
                             self.queue_notice(self.cycle_notice(message, icon))
-                    for resized in (progress or {}).get('size_updates', []):
-                        key = f'size-{resized.get("attempt")}'
-                        if key not in sent:
-                            sent.add(key)
-                            self.queue_notice(self.cycle_notice(
-                                f'объём уменьшен по свежей марже: {views.text(amount(resized.get("old_quantity")), 24)} → '
-                                f'{views.text(amount(resized.get("new_quantity")), 24)} BTC; проверяю перед открытием.', '↘️'))
-                    stage = progress.get('stage') if progress else None
-                    alerts = {'SPREAD_WAIT': ('⏳', 'жду спред под заданный отступ цены; ордера ещё не отправлены.'),
-                              'RECOVERY': ('🛠', 'пара закрылась не полностью — закрываю остаток reduce-only.')}
-                    if stage in alerts and stage not in sent:
-                        sent.add(stage)
-                        # Slow/unavailable delivery cannot hold up the child.
-                        self.queue_notice(self.cycle_notice(alerts[stage][1], alerts[stage][0]))
             except (Exception, asyncio.TimeoutError):
                 pass
             await asyncio.sleep(0.5)
@@ -583,8 +609,10 @@ class Controller:
                     await asyncio.gather(notices, return_exceptions=True)
                 if step < total and not safe:
                     break
-        except Exception:
+        except Exception as exc:
             self._flush_card()
+            self.queue_notice(self.step_notice(
+                f'остановлено: {stop_reason(exc)}. Серия не продолжается; /status — состояние.', '⛔'))
             active = self.store.data.get('active') or {}
             close_before = active.get('auto_close_before') if active.get('phase') == 'AUTO_CLOSE' else None
             close_added = (sorted(set(self.slots('close')) - set(close_before))
@@ -626,12 +654,14 @@ class Controller:
             self._series_pause = None
         if self.recovery is None:
             raise RuntimeError('series recovery is unavailable')
-        self.queue_notice(self.cycle_notice('начинаю: проверяю счета, затем плечо, цена и объём.', '▶️'))
+        self.queue_notice(self.cycle_notice('начинаю: проверяю позиции и старые ордера…', '▶️'))
         proof = await self.recovery(require_flat=False)
         if not isinstance(proof, dict) or proof.get('status') != 'CLOSE_READY':
             raise RuntimeError('next cycle close readiness is unproved')
         positions = self._exact_recovery_positions(proof)
         if any(position != 0 for position in positions):
+            self.queue_notice(self.cycle_notice(
+                f'есть позиции: {positions_text(proof)} — перед циклом закрою их reduce-only', '⚠️'))
             if self.close is None:
                 raise RuntimeError('next cycle close is unavailable')
             active['phase'] = 'AUTO_CLOSE'
@@ -640,10 +670,12 @@ class Controller:
                 k: proof.get(k) for k in ('status', 'at', 'previous_intents')}
             self.store.save()
             return
+        self.queue_notice(self.cycle_notice(f'позиций нет ({positions_text(proof)}); подтверждаю готовность…', '✓'))
         ready = await self.recovery(require_flat=True)
         if (not isinstance(ready, dict) or ready.get('status') != 'READY'
                 or any(position != 0 for position in self._exact_recovery_positions(ready))):
             raise RuntimeError('next cycle flatness is unproved')
+        self.queue_notice(self.cycle_notice('счета готовы — запускаю цикл', '✓'))
         self.store.data['last_recovery'] = {
             k: ready.get(k) for k in ('status', 'at', 'previous_intents')}
         self.store.save()
@@ -683,7 +715,9 @@ class Controller:
             raise RuntimeError('pre-cycle close slot is ambiguous')
         result = self.close_report(added[0])
         if result is None or result.get('status') != 'CONFIRMED_FLAT':
+            self.queue_notice(self.cycle_notice('старый остаток не удалось подтвердить закрытым — цикл не начинаю', '⛔'))
             raise RuntimeError('pre-cycle close is not confirmed flat')
+        self.queue_notice(self.cycle_notice('старый остаток закрыт; подтверждаю нулевые позиции…', '✓'))
         proof = await self.recovery(require_flat=True)
         if (not isinstance(proof, dict) or proof.get('status') != 'READY'
                 or any(position != 0 for position in self._exact_recovery_positions(proof))):
@@ -723,20 +757,28 @@ class Controller:
             if self.recovery is not None:
                 if action == 'run' and self.close is not None:
                     stage = 'CLOSE_READY'
+                    self.queue_notice(self.step_notice('проверяю позиции и старые ордера на обоих счетах…'))
                     proof = await self.recovery(require_flat=False)
                     if not isinstance(proof, dict) or proof.get('status') != 'CLOSE_READY':
                         raise RuntimeError('pre-cycle close readiness is unproved')
                     positions = self._exact_recovery_positions(proof)
                     if all(position == 0 for position in positions):
+                        self.queue_notice(self.step_notice(f'позиций нет ({positions_text(proof)}); старые ордера сверены', '✓'))
                         stage = 'READY'
+                        self.queue_notice(self.step_notice('подтверждаю готовность к открытию…'))
                         await self.reconcile_idle(require_flat=True)
+                        self.queue_notice(self.step_notice('счета готовы — запускаю цикл', '✓'))
                     else:
+                        self.queue_notice(self.step_notice(
+                            f'есть позиции: {positions_text(proof)} — перед циклом закрою их reduce-only', '⚠️'))
                         auto_close_before = self.slots('close')
                         self.store.data['last_recovery'] = {
                             k: proof.get(k) for k in ('status', 'at', 'previous_intents')}
                 else:
                     stage = 'READY' if action == 'run' else 'CLOSE_READY'
+                    self.queue_notice(self.step_notice('проверяю счета…'))
                     await self.reconcile_idle(require_flat=action == 'run')
+                    self.queue_notice(self.step_notice('проверка пройдена', '✓'))
             elif self.store.data['active'] is not None:
                 await self.notify(views.blocked_message())
                 return
@@ -760,6 +802,7 @@ class Controller:
                 self.store.save()
             except Exception:
                 print('Telegram admission refusal persistence failed.', file=sys.stderr, flush=True)
+            await self._drain_notices()  # Steps already queued precede the refusal.
             await self.notify(views.admission_refusal_message(record))
             return
         finally:

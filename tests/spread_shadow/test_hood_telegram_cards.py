@@ -242,13 +242,14 @@ async def test_live_steps_and_alerts_are_pushed_once_each(tmp_path, monkeypatch)
         journal_row(1, 'CYCLE_STARTED', {'binding': {}}) + journal_row(2, 'INITIAL_SPREAD_WAIT')
         + journal_row(3, 'OPENING_QUANTITY_RECALCULATED', {'attempt': 1, 'old_quantity': '0.00087',
                                                              'new_quantity': '0.00070'}))
-    steps = [('opening-1-accepted', '⏳', 'открываю: LIMIT'), ('opening-1-limited', '⚠️', 'открытие: HTTP 429'),
-             ('opening-1-execution', '🟢', 'открыто: 🤝 свои счета')]
+    from risex_spread_shadow.hood_handoff.telegram_cards import live_steps
+    steps = [('opening-1-accepted', 1.0, '⏳', 'открываю: LIMIT'), ('opening-1-limited', 2.0, '⚠️', 'открытие: HTTP 429'),
+             ('opening-1-execution', 3.0, '🟢', 'открыто: 🤝 свои счета')]
     seen = []
     def fake(path, progress):
         seen.append(path)
-        return steps
-    monkeypatch.setattr(bot, 'phase_notices', fake)
+        return sorted(live_steps(path, progress) + steps, key=lambda step: step[1])
+    monkeypatch.setattr(bot, 'live_steps', fake)
     c = setup(tmp_path, None)
     c.store.data['active'] = {'action': 'run', 'before': [], 'series_index': 1, 'series_total': 2}
     task = asyncio.create_task(c.lifecycle_notices())
@@ -264,7 +265,8 @@ async def test_live_steps_and_alerts_are_pushed_once_each(tmp_path, monkeypatch)
     assert sum(m.startswith('↘️ <b>Цикл 1/2</b> · объём уменьшен по свежей марже: 0.00087 → 0.0007 BTC')
                for m in messages) == 1
     assert sum(m.startswith('⏳ <b>Цикл 1/2</b> · жду спред') for m in messages) == 1
-    assert len(messages) == 5
+    assert messages.count('⚙️ <b>Цикл 1/2</b> · торговый процесс запущен: читаю рынок и счета') == 1
+    assert len(messages) == 6
 
 
 def test_phase_notices_follow_attempt_order_and_survive_partial_writes(tmp_path):
@@ -273,10 +275,10 @@ def test_phase_notices_follow_attempt_order_and_survive_partial_writes(tmp_path)
     slot = tmp_path / 'cycle-001'
     with (slot / 'opening-attempt-003.jsonl').open('a') as stream:
         stream.write('{"sequence":')  # The child is still writing.
-    keys = [key for key, _, _ in phase_notices(slot)]
+    keys = [key for key, _, _, _ in phase_notices(slot)]
     assert keys[:4] == ['opening-1-accepted', 'opening-1-execution', 'opening-2-accepted', 'opening-2-execution']
     assert 'opening-3-accepted' in keys
-    notices = {key: (icon, message) for key, icon, message in phase_notices(slot)}
+    notices = {key: (icon, message) for key, _, icon, message in phase_notices(slot)}
     assert notices['opening-2-accepted'][1].startswith('открываю (попытка 2): LIMIT 11 SELL 0.0002 BTC по ')
     # Old fixture receipts do not prove counterparties: never shown as own fills.
     assert notices['opening-1-execution'] == ('❔', 'открытие: исполнение не доказано')
