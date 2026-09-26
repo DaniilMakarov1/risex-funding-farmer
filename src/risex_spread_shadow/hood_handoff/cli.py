@@ -1546,6 +1546,12 @@ def _pool_failure_text(exc: BaseException, selection: Mapping[str, Any] | None) 
 
 
 async def _run_simple_confirmed(args, value, config_path, operator_dir) -> int:
+    from .operator_control import stop_requested
+    if stop_requested(operator_dir):
+        # An owner /stop is pending: no slot is claimed and nothing is read or sent.
+        print("Цикл не начат: действует команда /stop (файл stop-request.json рядом с конфигурацией). "
+              "Ордера не отправлялись; новая /run в Telegram снимает остановку.")
+        return 2
     # Validation is local and secret-free.  The SDK distribution/import,
     # configuration and evidence must all be valid before the new slot can be
     # durably claimed.  No Keychain, client, account reader or network path is
@@ -1659,7 +1665,8 @@ async def _run_simple_confirmed(args, value, config_path, operator_dir) -> int:
         stop_progress = asyncio.Event()
         progress_task = None if getattr(args, 'no_progress', False) else asyncio.create_task(
             _stream_simple_progress(Path(config.journal_path), emitted_keys, stop_progress))
-        run_task = asyncio.create_task(run_random_cycle(config, client))
+        run_task = asyncio.create_task(run_random_cycle(
+            config, client, stop_requested=lambda: stop_requested(operator_dir)))
         await asyncio.sleep(0)
         try:
             result = await run_task

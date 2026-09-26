@@ -276,6 +276,8 @@ def wallet_steps(slot):
     return [('wallets', record['at'], '👛' if isinstance(pair, list) else '⛔', line)]
 
 
+# Must equal random_cycle.OWNER_STOP_REASON (tested); kept here so views stay light.
+OWNER_STOP_REASON = 'owner /stop before the first order; no order was sent'
 PHASES = {'opening': 'открытие', 'closing': 'закрытие', 'PAIRED_OPENING': 'открытие', 'PAIRED_CLOSING': 'закрытие'}
 STOPS = {'CLOSING_BLOCKED': 'закрытие остановлено', 'CYCLE_EXECUTION_UNKNOWN': 'исполнение не доказано',
          'FALLBACK_BLOCKED_IDENTITY_BARRIER': 'закрытие остатка остановлено',
@@ -344,7 +346,19 @@ def cycle_steps(slot):
                 steps.append((key, at, '⚠️', f'повтор чтения ({text(payload.get("operation", "?"), 40)}): {reason(payload.get("reason"))}'))
             elif event in STOPS:
                 steps.append((key, at, '⛔', f'{STOPS[event]}: {reason(payload.get("reason"))}'))
+            elif event == 'OWNER_STOP_OBSERVED':
+                retry = payload.get('stage') == 'BEFORE_OPENING_RETRY'
+                steps.append((key, at, '⏹', 'получен /stop — новых попыток открытия не будет; остаток, если есть, '
+                              'закрою reduce-only' if retry else
+                              'получен /stop — цикл завершён до первого ордера, ордера не отправлялись'))
+            elif event == 'HOLD_ENDED_BY_OWNER_STOP':
+                held, planned = seconds(payload.get('held_seconds')), seconds(payload.get('hold_seconds'))
+                steps.append((key, at, '⏹', 'получен /stop — удержание прервано'
+                              + (f' через {held}' if held else '') + (f' из {planned}' if planned else '')
+                              + ', закрываю позиции обычным закрытием'))
             elif event == 'CYCLE_PREFLIGHT_BLOCKED':
+                if payload.get('reason') == OWNER_STOP_REASON:
+                    continue  # Already shown as the owner-stop step.
                 steps.append((key, at, '⛔', f'цикл остановлен до ордеров: {reason(payload.get("opening_reason"))}'))
     except Exception:
         pass  # A trailing partial write is read again at the next poll.
@@ -622,7 +636,8 @@ def cycle_card(card, report, slot=None):
         reason = (ws_admission_notice(cycle.get('reason'))
                   or opening_margin_refusal(cycle.get('preflight_reason')))
         if not reason and cycle.get('outcome') == 'FAILED_PREFLIGHT_BLOCKED' and not report.get('dispatched_actions'):
-            reason = 'остановлено до отправки ордеров: ' + str(cycle.get('reason'))[:200]
+            reason = ('остановлено командой /stop до первого ордера' if cycle.get('reason') == OWNER_STOP_REASON
+                      else 'остановлено до отправки ордеров: ' + str(cycle.get('reason'))[:200])
         if reason:
             lines.append('Причина: ' + text(reason, 300))
     if kind == 'stop':

@@ -761,7 +761,7 @@ def pool_launcher(tmp_path, monkeypatch, wallets, *, states=None, keys=(11, 22, 
         calls['read_indices'] = getattr(client, 'read_account_indices', None)
         return {}
 
-    async def run(config, client):
+    async def run(config, client, *, stop_requested=None):
         calls['configs'].append(config)
         return await run_random_cycle(config, client, clock=clock, rng=FixedRng(25, 20))
 

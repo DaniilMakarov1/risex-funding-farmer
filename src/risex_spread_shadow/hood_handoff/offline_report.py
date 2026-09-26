@@ -2413,7 +2413,13 @@ def load_saved_cycle_report(path: str | Path) -> dict[str, Any]:
         closing_plan = _first_record(cycle, "CLOSING_PLAN_READY")
         hold_seconds = _finite_number(hold.payload.get("hold_seconds")) if hold else None
         opening_end = max((e["observed_at"] for e in executions if e["phase"] == "opening"), default=None)
-        if hold is None or closing_plan is None or hold_seconds is None or hold_seconds < 0 or opening_end is None or hold["at"] < opening_end or closing_plan["at"] - hold["at"] < hold_seconds:
+        # An owner /stop may end the hold early: only a persisted stop row of
+        # the same hold, between the anchor and the closing plan, shortens it.
+        owner_stop = _first_record(cycle, "HOLD_ENDED_BY_OWNER_STOP")
+        stopped_early = (owner_stop is not None and hold is not None and closing_plan is not None
+                         and owner_stop.payload.get("hold_seconds") == hold.payload.get("hold_seconds")
+                         and hold["at"] <= owner_stop["at"] <= closing_plan["at"])
+        if hold is None or closing_plan is None or hold_seconds is None or hold_seconds < 0 or opening_end is None or hold["at"] < opening_end or (closing_plan["at"] - hold["at"] < hold_seconds and not stopped_early):
             issues.append(_issue("INCOMPLETE_HOLD_EVIDENCE", "closing lacks a causally complete persisted hold interval"))
     inventory, inventory_notes = _positions_from_cycle(cycle, all_files, executions, issues)
     economics = _economics(executions, fills, issues, inventory)

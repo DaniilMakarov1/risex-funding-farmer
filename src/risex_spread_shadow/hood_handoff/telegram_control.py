@@ -28,7 +28,7 @@ from .keychain import MacOSKeychainBackend, read_hidden_secret
 from .offline_report import load_saved_cycle_report
 from .operator_view import amount, read_lifecycle, read_launch_failure
 from .telegram_cards import live_steps, positions_text, wallet_selection_text
-from .operator_control import exclusive_lock
+from .operator_control import clear_stop_request, exclusive_lock, write_stop_request
 from . import telegram_messages as views
 
 MAX_COMMAND_FUTURE_SKEW_SECONDS = 5
@@ -63,6 +63,9 @@ STOP_REASONS = {
     'current account proof is incomplete': 'данные счетов неполные',
     'current position is invalid': 'позиция счёта некорректна',
     'current account identities conflict': 'счета не совпадают с настройкой',
+    'stop close is not confirmed flat': 'закрытие остатка после /stop не подтверждено',
+    'stop flatness is unproved': 'нулевые позиции после /stop не подтверждены',
+    'stop close is unavailable': 'закрытие позиций недоступно',
 }
 
 
@@ -93,6 +96,9 @@ STOP_STAGES = {
     'LAUNCH': 'выполнение цикла',
     'CLOSE': 'закрытие позиций',
     'FINISH': 'сохранение итога',
+    'STOP_CLOSE_READY': 'проверка позиций после /stop',
+    'STOP_CLOSE': 'закрытие остатка после /stop',
+    'STOP_READY': 'подтверждение нулевых позиций после /stop',
 }
 
 
@@ -321,6 +327,10 @@ class Controller:
         self._stage = None
         self._stage_started = None
         self._check_attempts = 0
+        # Owner /stop in progress ({'update_id', 'requested_at'}) and the event
+        # that ends an inter-cycle wait early.
+        self._stop = None
+        self._stop_event = None
         self._pending_card = None
         self._send_lock = None
         self.now = now
@@ -516,6 +526,14 @@ class Controller:
         return ''
 
     def summary(self, *, detailed=False):
+        running = self.task is not None and not self.task.done() and not self._runner_finished
+        if self._stop is not None:
+            return views.stop_status(None, running=True) + self._summary(detailed=detailed)
+        if running:
+            return self._summary(detailed=detailed)
+        return views.stop_status(self.store.data.get('last_stop')) + self._summary(detailed=detailed)
+
+    def _summary(self, *, detailed=False):
         if self._checking:
             return '<b>Проверяю текущие позиции и старые ордера</b>\nНовая операция ещё не отправлялась.'
         active = self.store.data['active']
@@ -698,12 +716,16 @@ class Controller:
             for step in range(1, total + 1):
                 carded = False
                 if step > 1:
+                    if self._stop is not None:
+                        break  # Owner /stop: the next step is never claimed.
                     await self._prepare_next_series_step()
                 notices = asyncio.create_task(self.lifecycle_notices())
                 try:
                     options = (self.store.data.get('active') or {}).get('launch_options', {})
                     if action == 'run' and (self.store.data.get('active') or {}).get('phase') == 'AUTO_CLOSE':
                         await self._close_before_run()
+                    if action == 'run' and self._stop is not None:
+                        break  # Owner /stop: a claimed or admitted cycle is never launched.
                     if action == 'close':
                         self.queue_notice('<b>Закрытие</b> · Проверяю остатки; ордера только reduce-only.')
                     elif step == 1:
@@ -728,6 +750,11 @@ class Controller:
                     await asyncio.gather(notices, return_exceptions=True)
                 if step < total and not safe:
                     break
+            if (action == 'run' and self._stop is not None
+                    and (self.store.data.get('active') or {}).get('action', 'run') == 'run'):
+                # The stopped series ends here: record a claimed-but-unlaunched
+                # step or release the barrier of a safely finished cycle.
+                self.finish()
         except Exception as exc:
             stop = self._stop_record(exc)
             print('Telegram run stopped: ' + json.dumps(stop, sort_keys=True), file=sys.stderr, flush=True)
@@ -761,12 +788,121 @@ class Controller:
     def _enter_stage(self, stage):
         self._stage, self._stage_started, self._check_attempts = stage, self.now(), 0
 
-    async def _checked_recovery(self, *, require_flat):
+    async def _stoppable_sleep(self, seconds):
+        """An inter-cycle wait that ends early on owner /stop; True when stopped."""
+        if self._stop is not None:
+            return True
+        if self._stop_event is None:
+            self._stop_event = asyncio.Event()
+        sleeper = asyncio.ensure_future(self._series_sleep(seconds))
+        waiter = asyncio.ensure_future(self._stop_event.wait())
+        try:
+            await asyncio.wait({sleeper, waiter}, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for task in (sleeper, waiter):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(sleeper, waiter, return_exceptions=True)
+        if sleeper.done() and not sleeper.cancelled() and sleeper.exception() is not None:
+            raise sleeper.exception()
+        return self._stop is not None
+
+    async def request_stop(self, uid):
+        """Owner /stop: no new cycle; a running cycle closes early at a safe point;
+        then every wallet is proved flat, a residual is closed reduce-only once."""
+        if self._stop is not None:
+            await self.notify(views.stop_pending_message())
+            return
+        running = self.task is not None and not self.task.done()
+        self._stop = {'update_id': uid, 'requested_at': self.now()}
+        if self._stop_event is not None:
+            self._stop_event.set()
+        marker = True
+        try:
+            write_stop_request(self.operator, dict(self._stop))
+        except Exception:
+            marker = False
+            print('Owner stop marker could not be written; no new cycle will start.', file=sys.stderr, flush=True)
+        if not running:
+            self._runner_finished = False
+            self.task = asyncio.create_task(self._with_stop(None))
+        await self.notify(views.stop_accepted_message(running=running, marker=marker))
+
+    async def _with_stop(self, operation):
+        """Run one owner operation; an owner /stop observed meanwhile completes after it."""
+        if operation is not None:
+            await operation
+        if self._stop is not None:
+            await self._complete_stop()
+
+    def _stop_notice(self, message, icon='⏹'):
+        return f'{icon} <b>Стоп</b> · {message}'
+
+    async def _complete_stop(self):
+        """Prove every wallet flat after /stop; close a residual reduce-only once."""
+        stop = self._stop
+        record = {'update_id': stop['update_id'], 'requested_at': stop['requested_at'], 'result': 'NOT_PROVED'}
+        final = None
+        self._enter_stage('STOP_CLOSE_READY')
+        try:
+            if self.recovery is None:
+                raise RuntimeError('series recovery is unavailable')
+            self.queue_notice(self._stop_notice('проверяю позиции и ордера '
+                                                + ('на всех кошельках пула…' if self.pooled() else 'на обоих счетах…'), '🔎'))
+            proof = await self._checked_recovery(require_flat=False, stoppable=False)
+            if not isinstance(proof, dict) or proof.get('status') != 'CLOSE_READY':
+                raise RuntimeError('next cycle close readiness is unproved')
+            if any(position != 0 for position in self._exact_recovery_positions(proof)):
+                if self.close is None:
+                    raise RuntimeError('stop close is unavailable')
+                self.queue_notice(self._stop_notice(f'есть позиции: {positions_text(proof)} — закрываю reduce-only', '🛠'))
+                self._enter_stage('STOP_CLOSE')
+                before = self.slots('close')
+                # Durable close record: a restart judges the new close slot, never replays it.
+                self.store.data['active'] = {'before': before, 'update_id': stop['update_id'], 'action': 'close'}
+                self.store.save()
+                await self.close()
+                added = sorted(set(self.slots('close')) - set(before))
+                result = self.close_report(added[0]) if len(added) == 1 else None
+                record['close_slot'] = added[0] if len(added) == 1 else None
+                record['close_status'] = result.get('status') if isinstance(result, dict) else None
+                if record['close_status'] != 'CONFIRMED_FLAT':
+                    raise RuntimeError('stop close is not confirmed flat')
+            self._enter_stage('STOP_READY')
+            final = await self._checked_recovery(require_flat=True, stoppable=False)
+            if (not isinstance(final, dict) or final.get('status') != 'READY'
+                    or any(position != 0 for position in self._exact_recovery_positions(final))):
+                raise RuntimeError('stop flatness is unproved')
+            self.store.data['last_recovery'] = recovery_record(final)
+            self.store.data['active'] = None
+            record['result'] = 'FLAT'
+        except Exception as exc:
+            final = None
+            record.update(self._stop_record(exc))
+            record['reason'] = stop_reason(exc)[:120]
+            print('Telegram stop not proved: ' + json.dumps({k: v for k, v in record.items() if k != 'reason'},
+                                                           sort_keys=True), file=sys.stderr, flush=True)
+        record['completed_at'] = self.now()
+        self.store.data['last_stop'] = record
+        try:
+            self.store.save()
+        except Exception:
+            print('Telegram stop result persistence failed.', file=sys.stderr, flush=True)
+        try:
+            clear_stop_request(self.operator)
+        except Exception:
+            print('Owner stop marker could not be removed; a new /run removes it.', file=sys.stderr, flush=True)
+        self._stop = None
+        self.queue_notice(views.stop_result_message(record, positions_text(final) if final else None))
+
+    async def _checked_recovery(self, *, require_flat, stoppable=True):
         """One read-only check between cycles of a run.
 
         A check that failed only because a read did not complete is repeated
         (bounded); every attempt is the complete check.  A refusal proved by a
         completed check, a local failure or cancellation is never repeated.
+        A between-cycle check is not repeated once an owner /stop is pending;
+        the stop procedure (``stoppable=False``) keeps its own bounded retries.
         """
         for attempt in range(1, SERIES_CHECK_ATTEMPTS + 1):
             self._check_attempts = attempt
@@ -774,7 +910,8 @@ class Controller:
                 return await self.recovery(require_flat=require_flat)
             except Exception as exc:
                 reason = transient_check_failure(exc)
-                if reason is None or attempt >= SERIES_CHECK_ATTEMPTS:
+                if (reason is None or attempt >= SERIES_CHECK_ATTEMPTS
+                        or (stoppable and self._stop is not None)):
                     raise
                 delay = check_retry_delay(exc, attempt)
                 print('Telegram run check retry: ' + json.dumps({
@@ -784,7 +921,11 @@ class Controller:
                 self.queue_notice(self.cycle_notice(
                     f'проверка счетов не завершилась: {reason}. Новый цикл не начат; повторю проверку через '
                     f'{delay} сек (попытка {attempt + 1} из {SERIES_CHECK_ATTEMPTS}).', '⏳'))
-                await self._series_sleep(delay)
+                if stoppable:
+                    if await self._stoppable_sleep(delay):
+                        raise
+                else:
+                    await self._series_sleep(delay)
 
     def _stop_record(self, exc):
         """Credential-free stop context: fixed stage and category, a class name only."""
@@ -821,7 +962,8 @@ class Controller:
         self._series_pause = delay
         self._flush_card(pause=delay)
         try:
-            await self._series_sleep(delay)
+            if await self._stoppable_sleep(delay):
+                return  # Owner /stop during the pause: no check, no launch.
         finally:
             self._series_pause = None
         if self.recovery is None:
@@ -842,6 +984,8 @@ class Controller:
             self.store.data['last_recovery'] = recovery_record(proof)
             self.store.save()
             return
+        if self._stop is not None:
+            return  # Owner /stop: positions are flat; the stop procedure proves READY.
         self.queue_notice(self.cycle_notice(f'позиций нет ({positions_text(proof)}); подтверждаю готовность…', '✓'))
         self._enter_stage('SERIES_READY')
         ready = await self._checked_recovery(require_flat=True)
@@ -936,6 +1080,8 @@ class Controller:
         stage = 'VALIDATION'
         try:
             self.store.data['last_admission'] = None
+            if action == 'run':
+                self.store.data['last_stop'] = None
             self.store.save()
             auto_close_before = None
             if (not integer(series_total) or series_total < 1
@@ -1061,6 +1207,8 @@ class Controller:
             except Exception:
                 response = views.accounts_message(None)
             await self.notify(response)
+        elif command == '/stop':
+            await self.request_stop(uid)
         elif command in ('/run', '/close'):
             if self.task is not None and not self.task.done():
                 await self.notify(views.blocked_message())
@@ -1071,9 +1219,19 @@ class Controller:
             if self.recovery is None and self.store.data['active'] is not None:
                 await self.notify(views.blocked_message())
                 return
+            if command == '/run':
+                # A fresh /run supersedes a finished or interrupted /stop.  The
+                # marker is removed before the task exists, so a later /stop
+                # always writes after this removal.
+                try:
+                    clear_stop_request(self.operator)
+                except Exception:
+                    await self.notify(views.stop_marker_refusal_message())
+                    return
+            self._stop_event = asyncio.Event()
             self._runner_finished = False
             self._checking = True
-            self.task = asyncio.create_task(self.admit(command[1:], uid, launch_options, series_total))
+            self.task = asyncio.create_task(self._with_stop(self.admit(command[1:], uid, launch_options, series_total)))
             try:
                 selected = json.loads(self.config.read_text())
                 selected.update(launch_options)

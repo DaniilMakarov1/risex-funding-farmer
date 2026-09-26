@@ -65,6 +65,10 @@ from .series import OrderBookSnapshot
 
 MIN_HOLD_SECONDS = 20
 MAX_HOLD_SECONDS = 180
+# Owner /stop results and the hold poll used only while a stop can be observed.
+OWNER_STOP_REASON = "owner /stop before the first order; no order was sent"
+OWNER_STOP_RETRY_REASON = "owner /stop before another opening attempt"
+OWNER_STOP_HOLD_POLL_SECONDS = 1.0
 MAX_OPENING_ATTEMPTS = 6
 MAX_CLOSING_ATTEMPTS = 15
 CYCLE_JOURNAL_NAME = "cycle.jsonl"
@@ -2084,10 +2088,17 @@ def _exclusive_source_price_available(
 class RandomCycleEngine:
     """Execute one sampled cycle and then stop."""
 
-    def __init__(self, client: RandomCycleClient, *, clock: Clock | None = None, rng: Any | None = None) -> None:
+    def __init__(self, client: RandomCycleClient, *, clock: Clock | None = None, rng: Any | None = None,
+                 stop_requested: Callable[[], bool] | None = None) -> None:
         self.client = client
         self.clock = clock or SystemClock()
         self.rng = rng or random.SystemRandom()
+        # Owner /stop is honoured only at safe points: before the first
+        # leverage/order mutation, before another opening attempt and during
+        # the hold.  A mutation, its reconciliation and closing are never
+        # interrupted.  None keeps the unchanged behavior.
+        self._stop_requested = stop_requested
+        self._owner_stop_journaled = False
         self._stage = "PREFLIGHT"
         self._identity_barrier: str | None = None
         self._selection: RandomCycleSelection | None = None
@@ -2444,6 +2455,8 @@ class RandomCycleEngine:
         )
         self._selection = selection
         journal.append("SELECTION_PROVED", {"selection": selection.as_dict(), "metadata": _metadata_payload(metadata), "book_observed_at": book.observed_at})
+        if self._owner_stop(journal, "BEFORE_LEVERAGE"):
+            return self._owner_stopped_before_orders(config, journal, selection)
 
         source, receiver = await self._configure_leverage(
             config, journal, metadata, book, selection, source, receiver,
@@ -2476,7 +2489,10 @@ class RandomCycleEngine:
             return result
         metadata, book, source, receiver, selection = prepared
         self._selection = selection
+        if self._owner_stop(journal, "BEFORE_FIRST_ORDER"):
+            return self._owner_stopped_before_orders(config, journal, selection)
         opening_preparation_result: RandomCycleResult | None = None
+        owner_stop_reason: str | None = None
         while True:
             attempt_index = pair_budget.used
             if config.confirmed_pilot:
@@ -2523,6 +2539,11 @@ class RandomCycleEngine:
                 {"result": opening.as_dict(), "attempt": attempt_index, "journal_path": opening_config.journal_path},
             )
             if not opening.retryable_pair:
+                break
+            if self._owner_stop(journal, "BEFORE_OPENING_RETRY"):
+                # No further attempt; any fill still goes to the unchanged
+                # reduce-only residual closure below.
+                owner_stop_reason = OWNER_STOP_RETRY_REASON
                 break
             if not pair_budget.available:
                 journal.append(
@@ -2587,7 +2608,7 @@ class RandomCycleEngine:
                 (
                     opening_preparation_result.reason
                     if opening_preparation_result is not None
-                    else "paired opening did not prove a complete cycle"
+                    else owner_stop_reason or "paired opening did not prove a complete cycle"
                 ),
                 remaining_source=remaining_source,
                 remaining_receiver=remaining_receiver,
@@ -2616,7 +2637,7 @@ class RandomCycleEngine:
         journal.append("HOLD_ANCHORED", {"hold_seconds": selection.hold_seconds, "anchor_wall": anchor_wall, "anchor_monotonic": anchor_mono})
         try:
             self._stage = "HOLD"
-            await self._wait_hold(selection.hold_seconds, anchor_mono)
+            held_seconds = await self._wait_hold(selection.hold_seconds, anchor_mono)
         except Exception as exc:
             reason = f"hold timer could not reach its persisted deadline: {sanitize_exception(exc)}"
             result = _with_cycle_classifications(RandomCycleResult(
@@ -2631,6 +2652,12 @@ class RandomCycleEngine:
             ))
             journal.append("CYCLE_COMPLETE", result.as_dict())
             return result
+        if held_seconds is not None:
+            # The owner ended the hold early; the unchanged paired closing and
+            # residual recovery follow immediately.
+            journal.append("HOLD_ENDED_BY_OWNER_STOP", {
+                "hold_seconds": selection.hold_seconds, "held_seconds": held_seconds,
+            })
 
         self._stage = "CLOSING"
         closing, fallback_seed = await self._run_paired_close(config, journal, selection, opening)
@@ -5155,16 +5182,52 @@ class RandomCycleEngine:
         except asyncio.TimeoutError as exc:
             raise TimeoutError(f"{label} exceeded configured request timeout") from exc
 
-    async def _wait_hold(self, hold_seconds: int, anchor_monotonic: float) -> None:
+    def _stop_observed(self) -> bool:
+        if self._stop_requested is None:
+            return False
+        try:
+            return bool(self._stop_requested())
+        except Exception:
+            return False
+
+    def _owner_stop(self, journal: DurableJournal, stage: str) -> bool:
+        """Observe an owner /stop at a safe point; journal the first observation."""
+        requested = self._stop_observed()
+        if requested and not self._owner_stop_journaled:
+            self._owner_stop_journaled = True
+            journal.append("OWNER_STOP_OBSERVED", {"stage": stage})
+        return requested
+
+    def _owner_stopped_before_orders(
+        self, config: RandomCycleConfig, journal: DurableJournal, selection: RandomCycleSelection,
+    ) -> RandomCycleResult:
+        result = _with_cycle_classifications(RandomCycleResult(
+            outcome=Outcome.FAILED_PREFLIGHT_BLOCKED,
+            phase=Phase.PREFLIGHT,
+            run_id=journal.run_id,
+            selection=selection,
+            reason=OWNER_STOP_REASON,
+            journal_path=str(config.journal_path),
+        ))
+        journal.append("CYCLE_PREFLIGHT_BLOCKED", result.as_dict())
+        journal.append("CYCLE_COMPLETE", result.as_dict())
+        return result
+
+    async def _wait_hold(self, hold_seconds: int, anchor_monotonic: float) -> float | None:
+        """Wait for the persisted deadline.  With an owner stop hook the wait
+        polls it and returns the seconds held when a stop is observed."""
         deadline = anchor_monotonic + hold_seconds
         previous = anchor_monotonic
         stalled = 0
+        stoppable = self._stop_requested is not None
         while True:
             current = _clock_monotonic(self.clock)
+            if stoppable and self._stop_observed():
+                return max(0.0, current - anchor_monotonic)
             remaining = deadline - current
             if remaining <= 0:
-                return
-            await self.clock.sleep(min(remaining, 60.0))
+                return None
+            await self.clock.sleep(min(remaining, OWNER_STOP_HOLD_POLL_SECONDS if stoppable else 60.0))
             after_sleep = _clock_monotonic(self.clock)
             if after_sleep <= previous:
                 stalled += 1
@@ -5199,8 +5262,9 @@ async def run_random_cycle(
     *,
     clock: Clock | None = None,
     rng: Any | None = None,
+    stop_requested: Callable[[], bool] | None = None,
 ) -> RandomCycleResult:
-    return await RandomCycleEngine(client, clock=clock, rng=rng).execute(config)
+    return await RandomCycleEngine(client, clock=clock, rng=rng, stop_requested=stop_requested).execute(config)
 
 
 # Readable aliases for callers that use "cycle" rather than the HCR name.

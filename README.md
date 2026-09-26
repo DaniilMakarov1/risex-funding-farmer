@@ -1,3 +1,7 @@
+## Stopping everything: `/stop`
+
+Send `/stop` in Telegram at any time. No new cycle starts; a pause between cycles or a waiting check ends immediately. A cycle that is running sends no new orders: before its first order it simply ends ("ордера не отправлялись"), and if positions are open the hold ends at once and the cycle closes them with its normal closing. An order that is being sent at that moment is never cut off. Then the bot checks every wallet; if a position is left, it closes it once with reduce-only MARKET orders and confirms that every wallet is at zero with no open orders. Telegram shows "⏹ Остановлено" with the positions, or "⛔ … не подтверждены" with the reason; then use `/accounts`, `/close` or `/stop` again. The bot stays online and `/run` starts trading again. While a stop is pending, the file `stop-request.json` sits next to `random-cycle.json`; a cycle started from the terminal refuses to start until a new `/run` removes it.
+
 ## Why the 30-cycle series stopped after 11 cycles on 2026-09-26, and what changed
 
 Before each cycle the system checks every old order that its own journal never proved finished. Five such orders (cycles 003, 121, 126, 158 and 193) were looked up again at every check: first an exact read, then a search through the exchange's inactive-order history, typically 7–8 seconds and up to 14 seconds of a 20-second limit, and slower as history grows. Before cycle 12 the check ran out of time (Telegram: `ошибка READ_TIMEOUT`); no order was sent, and one failed read ended the whole series.

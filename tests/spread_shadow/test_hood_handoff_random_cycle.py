@@ -4337,9 +4337,11 @@ async def test_simple_enter_admits_reserved_slot_and_same_slot_replay_is_blocked
         async def aclose(self):
             return None
 
-    async def run_with_synthetic_clock(config, client):
+    async def run_with_synthetic_clock(config, client, *, stop_requested=None):
         launched_configs.append(config)
-        return await real_run_random_cycle(config, client, clock=clock, rng=FixedRng(25, 20))
+        assert callable(stop_requested) and stop_requested() is False  # owner /stop hook is wired
+        return await real_run_random_cycle(config, client, clock=clock, rng=FixedRng(25, 20),
+                                           stop_requested=stop_requested)
 
     route_rng = FixedRng(route_draw)
     monkeypatch.setattr(cli_module, "select_random_route", lambda c: random_cycle_module.select_random_route(c, route_rng))
@@ -4424,7 +4426,7 @@ async def test_simple_exception_reports_durable_mutation_boundary(tmp_path, monk
         async def aclose(self):
             return None
 
-    async def failing_run(config, client):
+    async def failing_run(config, client, *, stop_requested=None):
         if after_boundary:
             Path(config.journal_path).write_text(
                 json.dumps({"event": "FIRST_MUTATION_BOUNDARY", "payload": {}}) + "\n",
@@ -4470,7 +4472,7 @@ async def test_simple_failure_reports_durable_positions_and_observation_times(
         async def aclose(self):
             return None
 
-    async def failing_run(config, client):
+    async def failing_run(config, client, *, stop_requested=None):
         Path(config.journal_path).write_text(
             json.dumps(
                 {
@@ -4523,7 +4525,7 @@ async def test_simple_progress_is_printed_before_synthetic_terminal_return(tmp_p
         async def aclose(self):
             return None
 
-    async def progress_run(config, client):
+    async def progress_run(config, client, *, stop_requested=None):
         journal_path = Path(config.journal_path)
         progress_rows = [
             {"event": "PREPARATION_ATTEMPT", "payload": {"attempt": 1}},
@@ -4703,7 +4705,7 @@ async def test_simple_success_reports_created_and_reserved_slot(tmp_path, monkey
         async def aclose(self):
             return None
 
-    async def successful_run(config, client):
+    async def successful_run(config, client, *, stop_requested=None):
         return SimpleNamespace(
             outcome=Outcome.SUCCESS,
             selection=None,
