@@ -96,7 +96,7 @@ async def test_unsafe_cycle_stops_series_without_second_launch(tmp_path, failure
     c.recovery = recover
     async def close(): pytest.fail('no proved inventory to close')
     c.close = close
-    await c.handle(update(text='/run ws 1 3'))
+    await c.handle(update(text='/run ack 1 3'))
     await c.task
     assert calls.count(('run',)) == 1
     assert calls.count(('read', False)) == 1
@@ -122,7 +122,7 @@ async def test_second_read_failure_preserves_one_completed_cycle_and_no_second_c
     c.recovery = recover
     async def close(): pytest.fail('no proved inventory to close')
     c.close = close
-    await c.handle(update(text='/run ws 1 3'))
+    await c.handle(update(text='/run ack 1 3'))
     await c.task
     assert calls == [('read', False), ('read', True), ('run',), ('read', False)]
     assert c.store.data['active']['series_index'] == 2

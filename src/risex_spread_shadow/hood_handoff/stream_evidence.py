@@ -111,7 +111,11 @@ def _safe_projection(item: Mapping[str, object], context: Mapping[str, object] |
 
 
 class StreamEvidenceJournal:
-    """One nonblocking producer and one background durable writer."""
+    """Bounded diagnostics: nonblocking producer, batched writer, fsync at close.
+
+    These observations never authorize mutations. Without a durable session_end
+    the file is incomplete; order intents live in DurableJournal separately.
+    """
 
     def __init__(self, path: Path, *, market_id: int, accounts: tuple[int, ...],
                  max_records: int = 512, queue_size: int = 64) -> None:
@@ -144,7 +148,26 @@ class StreamEvidenceJournal:
             if count <= 0:
                 raise OSError("stream evidence write did not progress")
             offset += count
-        os.fsync(fd)
+
+    async def _write_rows(self, rows, *, durable=False) -> None:
+        fd = self._fd
+        assert fd is not None
+
+        def write():
+            for row in rows:
+                self._write(fd, row)
+            if durable:
+                os.fsync(fd)
+
+        task = asyncio.create_task(asyncio.to_thread(write))
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            # Drain uncancellable disk IO before close can reuse the descriptor.
+            try:
+                await task
+            finally:
+                raise
 
     async def start(self) -> None:
         if self._fd is not None or self._writer is not None or self.closed:
@@ -156,12 +179,12 @@ class StreamEvidenceJournal:
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
         self._fd = os.open(self.path, flags, 0o600)
         try:
-            await asyncio.to_thread(self._write, self._fd, {
+            await self._write_rows([{
                 "kind": "session_start", "schema": "hood-stream-evidence-v1",
                 "market_id": self.market_id, "accounts": list(self.accounts),
                 "clock_basis": "time.monotonic/process-local",
                 "missing_terminal_means_incomplete": True,
-            })
+            }], durable=True)
         except BaseException:
             os.close(self._fd)
             self._fd = None
@@ -235,14 +258,20 @@ class StreamEvidenceJournal:
                 if row is None:
                     self._queue.task_done()
                     break
-                write = asyncio.create_task(asyncio.to_thread(self._write, self._fd, row))
-                try:
-                    await asyncio.shield(write)
-                except asyncio.CancelledError:
-                    # A thread cannot be cancelled: finish before closing/reusing fd.
-                    await write
-                    raise
-                self._queue.task_done()
+                batch = [row]
+                ended = False
+                while len(batch) < 64 and not self._queue.empty():
+                    item = self._queue.get_nowait()
+                    if item is None:
+                        self._queue.task_done()
+                        ended = True
+                        break
+                    batch.append(item)
+                await self._write_rows(batch)
+                for _ in batch:
+                    self._queue.task_done()
+                if ended:
+                    break
         except BaseException:
             self.failed = True
             raise
@@ -261,11 +290,11 @@ class StreamEvidenceJournal:
                     safe_reason = reason if reason in {"stopped", "duration_limit", "observer_stopped",
                                                         "transport_error", "task_cancelled",
                                                         "stopped_before_connect"} else "other"
-                    await asyncio.to_thread(self._write, fd, {
+                    await self._write_rows([{
                         "kind": "session_end", "reason": safe_reason,
                         "accepted": self.accepted, "dropped": self.dropped,
                         "complete": self.dropped == 0 and safe_reason == "stopped",
-                    })
+                    }], durable=True)
             except BaseException:
                 self.failed = True
                 raise

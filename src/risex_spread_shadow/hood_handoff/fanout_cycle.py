@@ -1341,6 +1341,9 @@ class FanoutCycleEngine(RandomCycleEngine):
             reason = _cycle_exception_reason(exc)
             journal.append("CLOSING_BLOCKED", {"reason": reason})
             return None, reason
+        finally:
+            # Every exit, including an exhausted price guard, precedes recovery.
+            await self._release_preflight_nonces()
 
     # ----- residual recovery ----------------------------------------------------------
 

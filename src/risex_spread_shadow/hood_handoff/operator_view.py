@@ -385,7 +385,7 @@ def execution_lines(result, *, phase, attempt=1):
             lines.append(f'Наша цена/объём: {amount(guard.get("source_price"))}/{amount(guard.get("source_quantity"))}; '
                          f'лучший уровень: {amount(guard.get("best_price"))}/{amount(guard.get("best_quantity"))}.')
     latency = mapping(result.get('latency'))
-    gap = number(latency.get('source_to_receiver_intent_seconds'))
+    gap = number(latency.get('source_to_receiver_send_seconds', latency.get('source_to_receiver_intent_seconds')))
     response = number(latency.get('receiver_submit_ack_seconds'))
     decision = number(latency.get('source_to_receiver_decision_seconds'))
     if gap is None and decision is not None and decision >= 0:

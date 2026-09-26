@@ -108,7 +108,7 @@ def test_restart_legacy_membership_and_duplicate_protection():
     assert 'PnL после комиссий: неизвестен' in duplicate
 
 
-@pytest.mark.parametrize('command', ['/run 6', '/run ack 1 12', '/run ws 5 10'])
+@pytest.mark.parametrize('command', ['/run 6', '/run ack 1 12', '/run ack 5 10'])
 async def test_more_than_five_cycles_persist_membership_and_recover_report(tmp_path, command):
     async def recovery(*, require_flat):
         return proof('READY' if require_flat else 'CLOSE_READY')

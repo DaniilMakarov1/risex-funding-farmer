@@ -39,7 +39,7 @@ from .contracts import (
     TransientStreamContractError,
     _bool,
 )
-from .journal import DurableJournal, sanitize_exception
+from .journal import DurableJournal, EXECUTION_DIAGNOSTICS, sanitize_exception
 from .read_errors import read_rate_limit_delay
 
 
@@ -836,7 +836,8 @@ class HandoffEngine:
 
     async def execute(self, config: HandoffConfig) -> HandoffResult:
         try:
-            journal = DurableJournal(config.journal_path, clock=self.clock.now)
+            journal = DurableJournal(config.journal_path, clock=self.clock.now,
+                                     deferred_events=EXECUTION_DIAGNOSTICS if config.receiver_admission == "ack" else frozenset())
         except Exception as exc:
             reason = f"journal unavailable: {sanitize_exception(exc)}"
             return HandoffResult(
@@ -996,7 +997,7 @@ class HandoffEngine:
         source_dispatch_attempted = False
         receiver_dispatch_attempted = False
         priority_guard: dict[str, Any] | None = None
-        latency: dict[str, float] = {}
+        latency: dict[str, float | None] = {"source_to_receiver_send_seconds": None}
         paired_mode = plan.operation_mode in {OperationMode.PAIRED_OPENING, OperationMode.PAIRED_CLOSING}
         public_book: dict[str, Any] | None = None
         source_order_id: str | None = None
@@ -1125,6 +1126,7 @@ class HandoffEngine:
                     {"plan": source_dispatch_plan.as_dict()},
                     run_id=run_id,
                 )
+                latency["source_send_entered_at"] = self.clock.now()
                 self._stream_milestone("send_entered", plan.source)
                 source_receipt = _as_receipt(
                     await self._submit_order(
@@ -1287,7 +1289,7 @@ class HandoffEngine:
                     raise PreflightBlocked("exact source event is missing/stale")
                 if source_order is not None:
                     ws_evidence["source_order"] = self._order_observation_payload(source_order)
-                    if not self._source_exact_resting(source_order, plan.source, source_order_id):
+                    if not self._source_exact_resting(source_order, plan.source, source_order_id or source_order.order_id):
                         raise PreflightBlocked("exact source is no longer fully resting")
                     if source_order.observed_at < source_dispatch_intent_at:
                         raise PreflightBlocked("source observation predates dispatch")
@@ -1803,7 +1805,7 @@ class HandoffEngine:
             )
 
         try:
-            receiver_dispatch_attempted = True
+            receiver_dispatch_attempted = not ack_admission
             receiver_submit_started = time.perf_counter()
             receiver_dispatch_intent_at = self.clock.now()
             latency["receiver_dispatch_intent_at"] = receiver_dispatch_intent_at
@@ -1836,8 +1838,24 @@ class HandoffEngine:
                     # final-admission deadlines, so a later final read never
                     # widens a pre-signed mutation's lifetime.
                     receiver_final_deadline = min(receiver_final_deadline, prepared_deadline)
-            journal.append("RECEIVER_DISPATCH_INTENT", {"plan": receiver_dispatch_plan.as_dict()}, run_id=run_id)
+            durable_started = time.perf_counter()
+            if ack_admission:
+                await journal.append_many_async([
+                    ("RECEIVER_DISPATCH_INTENT", {"plan": receiver_dispatch_plan.as_dict()})
+                ], run_id=run_id)
+            else:
+                journal.append("RECEIVER_DISPATCH_INTENT", {"plan": receiver_dispatch_plan.as_dict()}, run_id=run_id)
+            latency["receiver_intent_durable_seconds"] = max(0.0, time.perf_counter() - durable_started)
+            if ack_admission:
+                self._validate_ack_receiver_send(config, ws_anchor, plan.source, source_order_id,
+                                                 source_dispatch_intent_at, (source, receiver),
+                                                 (receiver_final_deadline,))
+            latency["receiver_send_entered_at"] = self.clock.now()
+            latency["source_to_receiver_send_seconds"] = max(0.0, self.clock.now() - latency["source_send_entered_at"])
+            if source_dispatch_ack_at is not None:
+                latency["source_ack_to_receiver_send_seconds"] = max(0.0, self.clock.now() - source_dispatch_ack_at)
             self._stream_milestone("send_entered", plan.receiver)
+            receiver_dispatch_attempted = True
             receiver_receipt = _as_receipt(
                 await self._submit_order(
                     receiver_dispatch_plan,
@@ -1864,15 +1882,25 @@ class HandoffEngine:
                 run_id=run_id,
             )
         except Exception as exc:
-            if "receiver_submit_started" in locals():
+            if receiver_dispatch_attempted and "receiver_submit_started" in locals():
                 latency["receiver_submit_ack_seconds"] = max(0.0, time.perf_counter() - receiver_submit_started)
             latency["receiver_dispatch_outcome_at"] = self.clock.now()
-            unknown_reasons.append(f"receiver dispatch outcome unknown: {sanitize_exception(exc)}")
-            journal.append(
-                "RECEIVER_DISPATCH_UNKNOWN",
-                {"operation_mode": plan.operation_mode.value, "reason": unknown_reasons[-1]},
-                run_id=run_id,
-            )
+            if ack_admission and not receiver_dispatch_attempted:
+                # The engine has not called any send method. Persist that fact;
+                # an intent alone remains unresolved after a crash in this gap.
+                detail = str(exc) if isinstance(exc, PreflightBlocked) else sanitize_exception(exc)
+                unknown_reasons.append(f"WS_ADMISSION_STOP: final send barrier: {detail}")
+                journal.append("RECEIVER_DISPATCH_RESULT", {
+                    "accepted": False, "not_sent": True, "order_id": None,
+                    "reason": unknown_reasons[-1], "operation_mode": plan.operation_mode.value,
+                }, run_id=run_id)
+            else:
+                unknown_reasons.append(f"receiver dispatch outcome unknown: {sanitize_exception(exc)}")
+                journal.append(
+                    "RECEIVER_DISPATCH_UNKNOWN",
+                    {"operation_mode": plan.operation_mode.value, "reason": unknown_reasons[-1]},
+                    run_id=run_id,
+                )
 
         latency.update(_prepared_timing_values(prepared_receiver, "receiver"))
         if receiver_receipt is not None:
@@ -1904,15 +1932,17 @@ class HandoffEngine:
         # ACK can dispatch B without an A observation. Resolve exact A afterwards,
         # including late publication/rejection; never leave a resting A just because
         # admission deliberately skipped its first observation.
+        source_just_read = False
         if ack_admission and source_order is None and source_dispatch_attempted:
             source_order = await self._poll_order(plan.source, source_receipt.order_id if source_receipt else None,
                                                   journal, run_id, require_terminal=False)
             if source_order is not None:
                 source_order_id = source_order.order_id
+                source_just_read = True
         # Once B is terminal or uncertain, cancel only this identified A order.
         if source_order is not None:
             try:
-                current_source = await self._lookup_order(plan.source, source_order.order_id)
+                current_source = source_order if source_just_read else await self._lookup_order(plan.source, source_order.order_id)
             except Exception as exc:
                 current_source = None
                 unknown_reasons.append(f"source cancellation lookup unresolved: {sanitize_exception(exc)}")
@@ -1960,6 +1990,29 @@ class HandoffEngine:
             latency=latency,
             priority_guard=priority_guard,
         )
+
+    def _validate_ack_receiver_send(self, config: HandoffConfig, anchor: Any, source_plan: OrderPlan,
+                                    source_order_id: str | None, dispatched_at: float,
+                                    accounts: Sequence[AccountSnapshot], deadlines: Sequence[float | None]) -> None:
+        """Recheck local evidence after slow durable IO, before any MARKET send."""
+        if any(deadline is not None and time.monotonic() >= deadline for deadline in deadlines):
+            raise PreflightBlocked("receiver evidence expired during durability wait")
+        now = self.clock.now()
+        if not all(self._snapshot_fresh(account, now, config.freshness_seconds) for account in accounts):
+            raise PreflightBlocked("pre-LIMIT account evidence expired during durability wait")
+        if config.max_source_to_receiver_seconds is not None and (
+                now - dispatched_at > config.max_source_to_receiver_seconds
+                or time.monotonic() - self._source_dispatch_monotonic > config.max_source_to_receiver_seconds):
+            raise PreflightBlocked("source-to-receiver latency budget expired")
+        order, book = self.client.ws_admission_view(anchor, source_plan, source_order_id)
+        if order is not None and (
+                not self._source_exact_resting(order, source_plan, source_order_id or order.order_id)
+                or order.observed_at < dispatched_at
+                or not self._time_fresh(order.observed_at, now, config.freshness_seconds)):
+            raise PreflightBlocked("source changed during durability wait")
+        evidence = self._ws_l2_evidence(_coerce_public_book(book, config, now), source_plan, now)
+        if evidence["ws_l2_status"] in {"BETTER_PRICE", "SAME_PRICE_EXTRA_VOLUME", "SOURCE_LEVEL_SMALLER"}:
+            raise PreflightBlocked("book changed during durability wait")
 
     async def _parallel_account_rechecks(
         self,
@@ -4411,6 +4464,7 @@ def _implementation_fingerprint() -> str:
     package_dir = Path(__file__).resolve().parent
     digest = hashlib.sha256()
     for name in ("contracts.py", "engine.py", "journal.py", "sdk.py", "cli.py",
+                 "fanout_handoff.py", "fanout_cycle.py", "random_cycle.py", "wallet_pool.py",
                  "stream_state.py", "stream_reads.py", "stream_measurement.py",
                  "stream_evidence.py", "stream_timeline.py", "ws_sender.py"):
         path = package_dir / name

@@ -153,7 +153,7 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="emit only machine-readable offline report JSON",
     )
-    parser.add_argument("--receiver-admission", choices=("ws_confirmed", "ack"), help="simple: MARKET after exact WS or experimental positive ACK")
+    parser.add_argument("--receiver-admission", choices=("ack",), help="simple: MARKET after positive application ACK and local book veto")
     parser.add_argument("--price-improvement-ticks", type=int, choices=range(1, 6), help="simple: exact improvement, skip when spread is too narrow")
     parser.add_argument("--fanout", action="store_true",
                         help="simple: one LIMIT filled by 2..(ready wallets - 1) MARKETs from the wallet pool")
@@ -842,6 +842,8 @@ def _validate_simple_local_inputs(
     except SystemExit as exc:
         detail = str(exc) or "неизвестная ошибка"
         raise SystemExit(f"Локальная ошибка конфигурации: {detail}") from None
+    if config.receiver_admission == "ws_confirmed":
+        raise SystemExit("Режим WS отключён; выберите --receiver-admission ack")
     if config.api_key_index is None:
         raise SystemExit("Локальная ошибка конфигурации: требуется api_key_index")
 
@@ -1581,9 +1583,9 @@ async def _run_simple_confirmed(args, value, config_path, operator_dir) -> int:
     )
     if base_config.confirmed_pilot:
         raise SystemExit("confirmed pilot uses the dedicated one-cycle command")
-    if getattr(args, "fanout", False) and base_config.receiver_admission not in ("ack", "ws_confirmed"):
+    if getattr(args, "fanout", False) and base_config.receiver_admission != "ack":
         # Checked before a slot is claimed: the fan-out cycle refuses any other admission.
-        raise SystemExit("режим «несколько MARKET» работает только с приёмом ACK или WS "
+        raise SystemExit("режим «несколько MARKET» работает только с приёмом ACK "
                          "(--receiver-admission ack); слот не занят, ордера не отправлялись")
     _require_owner_opening_margin_reserve(base_config)
     _validate_simple_sdk()

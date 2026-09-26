@@ -57,7 +57,7 @@ from .engine import (
     run_handoff,
 )
 from .read_errors import read_rate_limit_delay
-from .journal import DurableJournal, sanitize_exception
+from .journal import DurableJournal, EXECUTION_DIAGNOSTICS, sanitize_exception
 from .provenance import capture_provenance
 from .local_attempt import select_automatic_prices
 from .series import OrderBookSnapshot
@@ -2242,7 +2242,8 @@ class RandomCycleEngine:
                 expected_route={key: config.binding()[key] for key in
                     ("source_account_index", "receiver_account_index", "direction")},
             )
-            journal = DurableJournal(config.journal_path, clock=self.clock.now)
+            journal = DurableJournal(config.journal_path, clock=self.clock.now,
+                                     deferred_events=EXECUTION_DIAGNOSTICS if config.receiver_admission == "ack" else frozenset())
             journal.acquire_attempt()
             if journal.events:
                 return RandomCycleResult(
@@ -3847,6 +3848,8 @@ class RandomCycleEngine:
             reason = _cycle_exception_reason(exc)
             journal.append("CLOSING_BLOCKED", {"reason": reason})
             return None, reason
+        finally:
+            await self._release_preflight_nonces()
 
     async def _fallback_residuals(
         self,

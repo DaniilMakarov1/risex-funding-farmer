@@ -37,6 +37,7 @@ MAX_PROJECTED_STRING = 1024
 _PROJECTED_KEYS = frozenset(
     {
         "accepted",
+        "not_sent",
         "after",
         "admission_before",
         "account_index",
@@ -175,6 +176,8 @@ _PROJECTED_KEYS = frozenset(
         "source_dispatch_intent_at", "source_dispatch_ack_at", "receiver_dispatch_intent_at",
         "receiver_dispatch_ack_at", "receiver_dispatch_outcome_at", "receiver_fill_observed_at",
         "receiver_terminal_observed_at", "receiver_admission_at",
+        "source_to_receiver_send_seconds", "source_ack_to_receiver_send_seconds",
+        "receiver_intent_durable_seconds",
     }
 )
 
@@ -864,8 +867,9 @@ def _intent_actions(files: Sequence[_FileData]) -> list[dict[str, Any]]:
                     event=event,
                 )
                 continue
-            candidate["response_observed"] = event.endswith("_RESULT")
-            candidate["confirmed_response"] = event.endswith("_RESULT")
+            not_sent = event.endswith("_RESULT") and payload.get("not_sent") is True and payload.get("accepted") is False
+            candidate["response_observed"] = event.endswith("_RESULT") and not not_sent
+            candidate["confirmed_response"] = event.endswith("_RESULT") and not not_sent
             candidate["response_at"] = record["at"]
             candidate["response_event"] = event
             if event.endswith("_UNKNOWN"):
@@ -877,7 +881,9 @@ def _intent_actions(files: Sequence[_FileData]) -> list[dict[str, Any]]:
                 accepted = payload.get("accepted")
                 candidate["accepted"] = accepted if isinstance(accepted, bool) else None
                 candidate["status"] = (
-                    "ACCEPTED"
+                    "NOT_SENT"
+                    if not_sent
+                    else "ACCEPTED"
                     if accepted is True
                     else "REJECTED"
                     if accepted is False
@@ -996,8 +1002,32 @@ def _execution_evidence(
             issues.append(_issue("UNRESOLVED_EXECUTION", "terminal execution is explicitly UNKNOWN",
                                  data=data, record=record, phase=phase, leg=leg, attempt=attempt))
         if not fallback:
-            intent_present = any(r.event == f"{leg.upper()}_DISPATCH_INTENT" for r in data.records)
-            if intent_present != dispatched:
+            prefix = f"{leg.upper()}_DISPATCH"
+            intents = [r for r in data.records if r.event == f"{prefix}_INTENT"]
+            responses = [r for r in data.records if r.event in {f"{prefix}_RESULT", f"{prefix}_UNKNOWN"}]
+            # A durable batch intent precedes the final local send guard. Only
+            # an explicit refusal, bound to this exact intent and followed by
+            # complete zero-mutation receipts, resolves that unsent intent.
+            not_sent = False
+            if _is_receiver_leg(leg) and dispatched is False and len(intents) == len(responses) == 1:
+                intent, response = intents[0], responses[0]
+                intended = intent.payload.get("plan", {})
+                not_sent = (
+                    response.event == f"{prefix}_RESULT"
+                    and response.payload.get("not_sent") is True
+                    and response.payload.get("accepted") is False
+                    and response.payload.get("order_id") is None
+                    and response.payload.get("tx_hash") is None
+                    and intent["sequence"] < response["sequence"] < record["sequence"]
+                    and intent["at"] <= response["at"] <= record["at"]
+                    and intent["run_id"] == response["run_id"] == record["run_id"]
+                    and isinstance(intended, Mapping)
+                    and all(intended.get(key) == plan.get(key) for key in identity_fields)
+                    and _decimal_value(intended.get("quantity")) == expected_quantity
+                    and _decimal_value(intended.get("price")) == price_bound
+                    and order is None and quantity == 0 and value.get("trades") == []
+                )
+            if bool(intents) != dispatched and not not_sent:
                 fail("UNRESOLVED_EXECUTION", "terminal dispatch state does not agree with durable intent")
         if order is not None:
             if not dispatched:
@@ -1536,7 +1566,8 @@ def _latency_reports(
             label="receiver_admission",
         )
         receiver_ack = latency.get("receiver_submit_ack_seconds")
-        if receiver_ack is None and receiver_intent is not None and receiver_result is not None:
+        receiver_not_sent = receiver_result is not None and receiver_result.get("payload", {}).get("not_sent") is True
+        if receiver_ack is None and receiver_intent is not None and receiver_result is not None and not receiver_not_sent:
             receiver_ack = _duration(receiver_intent["at"], receiver_result["at"], issues=interval_issues, label="receiver_dispatch_ack")
         values["receiver_dispatch_ack"] = (
             _latency_unknown(
@@ -1554,6 +1585,11 @@ def _latency_reports(
                 label="receiver_dispatch_ack",
             )
         )
+        for name in ("source_to_receiver_send", "source_ack_to_receiver_send", "receiver_intent_durable"):
+            values[name] = _latency_measure(
+                name, latency.get(f"{name}_seconds"), basis=f"latency.{name}_seconds",
+                unavailable_reason="send boundary was not recorded; absent is not zero", issues=interval_issues,
+            )
         receiver_visibility = latency.get("receiver_visibility_seconds", latency.get("receiver_fill_observation_seconds"))
         if receiver_visibility is None and receiver_result is not None and receiver_observed is not None:
             receiver_visibility = _duration(receiver_result["at"], receiver_observed["at"], issues=interval_issues, label="receiver_visibility")
@@ -2564,6 +2600,9 @@ def load_saved_cycle_report(path: str | Path) -> dict[str, Any]:
         if action["leg"] != "cancel" and any(e["resolved"] and e["dispatched"] for e in matching):
             action["dispatched"] = True
             action["dispatch_proof"] = "terminal order and complete bound history"
+        elif action["status"] == "NOT_SENT" and matching and all(e["resolved"] and not e["dispatched"] for e in matching):
+            action["possible_dispatch"] = False
+            action["dispatch_proof"] = "explicit pre-send refusal and complete zero-mutation receipts"
         if not matching or not all(e["resolved"] for e in matching):
             issues.append(_issue("UNRESOLVED_INTENT", "mutation intent has no resolved terminal execution", phase=action["phase"], leg=action["leg"]))
     latest_positions: dict[str, Decimal] = {}

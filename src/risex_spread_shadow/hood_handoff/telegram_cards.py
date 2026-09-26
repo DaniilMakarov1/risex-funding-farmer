@@ -138,7 +138,8 @@ def execution_text(phase, attempt, receipt, progress=None):
     if notice:
         details.append(text(notice, 200))
     latency = mapping(receipt.get('latency'))
-    gap, response = ms(latency.get('source_to_receiver_intent_seconds')), ms(latency.get('receiver_submit_ack_seconds'))
+    gap = ms(latency.get('source_to_receiver_send_seconds', latency.get('source_to_receiver_intent_seconds')))
+    response = ms(latency.get('receiver_submit_ack_seconds'))
     decision = ms(latency.get('source_to_receiver_decision_seconds'))
     if gap:
         details.append(f'LIMIT→MARKET {gap}' + (f' · ответ MARKET {response}' if response else ''))
@@ -536,7 +537,7 @@ def phase_gaps(slot):
                 if row['event'] != 'COMPLETE':
                     continue
                 latency = mapping(mapping(mapping(row['payload']).get('receipt')).get('latency'))
-                gap = latency.get('source_to_receiver_intent_seconds')
+                gap = latency.get('source_to_receiver_send_seconds', latency.get('source_to_receiver_intent_seconds'))
                 if (isinstance(gap, (int, float)) and not isinstance(gap, bool) and math.isfinite(gap) and gap >= 0
                         and attempt >= gaps.get(match[1], (0, None))[0]):
                     gaps[match[1]] = (attempt, gap)

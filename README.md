@@ -1,3 +1,15 @@
+## Current operation: ACK only, with bounded disk waits
+
+Use `/run` to choose one LIMIT with one or several MARKETs, then the cycle count. Typed `/run ack 1 20` remains one LIMIT with one MARKET. From the terminal use `./start --receiver-admission ack --price-improvement-ticks 1 --fanout` for several MARKETs. WS admission is disabled in owner commands; an old saved `ws_confirmed` setting is refused, and an explicit ACK override is required. The WebSocket connection still supplies current account/order/book observations used by ACK.
+
+All MARKET intents for one LIMIT now share one required disk flush before they can send. Diagnostic records are buffered in bounded batches and flushed with the next durable boundary; stream diagnostics sync at the session boundaries. Mutation intents, settings and completed results still wait for durable storage. If the market or a prepared deadline changes during that wait, the MARKETs are refused and the source is cancelled/reconciled. A disk error or incomplete journal never authorizes a replay. Keep journals on persistent owner-only storage and preserve incomplete evidence when restarting.
+
+The new LIMIT→MARKET measurement includes the wait before the actual send. Old journal cards can still show the earlier intent-based measurement. An offline benchmark with an added 50 ms per disk flush reduced the three-receiver ACK→first MARKET interval from about 295–307 ms to 52–62 ms (five waits to one). This is a synthetic storage result, not an exchange latency or own-match guarantee. Real saved cycles 341–344 have three PARTIAL and one SUCCESS outcome, all with confirmed flat final positions; ACK does not guarantee that our LIMIT wins against outside participants.
+
+The earlier below-minimum warning below is too broad: the existing Robinhood BTC recovery can close an exact on-grid dust position reduce-only. No top-up was added. If an order's execution remains unknown, the existing series stop and `/accounts`/`/close` workflow remain necessary.
+
+The remote-server move has not been performed. This change reduces the engine's storage waits; server access, deployment and replacing the current macOS Keychain dependency are separate work. Current requirements above supersede the historical instructions below.
+
 ## `/run`: one LIMIT filled by one or by several MARKETs
 
 After `/run` the bot first asks the mode with two buttons: "1 LIMIT → 1 MARKET" (the usual cycle) or "1 LIMIT → несколько MARKET". Then it asks the number of cycles as before; each question waits 5 minutes. The chosen mode applies to every cycle of that series (ACK, +1 tick). A number sent instead of pressing a mode button starts nothing; the bot asks for the button again. The typed forms `/run ack 1 20`, `/run ws 5 3` and `/run 20` stay 1 LIMIT → 1 MARKET and ask nothing.

@@ -107,7 +107,7 @@ class FanoutHandoffConfig(HandoffConfig):
 
     ``quantity`` is the source LIMIT; ``receivers`` lists every receiver (the
     first is the bound client's receiver) with its exact part.  The parts sum
-    to ``quantity``.  Only the stream admissions (ACK or WS) are supported.
+    to ``quantity``.  Only ACK admission is supported.
     """
 
     receivers: tuple[FanoutReceiver, ...] = ()
@@ -123,8 +123,8 @@ class FanoutHandoffConfig(HandoffConfig):
             raise ContractError("fan-out receiver accounts must differ")
         if sum((item.quantity for item in receivers), Decimal(0)) != self.quantity:
             raise ContractError("fan-out receiver parts must sum to the source quantity")
-        if self.receiver_admission not in ("ack", "ws_confirmed"):
-            raise ContractError("fan-out supports only ACK or WS receiver admission")
+        if self.receiver_admission != "ack":
+            raise ContractError("fan-out supports only ACK receiver admission")
         if self.operation_mode not in (OperationMode.PAIRED_OPENING, OperationMode.PAIRED_CLOSING):
             raise ContractError("fan-out requires a paired opening or closing")
         first = receivers[0]
@@ -781,9 +781,8 @@ class FanoutHandoffEngine(HandoffEngine):
             )
 
         k = len(plan.receivers)
-        ack_admission = config.receiver_admission == "ack"
         unknown_reasons: list[str] = []
-        latency: dict[str, Any] = {}
+        latency: dict[str, Any] = {"source_to_receiver_send_seconds": None}
         pre_dispatch_transient = True
         pre_source_stream: str | None = None
         source_receipt: MutationReceipt | None = None
@@ -846,6 +845,7 @@ class FanoutHandoffEngine(HandoffEngine):
                     latency["quote_age_to_source_dispatch_seconds"] = quote_age
                     latency["source_quote_age_seconds"] = quote_age
                 journal.append("SOURCE_DISPATCH_INTENT", {"plan": prepared_source_plan.as_dict()}, run_id=run_id)
+                latency["source_send_entered_at"] = self.clock.now()
                 self._stream_milestone("send_entered", plan.source)
                 source_receipt = _as_receipt(await self._submit_order(prepared_source_plan, prepared=prepared_source))
                 latency["source_submit_ack_seconds"] = max(0.0, time.perf_counter() - source_submit_started)
@@ -868,77 +868,23 @@ class FanoutHandoffEngine(HandoffEngine):
                 }, run_id=run_id)
                 await release_receivers()
 
-        if source_receipt is not None and not ack_admission:
-            if not source_receipt.accepted:
-                unknown_reasons.append("source dispatch was rejected")
-            visibility_started = time.perf_counter()
-            if source_receipt.accepted:
-                try:
-                    source_order = await asyncio.wait_for(
-                        self.client.wait_order_observation(
-                            plan.source.account_index, plan.source.market_id,
-                            plan.source.client_order_index, source_receipt.order_id,
-                            min(config.order_timeout_seconds, 1.0), terminal_only=False),
-                        timeout=min(config.order_timeout_seconds, 1.0),
-                    )
-                except Exception as exc:
-                    unknown_reasons.append("WS_ADMISSION_STOP: source observation unavailable: " + sanitize_exception(exc))
-                latency["source_visibility_lookup_seconds"] = time.perf_counter() - visibility_started
-                if source_order is not None:
-                    source_order_id = source_order.order_id
-                    bind_cancel = getattr(self.client, "bind_read_stream_cancel", None)
-                    if callable(bind_cancel) and self._order_matches(source_order, plan.source):
-                        bind_cancel(plan.source.account_index, plan.source.market_id,
-                                    plan.source.client_order_index, source_order_id)
-                    self._start_cancel_preparation(plan.source, source_order)
-                if source_order is None and not unknown_reasons:
-                    unknown_reasons.append("WS_ADMISSION_STOP: source event absent")
-                elif source_order is not None and not self._order_matches(source_order, plan.source):
-                    unknown_reasons.append("source order identity/parameters conflict with plan")
-                elif source_order is not None and source_order.filled_quantity > 0:
-                    unknown_reasons.append("source fill observed before receiver dispatch")
-                    journal.append("SOURCE_FILLED_BEFORE_RECEIVER", {
-                        "order_id": source_order.order_id, "filled_quantity": str(source_order.filled_quantity),
-                    }, run_id=run_id)
-                    await self._cancel_if_safe(plan.source, source_order, journal, run_id, unknown_reasons,
-                                               expected_order_id=source_order_id)
-                elif source_order is not None and (not source_order.active
-                                                   or source_order.remaining_quantity != plan.quantity):
-                    if self._is_exact_canceled_post_only_zero_fill(source_order, plan.source):
-                        reason = "source canceled-post-only zero-fill; receiver was not dispatched"
-                        if reason not in unknown_reasons:
-                            unknown_reasons.append(reason)
-                        journal.append("SOURCE_CANCELED_POST_ONLY_ZERO_FILL", {
-                            "order_id": source_order.order_id, "status": source_order.status,
-                            "filled_quantity": str(source_order.filled_quantity),
-                            "remaining_quantity": str(source_order.remaining_quantity),
-                            "terminal_reason": "canceled-post-only",
-                        }, run_id=run_id)
-                    else:
-                        unknown_reasons.append("source order did not prove exact resting quantity")
-                    await self._cancel_if_safe(plan.source, source_order, journal, run_id, unknown_reasons,
-                                               expected_order_id=source_order_id)
-            latency["source_visibility_seconds"] = max(0.0, time.perf_counter() - visibility_started)
-
-        if ack_admission and source_receipt is not None:
+        if source_receipt is not None:
             source_order_id = source_receipt.order_id
-        if ack_admission and source_dispatch_attempted and (
+        if source_dispatch_attempted and (
                 source_receipt is None or not source_receipt.accepted
                 or type(source_receipt.response_code) is not int or source_receipt.response_code != 200
                 or source_receipt.error is not None):
             unknown_reasons.append("ACK_ADMISSION_STOP: positive application ACK is not proved")
 
-        if not unknown_reasons and (source_order is not None or ack_admission):
+        if not unknown_reasons:
             local_started = time.perf_counter()
             guard_started_at = self.clock.now()
             ws_evidence: dict[str, Any] = {}
             try:
                 source_order, local_book = self.client.ws_admission_view(ws_anchor, plan.source, source_order_id)
-                if source_order is None and not ack_admission:
-                    raise PreflightBlocked("exact source event is missing/stale")
                 if source_order is not None:
                     ws_evidence["source_order"] = self._order_observation_payload(source_order)
-                    if not self._source_exact_resting(source_order, plan.source, source_order_id):
+                    if not self._source_exact_resting(source_order, plan.source, source_order_id or source_order.order_id):
                         raise PreflightBlocked("exact source is no longer fully resting")
                     if source_order.observed_at < source_dispatch_intent_at:
                         raise PreflightBlocked("source observation predates dispatch")
@@ -961,10 +907,9 @@ class FanoutHandoffEngine(HandoffEngine):
                 if ws_reason is not None:
                     raise PreflightBlocked(ws_reason)
                 priority_guard = {
-                    "status": "ACK_ADMITTED" if ack_admission else "WS_CONFIRMED", "priority_status": "UNPROVED",
+                    "status": "ACK_ADMITTED", "priority_status": "UNPROVED",
                     "receiver_admission": config.receiver_admission, "priority_proof_admitted": False,
-                    "priority_reason": ("positive ACK + local L2 veto; source may be absent; owner/FIFO not proved"
-                                        if ack_admission else "exact private source + fresh L2 veto; owner/FIFO not proved"),
+                    "priority_reason": "positive ACK + local L2 veto; source may be absent; owner/FIFO not proved",
                     **self._guard_payload(plan, None, source, receivers),
                     **ws_evidence,
                     "account_evidence_basis": "pre-LIMIT snapshots",
@@ -975,7 +920,7 @@ class FanoutHandoffEngine(HandoffEngine):
             except Exception as exc:
                 reason = str(exc) if isinstance(exc, PreflightBlocked) else sanitize_exception(exc)
                 unknown_reasons.append(f"WS_ADMISSION_STOP: {reason}")
-                priority_guard = {"status": "ACK_REFUSED" if ack_admission else "WS_REFUSED",
+                priority_guard = {"status": "ACK_REFUSED",
                                   "priority_status": "UNPROVED", "receiver_admission": config.receiver_admission,
                                   "priority_proof_admitted": False, "priority_reason": unknown_reasons[-1],
                                   "fanout_receiver_count": k, **ws_evidence}
@@ -1064,21 +1009,47 @@ class FanoutHandoffEngine(HandoffEngine):
                 deadline = min(deadline, prepared_deadline)
             dispatch_plans.append(dispatch_plan)
             deadlines.append(deadline)
-        for position, dispatch_plan in enumerate(dispatch_plans, 1):
-            journal.append(f"{receiver_event_prefix(position)}_DISPATCH_INTENT",
-                           {"plan": dispatch_plan.as_dict(), "receiver_position": position}, run_id=run_id)
-            self._stream_milestone("send_entered", plan.receivers[position - 1])
-            receiver_dispatched[position - 1] = True
+        durable_started = time.perf_counter()
+        await journal.append_many_async([
+            (f"{receiver_event_prefix(position)}_DISPATCH_INTENT",
+             {"plan": dispatch_plan.as_dict(), "receiver_position": position})
+            for position, dispatch_plan in enumerate(dispatch_plans, 1)
+        ], run_id=run_id)
+        latency["receiver_intent_durable_seconds"] = max(0.0, time.perf_counter() - durable_started)
+        send_allowed = True
+        try:
+            self._validate_ack_receiver_send(config, ws_anchor, plan.source, source_order_id,
+                                             source_dispatch_intent_at, (source, *receivers), deadlines)
+        except Exception as exc:
+            send_allowed = False
+            detail = str(exc) if isinstance(exc, PreflightBlocked) else sanitize_exception(exc)
+            reason = f"WS_ADMISSION_STOP: final send barrier: {detail}"
+            unknown_reasons.append(reason)
+            for position in range(1, k + 1):
+                journal.append(f"{receiver_event_prefix(position)}_DISPATCH_RESULT", {
+                    "accepted": False, "not_sent": True, "order_id": None, "reason": reason,
+                    "receiver_position": position, "operation_mode": plan.operation_mode.value,
+                }, run_id=run_id)
+            await release_receivers()
+        if send_allowed:
+            latency["receiver_send_entered_at"] = self.clock.now()
+            latency["source_to_receiver_send_seconds"] = max(0.0, self.clock.now() - latency["source_send_entered_at"])
+            latency["source_ack_to_receiver_send_seconds"] = max(0.0, self.clock.now() - latency["source_dispatch_ack_at"])
+            for position in range(1, k + 1):
+                self._stream_milestone("send_entered", plan.receivers[position - 1])
+                receiver_dispatched[position - 1] = True
         submit_started = time.perf_counter()
 
         async def send(index: int) -> MutationReceipt:
             return _as_receipt(await self._submit_order(dispatch_plans[index], prepared=prepared_receivers[index],
                                                         final_deadline=deadlines[index]))
 
-        outcomes = await asyncio.gather(*(send(index) for index in range(k)), return_exceptions=True)
+        outcomes = (await asyncio.gather(*(send(index) for index in range(k)), return_exceptions=True)
+                    if send_allowed else [])
         ack_seconds = max(0.0, time.perf_counter() - submit_started)
-        latency["receiver_submit_ack_seconds"] = ack_seconds
-        latency["receiver_dispatch_ack_at"] = self.clock.now()
+        if send_allowed:
+            latency["receiver_submit_ack_seconds"] = ack_seconds
+            latency["receiver_dispatch_ack_at"] = self.clock.now()
         for position, value in enumerate(outcomes, 1):
             prefix = receiver_event_prefix(position)
             if isinstance(value, BaseException):
@@ -1126,14 +1097,16 @@ class FanoutHandoffEngine(HandoffEngine):
                 if value.filled_quantity > 0:
                     latency["receiver_fill_observed_at"] = value.observed_at
 
-        if ack_admission and source_order is None and source_dispatch_attempted:
+        source_just_read = False
+        if source_order is None and source_dispatch_attempted:
             source_order = await self._poll_order(plan.source, source_receipt.order_id if source_receipt else None,
                                                   journal, run_id, require_terminal=False)
             if source_order is not None:
                 source_order_id = source_order.order_id
+                source_just_read = True
         if source_order is not None:
             try:
-                current_source = await self._lookup_order(plan.source, source_order.order_id)
+                current_source = source_order if source_just_read else await self._lookup_order(plan.source, source_order.order_id)
             except Exception as exc:
                 current_source = None
                 unknown_reasons.append(f"source cancellation lookup unresolved: {sanitize_exception(exc)}")
@@ -1200,7 +1173,7 @@ class FanoutHandoffEngine(HandoffEngine):
                     and _zero_mutation_all(source, receivers))
         ws_liquidity_veto = (
             (priority_guard.get("status"), priority_guard.get("receiver_admission"))
-            in {("WS_REFUSED", "ws_confirmed"), ("ACK_REFUSED", "ack")}
+            == ("ACK_REFUSED", "ack")
             and priority_guard.get("ws_l2_status") in {"BETTER_PRICE", "SAME_PRICE_EXTRA_VOLUME"}
         )
         terminal_source = HandoffEngine._is_exact_canceled_post_only_zero_fill(source.order, plan.source)

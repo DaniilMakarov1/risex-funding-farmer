@@ -1230,11 +1230,11 @@ class Controller:
         explicit = None
         if isinstance(command, str) and len(command) <= 4096:
             count_match = re.fullmatch(r'/run ([1-9][0-9]*)', command)
-            option_match = re.fullmatch(r'/run (ws|ack)(?: ([1-5])(?: ([1-9][0-9]*))?)?', command)
+            option_match = re.fullmatch(r'/run (ack)(?: ([1-5])(?: ([1-9][0-9]*))?)?', command)
             if count_match:
                 explicit = ({}, int(count_match[1]))
             elif option_match:
-                options = {'receiver_admission': 'ws_confirmed' if option_match[1] == 'ws' else 'ack'}
+                options = {'receiver_admission': 'ack'}
                 if option_match[2]:
                     options['price_improvement_ticks'] = int(option_match[2])
                 explicit = (options, int(option_match[3]) if option_match[3] else 1)
@@ -1364,7 +1364,7 @@ async def serve(args, store, lock_fd, token):
         env['RISEX_HOOD_OPERATOR_INTERFACE'] = 'telegram'
         flags = []
         if receiver_admission is not None:
-            if receiver_admission not in ('ws_confirmed', 'ack'):
+            if receiver_admission != 'ack':
                 raise RuntimeError('invalid receiver admission override')
             flags += ['--receiver-admission', receiver_admission]
         if price_improvement_ticks is not None:

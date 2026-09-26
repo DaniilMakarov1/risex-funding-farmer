@@ -40,10 +40,10 @@ async def test_flat_run_keeps_existing_path_without_close(tmp_path):
         restore_cycle(tmp_path, '004')
     c = setup(tmp_path, launch)
     c.recovery, c.close = recover, close
-    await c.handle(update(text='/run ws 5'))
+    await c.handle(update(text='/run ack 5'))
     await c.task
     assert calls == [('read', False), ('read', True),
-                     ('run', {'receiver_admission': 'ws_confirmed',
+                     ('run', {'receiver_admission': 'ack',
                               'price_improvement_ticks': 5})]
     assert c.store.data['active'] is None
 

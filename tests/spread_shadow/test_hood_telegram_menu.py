@@ -310,7 +310,7 @@ async def test_blocked_state_without_recovery_asks_nothing(tmp_path):
 
 @pytest.mark.parametrize('text,expected', [
     ('/run 2', [{}, {}]), ('/run ack 1 2', [ACK_ONE] * 2),
-    ('/run ws 5', [{'receiver_admission': 'ws_confirmed', 'price_improvement_ticks': 5}]),
+    ('/run ack 5', [{'receiver_admission': 'ack', 'price_improvement_ticks': 5}]),
 ])
 async def test_explicit_run_forms_are_unchanged_and_ask_nothing(tmp_path, text, expected):
     c, calls = series(tmp_path)

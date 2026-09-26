@@ -117,6 +117,11 @@ class MissingSourceAfterMarket(AckClient):
         self.source_reads = 0
         self.market_sent = False
         self.failure = failure
+    def ws_admission_view(self, anchor, plan, order_id):
+        _, book = super().ws_admission_view(anchor, plan, order_id)
+        order = next(v for v in self.orders.values() if v.account_index == plan.account_index
+                     and v.client_order_index == plan.client_order_index)
+        return order, book
     async def submit_order(self, plan):
         result = await super().submit_order(plan)
         if plan.order_type == 'MARKET' and not plan.reduce_only:
@@ -129,7 +134,9 @@ class MissingSourceAfterMarket(AckClient):
         value = await super().lookup_order(a, m, **kwargs)
         if self.market_sent and a == 11 and value is not None and not value.reduce_only:
             self.source_reads += 1
-            if self.source_reads == 2 or self.failure == 'missing' and self.source_reads > 2:
+            # The source is already identified by the stream; its cancellation
+            # read disappears, then only later terminal proof may resolve it.
+            if self.source_reads == 1 or self.failure == 'missing' and self.source_reads > 1:
                 return None
         return value
     async def list_trades(self, a, m, **kwargs):

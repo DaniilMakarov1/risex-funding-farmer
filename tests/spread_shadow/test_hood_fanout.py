@@ -726,7 +726,7 @@ async def test_simple_fanout_requires_the_wallet_pool_file(tmp_path, monkeypatch
 
 async def test_simple_fanout_refuses_strict_admission_before_claiming_a_slot(tmp_path, monkeypatch):
     cli_module, args, operator_dir, calls = fanout_launcher(tmp_path, monkeypatch, [11, 22, 33], admission=())
-    with pytest.raises(SystemExit, match="только с приёмом ACK или WS"):
+    with pytest.raises(SystemExit, match="только с приёмом ACK"):
         await cli_module._run(args)
     assert not list(operator_dir.glob("cycle-*")) and calls["clients"] == []
 

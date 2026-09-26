@@ -110,7 +110,7 @@ async def test_ack_preserves_known_adverse_veto_and_residual_cleanup(tmp_path, a
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('text,mode,ticks', [('/run ack 5','ack',5),('/run ws 1','ws_confirmed',1),('/run ack','ack',None)])
+@pytest.mark.parametrize('text,mode,ticks', [('/run ack 5','ack',5),('/run ack 1','ack',1),('/run ack','ack',None)])
 async def test_owner_command_passes_only_selected_options_once(tmp_path, text, mode, ticks):
     calls=[]
     async def launch(**options): calls.append(options)
@@ -126,7 +126,7 @@ async def test_owner_command_passes_only_selected_options_once(tmp_path, text, m
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('text',['/run ack 0','/run ack 6','/run ACK 5','/run ws 1; close','/run ack 5 extra'])
+@pytest.mark.parametrize('text',['/run ack 0','/run ack 6','/run ACK 5','/run ws','/run ws 1','/run ws 1; close','/run ack 5 extra'])
 async def test_invalid_switch_never_launches(tmp_path,text):
     calls=[]
     async def launch(**options):calls.append(options)
