@@ -62,7 +62,7 @@ def report_pages(state, load_report):
     execution task. Values are already reconciled by offline_report; do not
     infer fees, reciprocal fills or completeness from a process exit status.
     """
-    from .telegram_cards import FOOTNOTE, LEGEND, btc, clock, cycle_times, fee_estimate, outcome, planned_quantity, seconds, usd
+    from .telegram_cards import FOOTNOTE, LEGEND, btc, clock, cycle_times, outcome, planned_quantity, seconds, usd, zero_tariff
     total, completed = state.get('series_total'), state.get('series_completed', 0)
     finished = completed == total and state.get('status') == 'FINISHED'
     title = 'Серия завершена' if finished else 'Серия остановлена'
@@ -71,8 +71,8 @@ def report_pages(state, load_report):
     if not isinstance(names, list):
         yield header + '\nСписок циклов старой команды не сохранён. Общий PnL неизвестен; отдельный результат доступен в локальном отчёте.'
         return
-    gross, net, turnover, estimate = Decimal(0), Decimal(0), Decimal(0), Decimal(0)
-    gross_count = net_count = turnover_count = estimate_count = 0
+    gross, net, turnover = Decimal(0), Decimal(0), Decimal(0)
+    gross_count = net_count = turnover_count = tariff_count = 0
     outcomes = {'ok': 0, 'partial': 0, 'stop': 0}
     starts, terminals = [], []
     seen_receipts = set()
@@ -96,14 +96,13 @@ def report_pages(state, load_report):
         if volume is not None:
             turnover = add_exact(turnover, volume)
             turnover_count += 1
-            bound = fee_estimate(report)
-            if bound is not None:
-                estimate = add_exact(estimate, bound)
-                estimate_count += 1
         valid = resolved and mapping(report.get('inventory')).get('status') == 'CONFIRMED_FLAT'
         pnl = mapping(mapping(report.get('economics')).get('closed_execution_pnl'))
         g = number(pnl.get('gross')) if valid and pnl.get('status') in ('PROVEN', 'GROSS_ONLY') and pnl.get('unit') == 'quote_currency' else None
         n = number(pnl.get('net')) if g is not None and pnl.get('status') == 'PROVEN' else None
+        if n is None and g is not None and zero_tariff(report):
+            n = g  # Owner-confirmed 0% tariff; every fill has an empty fee.
+            tariff_count += 1
         if g is not None:
             gross = add_exact(gross, g)
             gross_count += 1
@@ -148,13 +147,11 @@ def report_pages(state, load_report):
     summary.append('PnL после комиссий: ' + (f'<b>{usd(net, signed=True)} $</b>' if net_known else 'неизвестен'))
     if not net_known and net_count:
         summary.append(f'Известная часть после комиссий ({net_count}/{len(names)}): {usd(net, signed=True)} $')
+    tariff = f' (тариф 0% в {tariff_count}/{len(names)} циклах)' if tariff_count else ''
     if net_known and gross_known:
-        summary.append(f'Комиссии: {usd(gross - net)} $')
-    elif estimate_count and estimate > 0:
-        scope = '' if estimate_count == len(names) else f' по {estimate_count}/{len(names)} циклам'
-        summary.append(f'Комиссии: биржа не прислала · оценка по тарифу{scope} ≤ {usd(estimate)} $')
+        summary.append(f'Комиссии: {usd(gross - net)} ${tariff}')
     else:
-        summary.append('Комиссии: неизвестны')
+        summary.append('Комиссии: неизвестны' + (f'; тариф 0% в {tariff_count}/{len(names)} циклах' if tariff_count else ''))
     if not names:
         summary.append('Ни один цикл с сохранённым результатом не найден.')
     if state.get('series_precloses'):

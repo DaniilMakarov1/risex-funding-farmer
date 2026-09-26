@@ -2,9 +2,11 @@
 
 Rendering is display-only and runs in the controller's worker thread after a
 cycle has finished: it never reads the network, never feeds trading decisions
-and never turns missing evidence into a value. The optional fee estimate is a
-separately labelled upper bound from the published Robinhood caps; it is not a
-receipt fee and never enters PnL or proof.
+and never turns missing evidence into a value. The owner confirmed a 0%
+Robinhood BTC tariff (2026-09-26): only when every validated fill of a settled
+nominal-USD cycle has an empty fee (no raw venue/integrator value) is the fee
+displayed as 0 by that tariff and PnL after fees equal to gross, explicitly
+labelled. Saved reports and proof keep their own UNKNOWN fee status.
 """
 from datetime import datetime
 from decimal import Decimal, ROUND_HALF_UP
@@ -195,20 +197,6 @@ def phase_gaps(slot):
     return {phase: value[1] for phase, value in gaps.items()}
 
 
-def fee_estimate(report):
-    """Upper bound from published Robinhood caps over validated fills, or None."""
-    from .random_cycle import ROBINHOOD_MAKER_FEE_CAP, ROBINHOOD_TAKER_FEE_CAP
-    from .telegram_series_report import executed_turnover
-    if not nominal_usd(mapping(report.get('binding'))) or executed_turnover(report, set()) is None:
-        return None
-    total = Decimal(0)
-    for fill in report.get('confirmed_fills', []):
-        fill = mapping(fill)
-        cap = ROBINHOOD_MAKER_FEE_CAP if fill.get('fee_role') == 'maker' else ROBINHOOD_TAKER_FEE_CAP
-        total += number(fill.get('quantity')) * number(fill.get('price')) * cap
-    return total
-
-
 def settled(report):
     order = mapping(report.get('order_state'))
     return (report.get('status') == 'COMPLETE'
@@ -231,25 +219,42 @@ def outcome(report, safe=None):
     return 'ok' if mapping(report.get('paired_execution')).get('status') == 'SUCCESS' else 'partial'
 
 
+def zero_tariff(report):
+    """True only for a settled nominal-USD cycle whose every fill has an empty fee."""
+    from .telegram_series_report import executed_turnover
+    fills = report.get('confirmed_fills')
+    if not resolved(report) or not isinstance(fills, list) or not fills or executed_turnover(report, set()) is None:
+        return False
+    return all(mapping(f).get('fee_evidence') == 'MISSING_OR_INVALID_COMPONENTS' and mapping(f).get('fee') is None
+               and mapping(f).get('venue_fee_raw') is None and mapping(f).get('integrator_fee_raw') is None
+               for f in fills)
+
+
 def pnl_values(report, safe=None):
-    """(gross, net) under the series-report rules; unknown stays None."""
+    """(gross, net, by_tariff) under the series-report rules; unknown stays None.
+
+    ``net`` is the proven receipt net, or gross under the owner-confirmed 0%
+    tariff when :func:`zero_tariff` holds (``by_tariff`` is then True).
+    """
     if outcome(report, safe) == 'stop' or not resolved(report):
-        return None, None
+        return None, None, False
     pnl = mapping(mapping(report.get('economics')).get('closed_execution_pnl'))
     if pnl.get('unit') != 'quote_currency' or pnl.get('status') not in ('PROVEN', 'GROSS_ONLY'):
-        return None, None
+        return None, None, False
     gross = number(pnl.get('gross'))
-    net = number(pnl.get('net')) if gross is not None and pnl.get('status') == 'PROVEN' else None
-    return gross, net
+    if gross is not None and pnl.get('status') == 'PROVEN':
+        return gross, number(pnl.get('net')), False
+    if gross is not None and zero_tariff(report):
+        return gross, gross, True
+    return gross, None, False
 
 
-def fee_line(report):
+def fee_line(report, safe=None):
     fees = mapping(mapping(report.get('economics')).get('fees'))
     if fees.get('status') == 'PROVEN' and number(fees.get('total')) is not None:
         return f'Комиссии: {usd(fees.get("total"))} $'
-    estimate = fee_estimate(report) if resolved(report) else None
-    if estimate is not None and estimate > 0:
-        return f'Комиссии: биржа не прислала · оценка по тарифу ≤ {usd(estimate)} $'
+    if outcome(report, safe) != 'stop' and zero_tariff(report):
+        return 'Комиссии: 0 $ · тариф биржи 0% (в сделках не указываются)'
     return 'Комиссии: неизвестны'
 
 
@@ -314,14 +319,17 @@ def cycle_card(card, report, slot=None):
               if key in spans and seconds(spans[key])]
     if timing:
         lines.append('⏱ ' + ' · '.join(timing))
-    gross, net = pnl_values(report, card.get('safe'))
-    if net is not None:
-        lines.append(f'💰 PnL {usd(net, signed=True)} $ после комиссий')
-    elif gross is not None:
-        lines.append(f'💰 PnL {usd(gross, signed=True)} $ до комиссий')
+    gross, net, by_tariff = pnl_values(report, card.get('safe'))
+    if by_tariff:
+        lines.append(f'💰 PnL {usd(net, signed=True)} $ · комиссии 0 (тариф биржи 0%)')
     else:
-        lines.append('💰 PnL неизвестен')
-    lines.append(fee_line(report))
+        if net is not None:
+            lines.append(f'💰 PnL {usd(net, signed=True)} $ после комиссий')
+        elif gross is not None:
+            lines.append(f'💰 PnL {usd(gross, signed=True)} $ до комиссий')
+        else:
+            lines.append('💰 PnL неизвестен')
+        lines.append(fee_line(report, card.get('safe')))
     kind = outcome(report, card.get('safe'))
     cycle = mapping(report.get('cycle'))
     if kind != 'ok':

@@ -253,9 +253,27 @@ def test_usd_pnl_and_total_two_account_open_close_external_and_residual_volume()
     assert '1. cycle-001 · 🤝/🤝 · +0.0200 $' in result
     assert '2. cycle-002 · 🤝/🤝 🛠 · −0.0700 $ до ком.' in result
     assert 'USD — номинал USDG' in result
-    # Receipts carry no fee: only a labelled cap estimate, never a net value.
-    # 0.001*50000*0.00035*2 + 0.001*50100*0.00035*2 + 0.0002*(50000+50200)*0.00035
-    assert 'Комиссии: биржа не прислала · оценка по тарифу ≤ 0.0771 $' in result
+    # Fills without fee evidence never become a zero-fee net value.
+    assert 'Комиссии: неизвестны' in result and 'тариф' not in result
+
+
+def test_zero_tariff_series_net_equals_gross_only_when_every_fill_fee_is_empty():
+    def tariff(value):
+        return {**value, 'fee': None, 'fee_evidence': 'MISSING_OR_INVALID_COMPONENTS',
+                'venue_fee_raw': None, 'integrator_fee_raw': None}
+    first, second = report('0.03', '0.02'), report('-0.07', None)
+    first['confirmed_fills'] = [fill(11, 'a', '0.001', '50000')]
+    second['confirmed_fills'] = [tariff(fill(11, 'b', '0.001', '50000')),
+                                 tariff(fill(22, 'b', '0.001', '50000', 'SELL'))]
+    result = render({'cycle-001': first, 'cycle-002': second})
+    assert '2. cycle-002 · 🤝/🤝 · −0.0700 $' in result and 'до ком.' not in result
+    assert 'PnL до комиссий: −0.0400 $' in result
+    # 0.02 (proven net) + (-0.07) (0% tariff net) = -0.05; fees 0.01 proven + 0.
+    assert 'PnL после комиссий: −0.0500 $' in result
+    assert 'Комиссии: 0.0100 $ (тариф 0% в 1/2 циклах)' in result
+    second['confirmed_fills'][1]['venue_fee_raw'] = 7
+    blocked = render({'cycle-001': first, 'cycle-002': second})
+    assert 'PnL после комиссий: неизвестен' in blocked and 'тариф 0%' not in blocked
 
 
 def test_proved_empty_fills_have_zero_turnover():

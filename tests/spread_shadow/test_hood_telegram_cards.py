@@ -27,7 +27,8 @@ def match(phase, status='MATCHED', own='0.001', **changes):
 def fill(account, trade, quantity, price, side, role, phase='opening', peer=22):
     return {'account_index': account, 'market_id': 1, 'trade_id': trade, 'quantity': quantity,
             'price': price, 'side': side, 'phase': phase, 'history_complete': True,
-            'fee': None, 'fee_role': role, 'counterparty_account_index': peer}
+            'fee': None, 'fee_evidence': 'MISSING_OR_INVALID_COMPONENTS', 'venue_fee_raw': None,
+            'integrator_fee_raw': None, 'fee_role': role, 'counterparty_account_index': peer}
 
 
 def report(**changes):
@@ -64,7 +65,7 @@ def card(**changes):
     return {'kind': 'cycle', 'name': 'cycle-007', 'index': 3, 'total': 20, 'safe': True, 'pause': 17, **changes}
 
 
-def test_paired_card_shows_volume_route_time_pnl_fee_estimate_and_pause():
+def test_paired_card_shows_volume_route_time_pnl_zero_tariff_and_pause():
     result = valid(cycle_card(card(), report()))
     lines = result.splitlines()
     assert lines[0] == '✅ Цикл 3/20 · cycle-007'
@@ -74,12 +75,29 @@ def test_paired_card_shows_volume_route_time_pnl_fee_estimate_and_pause():
     assert 'LIMIT 11 SELL → MARKET 22 BUY' in result
     assert 'Открытие: 🤝 свои счета' in result and 'Закрытие: 🤝 свои счета · попыток 2' in result
     assert '⏱ подготовка 6.0 с · удержание 50 с · закрытие 3.4 с' in result
-    assert '💰 PnL −0.0200 $ до комиссий' in result and 'после комиссий' not in result
-    # Independent bound: maker 0.00012 × (50 + 50.01) + taker 0.00035 × (50 + 50.01).
-    expected = Decimal('0.00012') * Decimal('100.01') + Decimal('0.00035') * Decimal('100.01')
-    assert expected.quantize(Decimal('0.0001')) == Decimal('0.0470')
-    assert 'Комиссии: биржа не прислала · оценка по тарифу ≤ 0.0470 $' in result
+    # Every fill has an empty fee: the owner-confirmed 0% tariff gives net = gross.
+    assert '💰 PnL −0.0200 $ · комиссии 0 (тариф биржи 0%)' in result
+    assert 'неизвестн' not in result
     assert result.endswith('⏸ Следующий цикл через 17 с')
+
+
+@pytest.mark.parametrize('bad', ['nonzero_raw', 'integrator_raw', 'legacy_evidence', 'fee_value', 'no_fills'])
+def test_zero_tariff_needs_every_fill_to_have_an_empty_fee(bad):
+    r = report()
+    target = r['confirmed_fills'][2]
+    if bad == 'nonzero_raw':
+        target.update(fee_evidence='NONZERO_UNIT_UNVERIFIED', venue_fee_raw=5)
+    elif bad == 'integrator_raw':
+        target['integrator_fee_raw'] = 1
+    elif bad == 'legacy_evidence':
+        target.pop('fee_evidence')
+    elif bad == 'fee_value':
+        target['fee'] = '0.001'
+    else:
+        r['confirmed_fills'] = []
+    result = valid(cycle_card(card(), r))
+    assert '💰 PnL −0.0200 $ до комиссий' in result and 'Комиссии: неизвестны' in result
+    assert 'тариф' not in result
 
 
 def test_proved_fees_show_net_and_actual_fee_without_estimate():
@@ -89,7 +107,7 @@ def test_proved_fees_show_net_and_actual_fee_without_estimate():
                                                'gross': '0.05', 'net': '0.04'}}
     result = valid(cycle_card(card(pause=None), r))
     assert '💰 PnL +0.0400 $ после комиссий' in result
-    assert 'Комиссии: 0.0100 $' in result and 'оценка' not in result and '⏸' not in result
+    assert 'Комиссии: 0.0100 $' in result and 'тариф' not in result and '⏸' not in result
 
 
 def test_external_mixed_unknown_and_residual_phases_are_named_with_accounts():
@@ -137,7 +155,9 @@ def test_uncertain_cycle_never_looks_successful_or_continues(bad):
     # Settled receipts remain a proven turnover fact (as in the series total);
     # unsettled evidence yields neither turnover nor a fee estimate.
     settled = bad in ('unsafe', 'nonflat')
-    assert ('оборот 200.02 $' in result) is settled and ('оценка' in result) is settled
+    assert ('оборот 200.02 $' in result) is settled
+    # An uncertain cycle never gets a tariff-based fee or net PnL.
+    assert 'Комиссии: неизвестны' in result and 'тариф' not in result
 
 
 def test_missing_report_and_foreign_denomination_do_not_invent_values():
