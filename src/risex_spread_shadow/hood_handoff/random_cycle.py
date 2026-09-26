@@ -182,6 +182,7 @@ def allocate_cycle_slot(
     *,
     client_order_prefix: str = "hood-cycle",
     random_route: Mapping[str, Any] | None = None,
+    wallet_selection: Mapping[str, Any] | None = None,
 ) -> tuple[Path, str]:
     """Atomically reserve the next owner-only cycle directory and prefix.
 
@@ -189,10 +190,13 @@ def allocate_cycle_slot(
     confirmation.  Existing directories are never inspected beyond their
     names and are never overwritten; a newly created directory is retained if
     metadata persistence fails so a caller cannot accidentally reuse a
-    partially claimed slot.
+    partially claimed slot.  A wallet-pool draw is stored inside the same
+    immutable reservation (display/audit only; the route stays authoritative).
     """
 
     route = None if random_route is None else _validate_random_route(random_route)
+    if wallet_selection is not None and not isinstance(wallet_selection, Mapping):
+        raise PreflightBlocked("invalid wallet selection record")
     parent = Path(operator_dir)
     _require_owner_only_directory(parent, label="operator cycle directory")
     prefix = _text(client_order_prefix, "client_order_prefix")
@@ -214,6 +218,7 @@ def allocate_cycle_slot(
                 {
                     "schema": "hcr-19-simple-launch-v1",
                     **({"random_route": route} if route is not None else {}),
+                    **({"wallet_selection": dict(wallet_selection)} if wallet_selection is not None else {}),
                     "claimed_at": time.time(),
                     "cycle_dir": str(candidate),
                     "client_order_prefix": unique_prefix,

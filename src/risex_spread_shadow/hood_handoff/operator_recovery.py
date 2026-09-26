@@ -20,6 +20,7 @@ from .random_cycle import RandomCycleEngine, _account_payload, _fallback_order_m
 from .readiness import ReadOnlyLighterSdkClient
 from .sdk import PlainAioHttp, _leverage_next_nonce, _leverage_tx_diagnostic, _leverage_tx_hash, _order_snapshot_mapping, _require_success_code
 from .telegram_accounts import missing_key
+from .wallet_pool import WalletPoolError, load_wallet_pool
 
 SLOT = re.compile(r'(?:cycle|close)-[0-9]{3,}')
 INTENTS = {'SOURCE_DISPATCH_INTENT', 'RECEIVER_DISPATCH_INTENT', 'FALLBACK_DISPATCH_INTENT'}
@@ -32,15 +33,33 @@ SHARED_RECOVERY_JOURNAL_MAX_BYTES = 512 * 1024 * 1024
 HISTORICAL_JOURNAL_MAX_FILES = 10000
 
 
+# Concurrent authenticated account reads when a wallet pool is checked.
+WALLET_READ_CONCURRENCY = 4
+
+
 class HistoryBoundExceeded(PreflightBlocked):
     """A finite history-scan bound was reached; not an order or position fact."""
+
+
+class WalletKeyMissing(PreflightBlocked):
+    """A pool wallet has no stored credential; its orders cannot be read."""
+
+
+def _slim_account(row):
+    """Per-wallet journal row: exact state without the full margin evidence."""
+    row = row if isinstance(row, dict) else {}
+    orders = row.get('active_orders')
+    return {**{key: row.get(key) for key in ('account_index', 'market_id', 'signed_position',
+                                               'observed_at', 'source_identity', 'available_balance')},
+            'active_order_count': len(orders) if isinstance(orders, list) else None}
 
 
 def persisted_proof(proof):
     """Journal form of a readiness proof: the per-file input list is replaced by
     its exact count and SHA-256 over the canonical sorted list.  The in-memory
     proof is not modified.  This keeps each shared-journal row small instead of
-    repeating every historical path/hash on every check."""
+    repeating every historical path/hash on every check.  A wallet-pool proof
+    keeps one compact exact row per wallet."""
     value = dict(proof)
     inputs = value.pop('inputs', None)
     if isinstance(inputs, list):
@@ -49,6 +68,8 @@ def persisted_proof(proof):
                                sort_keys=True, separators=(',', ':')).encode('utf-8')
         value['inputs_count'] = len(inputs)
         value['inputs_sha256'] = hashlib.sha256(canonical).hexdigest()
+    if isinstance(value.get('accounts'), list):
+        value['accounts'] = [_slim_account(row) for row in value['accounts']]
     return value
 
 
@@ -111,8 +132,9 @@ class RecoveryReadClient(ReadOnlyLighterSdkClient):
         return _leverage_tx_diagnostic(payload, tx_hash, self._clock())
 
     async def read_leverage_next_nonce(self, account_index, api_key_index):
-        if (account_index not in {self.source_account_index, self.receiver_account_index}
-                or api_key_index != self.config.api_key_index):
+        readable = {self.source_account_index, self.receiver_account_index,
+                    *getattr(self, 'read_account_indices', ())}
+        if account_index not in readable or api_key_index != self.config.api_key_index:
             raise ContractError('nextNonce identity is invalid')
         token = await self._authorization(account_index)
         http = PlainAioHttp(self.config.api_base_url, timeout_seconds=self.config.request_timeout_seconds)
@@ -233,16 +255,17 @@ def journal_rows(path, *, shared_recovery=False):
             yield row
 
 
-def prior_intents(operator, config):
+def prior_intents(operator, config, indices=None):
     """Return every old creation intent and its exact terminal/rejection proof.
 
     Admission UNKNOWN does not imply an order can still execute. Conversely an
     empty current book alone does not resolve a transmitted but invisible order.
+    ``indices`` is the wallet pool; history on any other account is refused.
     """
     intents = {}
     unresolved_leverage = []
     files = []
-    indices = {config.source_account_index, config.receiver_account_index}
+    indices = {config.source_account_index, config.receiver_account_index, *(indices or ())}
     for slot in sorted(Path(operator).iterdir()):
         if not SLOT.fullmatch(slot.name):
             continue
@@ -411,10 +434,12 @@ def _checkpoint_matches(item, checkpoints, config=None):
     return True
 
 
-async def resolve_prior(config, client, operator, *, clock=None, require_leverage_resolved=True):
+async def resolve_prior(config, client, operator, *, clock=None, require_leverage_resolved=True, pool=None):
     """Resolve outstanding creations before admitting a new operation."""
     engine = RandomCycleEngine(client, clock=clock)
-    intents, files, pending_leverage = await asyncio.to_thread(prior_intents, operator, config)
+    pooled = pool is not None and pool.from_file
+    intents, files, pending_leverage = await asyncio.to_thread(
+        prior_intents, operator, config, tuple(pool.all) if pooled else None)
     if pending_leverage and require_leverage_resolved:
         checkpoints = await asyncio.to_thread(_leverage_checkpoints, operator)
         unresolved_settings = [item for item in pending_leverage if not _checkpoint_matches(item, checkpoints, config)]
@@ -460,8 +485,13 @@ async def resolve_prior(config, client, operator, *, clock=None, require_leverag
                 if type(next_nonce) is not int or next_nonce <= identity['nonce']:
                     raise PreflightBlocked('previous leverage nonce consumption is unproved')
                 proved.append((item, tx, next_nonce))
-            source, receiver = await asyncio.wait_for(engine._recovery_accounts(config), timeout=remaining())
-            accounts = {source.account_index: source, receiver.account_index: receiver}
+            if pooled:
+                accounts = await asyncio.wait_for(
+                    _wallet_snapshots(engine, config, sorted({item['account_index'] for item, _, _ in proved})),
+                    timeout=remaining())
+            else:
+                source, receiver = await asyncio.wait_for(engine._recovery_accounts(config), timeout=remaining())
+                accounts = {source.account_index: source, receiver.account_index: receiver}
             for item, tx, _ in proved:
                 account = accounts[item['account_index']]
                 label = 'source' if account.account_index == config.source_account_index else 'receiver'
@@ -513,8 +543,76 @@ async def resolve_prior(config, client, operator, *, clock=None, require_leverag
             'resolved_now': checked, 'inputs': files}
 
 
-async def inspect_current(config, client, operator, *, require_flat, clock=None, journal=None):
+def _validate_wallet_fresh(config, snapshot, index, now):
+    """The pair-read rules of the cycle engine, for any pool wallet."""
+    label = f'wallet {index}'
+    if snapshot.account_index != index or snapshot.market_id != config.market_id:
+        raise PreflightBlocked(f'{label} account identity/market does not match the pool')
+    if not snapshot.authorized or not snapshot.ready:
+        raise PreflightBlocked(f'{label} account authorization/readiness is unproven')
+    if snapshot.active_orders:
+        raise PreflightBlocked(f'{label} has active cycle-market orders')
+    if snapshot.margin_available is None or snapshot.margin_required is None:
+        raise PreflightBlocked(f'{label} margin evidence is missing')
+    if snapshot.observed_at > now:
+        raise PreflightBlocked(f'{label} account state is from the future')
+    if now - snapshot.observed_at > config.freshness_seconds:
+        raise PreflightBlocked(f'{label} account state is stale')
+    if not snapshot.source_identity:
+        raise PreflightBlocked(f'{label} account identity is missing')
+
+
+async def _wallet_snapshots(engine, config, indices, journal=None):
+    """Fresh validated reads of every listed wallet, bounded fan-out.
+
+    Each read is validated when it completes and uses the engine's
+    read-only retry rules; one failure cancels and drains the rest.
+    """
+    indices = tuple(indices)
+    semaphore = asyncio.Semaphore(WALLET_READ_CONCURRENCY)
+
+    async def one(index):
+        async def read():
+            snapshot = await engine._read_account(config, index, f'wallet {index} account read')
+            _validate_wallet_fresh(config, snapshot, index, engine.clock.now())
+            return snapshot
+        async with semaphore:
+            return await engine._recovery_read(config, read, f'wallet {index} account', journal)
+
+    tasks = [asyncio.create_task(one(index)) for index in indices]
+    try:
+        values = await asyncio.gather(*tasks)
+    except BaseException:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
+    return dict(zip(indices, values))
+
+
+async def inspect_wallets(config, client, operator, pool, *, require_flat, clock=None, journal=None):
+    """Pool form of ``inspect_current``: every wallet, active or paused."""
+    engine = RandomCycleEngine(client, clock=clock)
+    prior = await resolve_prior(config, client, operator, clock=engine.clock,
+                                require_leverage_resolved=require_flat, pool=pool)
+    wallets = await _wallet_snapshots(engine, config, pool.all, journal)
+    if require_flat and any(snapshot.signed_position != 0 for snapshot in wallets.values()):
+        raise PreflightBlocked('positions remain; use /close before /run')
+    proof = {'status': 'READY' if require_flat else 'CLOSE_READY', 'at': engine.clock.now(),
+             'source': _account_payload(wallets[config.source_account_index]),
+             'receiver': _account_payload(wallets[config.receiver_account_index]),
+             'accounts': [_account_payload(wallets[index]) for index in pool.all],
+             'wallets': pool.as_dict(), **prior}
+    return wallets, proof
+
+
+async def inspect_current(config, client, operator, *, require_flat, clock=None, journal=None, pool=None):
     """Called under the operator lock; read only, with causal accounts last."""
+    if pool is not None and pool.from_file:
+        wallets, proof = await inspect_wallets(config, client, operator, pool, require_flat=require_flat,
+                                               clock=clock, journal=journal)
+        return wallets[config.source_account_index], wallets[config.receiver_account_index], proof
     engine = RandomCycleEngine(client, clock=clock)
     prior = await resolve_prior(config, client, operator, clock=engine.clock,
                                 require_leverage_resolved=require_flat)
@@ -527,16 +625,31 @@ async def inspect_current(config, client, operator, *, require_flat, clock=None,
     return source, receiver, proof
 
 
+def require_pool_credentials(secrets, pool):
+    """A pool wallet without a stored key cannot be checked for open orders."""
+    check = getattr(secrets, 'has_stored_credential', None)
+    if not pool.from_file or not callable(check):
+        return
+    for index in pool.all:
+        if not check(index):
+            raise WalletKeyMissing(f'wallet {index} has no stored credential')
+
+
 async def check_recovery(config, operator, *, require_flat=True,
                          client_factory=RecoveryReadClient, secret_factory=KeychainSecretProvider.from_config):
     """Persist a separate current-state checkpoint without rewriting any cycle."""
     with exclusive_lock(Path(operator) / '.operator-launch.lock'):
-        secrets = secret_factory(config, (config.source_account_index, config.receiver_account_index), prompt=missing_key)
+        pool = load_wallet_pool(operator, config)
+        indices = tuple(pool.all) if pool.from_file else (config.source_account_index, config.receiver_account_index)
+        secrets = secret_factory(config, indices, prompt=missing_key)
         client = None
         try:
+            require_pool_credentials(secrets, pool)
             client = client_factory(config, source_account_index=config.source_account_index,
                                     receiver_account_index=config.receiver_account_index, secrets=secrets)
-            _, _, proof = await inspect_current(config, client, operator, require_flat=require_flat)
+            if pool.from_file:
+                client.read_account_indices = tuple(pool.all)
+            _, _, proof = await inspect_current(config, client, operator, require_flat=require_flat, pool=pool)
             journal = DurableJournal(Path(operator) / 'recovery-checks.jsonl')
             journal.acquire_attempt()
             try:
@@ -565,10 +678,26 @@ def allocate_close_slot(operator):
     return path
 
 
-async def close_positions(config, client, operator, slot, *, clock=None):
+def close_pairs(nonflat, every):
+    """Pair wallets holding a position; an odd one is paired with a flat wallet."""
+    nonflat = list(nonflat)
+    pairs = [tuple(nonflat[i:i + 2]) for i in range(0, len(nonflat) - 1, 2)]
+    if len(nonflat) % 2:
+        last = nonflat[-1]
+        partner = next((index for index in every if index not in nonflat), None)
+        if partner is None:
+            partner = next(index for index in every if index != last)
+        pairs.append((last, partner))
+    return pairs
+
+
+async def close_positions(config, client, operator, slot, *, clock=None, pool=None, pair_client_factory=None):
     """User-triggered closure only; caller owns the normal operator lock."""
     if not config.operator_execution_opt_in or not config.operator_plan_reviewed:
         raise PreflightBlocked('explicit operator closure confirmation required')
+    if pool is not None and pool.from_file:
+        return await _close_pool_positions(config, client, operator, slot, pool, clock=clock,
+                                           pair_client_factory=pair_client_factory)
     engine = RandomCycleEngine(client, clock=clock)
     config = replace(config, cycle_dir=slot, journal_path=Path(slot) / 'close.jsonl')
     journal = DurableJournal(config.journal_path, clock=engine.clock.now)
@@ -588,6 +717,70 @@ async def close_positions(config, client, operator, slot, *, clock=None):
                       'at': engine.clock.now(), 'symbol': config.market_symbol,
                       'positions': [{'account_index': index, 'position': None if pos is None else str(pos)}
                                     for index, pos in ((config.source_account_index, source_after), (config.receiver_account_index, receiver_after))],
+                      'attempts': [r.as_dict() for r in results],
+                      'reason': None if flat else (_recovery_stop_reason(journal) or next(
+                          (r.reason for r in reversed(results) if r.reason), None))}
+        except Exception as exc:
+            result = {'status': 'UNKNOWN', 'at': engine.clock.now(), 'symbol': config.market_symbol,
+                      'reason': str(exc) if isinstance(exc, PreflightBlocked) else sanitize_exception(exc)}
+        journal.append('CLOSE_COMPLETE', result)
+        return result
+    finally:
+        journal.release_attempt()
+
+
+async def _close_pool_positions(config, client, operator, slot, pool, *, clock=None, pair_client_factory=None):
+    """Close every pool wallet's residual, one existing two-account loop per pair.
+
+    Mutations only ever use a client bound to exactly that pair.  Each pair is
+    read fresh right before its closure; the first pair whose outcome is not
+    proved stops the operation (later pairs stay untouched for the next check).
+    """
+    engine = RandomCycleEngine(client, clock=clock)
+    config = replace(config, cycle_dir=slot, journal_path=Path(slot) / 'close.jsonl')
+    journal = DurableJournal(config.journal_path, clock=engine.clock.now)
+    journal.acquire_attempt()
+    try:
+        if journal.events:
+            raise PreflightBlocked('close slot cannot be replayed')
+        journal.append('CLOSE_STARTED', {'binding': config.binding(), 'wallets': pool.as_dict(),
+                                         'runtime_provenance': capture_provenance(config.binding())})
+        results = []
+        after = {}
+        try:
+            wallets, proof = await inspect_wallets(config, client, operator, pool, require_flat=False,
+                                                   clock=engine.clock, journal=journal)
+            journal.append('CLOSE_BASELINE', persisted_proof(proof))
+            after = {index: wallets[index].signed_position for index in pool.all}
+            nonflat = [index for index in pool.all if wallets[index].signed_position != 0]
+            resolved = True
+            for first, second in close_pairs(nonflat, pool.all):
+                pair_config = replace(config, source_account_index=first, receiver_account_index=second)
+                bound = (client.source_account_index, client.receiver_account_index) == (first, second)
+                if not bound and pair_client_factory is None:
+                    raise PreflightBlocked('pool closure requires a per-pair client')
+                pair_client = client if bound else pair_client_factory(pair_config)
+                try:
+                    pair_engine = RandomCycleEngine(pair_client, clock=engine.clock)
+                    journal.append('CLOSE_PAIR', {'source_account_index': first, 'receiver_account_index': second})
+                    source, receiver = await pair_engine._recovery_accounts(pair_config, journal)
+                    pair_results, first_after, second_after = await pair_engine.close_reconciled_positions(
+                        pair_config, journal, source, receiver)
+                finally:
+                    if pair_client is not client:
+                        await pair_client.aclose()
+                results.extend(pair_results)
+                after[first], after[second] = first_after, second_after
+                if (first_after is None or second_after is None
+                        or any(item.outcome is Outcome.UNKNOWN for item in pair_results)):
+                    resolved = False
+                    break  # Unproved outcome: no further pair is touched.
+            flat = resolved and all(value == 0 for value in after.values())
+            result = {'status': 'CONFIRMED_FLAT' if flat else 'PARTIAL' if resolved else 'UNKNOWN',
+                      'at': engine.clock.now(), 'symbol': config.market_symbol,
+                      'positions': [{'account_index': index,
+                                     'position': None if after.get(index) is None else str(after[index])}
+                                    for index in pool.all],
                       'attempts': [r.as_dict() for r in results],
                       'reason': None if flat else (_recovery_stop_reason(journal) or next(
                           (r.reason for r in reversed(results) if r.reason), None))}

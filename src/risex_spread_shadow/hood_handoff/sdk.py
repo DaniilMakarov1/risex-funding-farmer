@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 from collections import deque
 from dataclasses import dataclass, field
+from decimal import Decimal
 import importlib
 from importlib import metadata as importlib_metadata
 import inspect
@@ -1151,6 +1152,57 @@ class LighterSdkClient:
     async def order_book_snapshot(self, market_id: int) -> Any:
         return await self.order_book(market_id)
 
+    async def public_account_state(self, account_index: int, market_id: int) -> Any:
+        """Unauthenticated balance/position read for wallet-pool eligibility only.
+
+        This is never admission or execution proof: the drawn pair is read
+        again with authenticated active orders by the cycle itself.
+        """
+        from .wallet_pool import WalletState
+
+        if isinstance(account_index, bool) or not isinstance(account_index, int) or account_index <= 0:
+            raise ContractError("public account read requires a positive account index")
+        module = self._lighter()
+        api = module.AccountApi(self._generated_api_client(module))
+        raw = await self._bounded(
+            _await(api.account(by="index", value=str(account_index), active_only=False,
+                               _request_timeout=self.config.request_timeout_seconds)),
+            time.monotonic() + self.config.request_timeout_seconds,
+            "public account read",
+        )
+        observed_at = self._clock()
+        _require_success_code(_model_dict(raw), "account")
+        account = _first_mapping(raw, "accounts")
+        if not {"index", "status", "positions", "available_balance"}.issubset(account):
+            raise ContractError("Lighter account response is missing required state fields")
+        try:
+            if int(account["index"]) != account_index:
+                raise ContractError("Lighter account response identity does not match requested account")
+            positions = account["positions"]
+            if not isinstance(positions, (list, tuple)):
+                raise ContractError("Lighter account positions field is malformed")
+            signed = Decimal(0)
+            matched = 0
+            for candidate in positions:
+                row = _model_dict(candidate)
+                if int(row["market_id"]) != market_id:
+                    continue
+                matched += 1
+                sign = row["sign"]
+                if isinstance(sign, bool) or sign not in (-1, 1):
+                    raise ContractError("Lighter account position sign is malformed")
+                signed = Decimal(str(row["position"])) * sign
+            balance = Decimal(str(account["available_balance"]))
+        except ContractError:
+            raise
+        except (KeyError, TypeError, ValueError, ArithmeticError):
+            raise ContractError("Lighter account response is malformed") from None
+        if matched > 1 or not signed.is_finite() or not balance.is_finite() or balance < 0:
+            raise ContractError("Lighter account response is malformed")
+        status = account["status"]
+        return WalletState(account_index=account_index, available_balance=balance, signed_position=signed,
+                           ready=status in (0, 1, "active", "online"), observed_at=observed_at)
+
     async def account_snapshot(self, account_index: int, market_id: int) -> AccountSnapshot:
         module = self._lighter()
         api = module.AccountApi(self._generated_api_client(module))
@@ -1980,7 +2032,10 @@ class LighterSdkClient:
         return _leverage_tx_diagnostic(raw, tx_hash, self._clock())
 
     async def read_leverage_next_nonce(self, account_index: int, api_key_index: int) -> int:
-        if (account_index not in {self.source_account_index, self.receiver_account_index}
+        # Read-only: a pool wallet's earlier setting may be proved by any cycle client.
+        readable = {self.source_account_index, self.receiver_account_index,
+                    *getattr(self, "read_account_indices", ())}
+        if (account_index not in readable
                 or api_key_index != self.config.api_key_index):
             raise ContractError("nextNonce identity is invalid")
         module = self._lighter()

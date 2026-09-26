@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 from contextlib import nullcontext
+from dataclasses import replace
 from decimal import Decimal, InvalidOperation
 import importlib
 import json
@@ -582,6 +583,7 @@ def _keychain_provider(
     account_indices: tuple[int, ...],
     *,
     replace: bool,
+    prompt: Any = None,
 ) -> KeychainSecretProvider:
     """Construct the explicit Keychain provider after config validation."""
 
@@ -591,6 +593,7 @@ def _keychain_provider(
             account_indices,
             backend=MacOSKeychainBackend(),
             replace=replace,
+            prompt=prompt,
         )
     except KeychainError as exc:
         raise SystemExit(f"keychain configuration failed: {_keychain_error_text(exc)}") from None
@@ -848,6 +851,24 @@ def _validate_simple_local_inputs(
     return config, evidence
 
 
+def _pool_summary_line(value: Mapping[str, Any], operator_dir: Path) -> str | None:
+    """Local, secret-free description of wallets.json; None without a pool file."""
+
+    from types import SimpleNamespace
+    from .wallet_pool import WalletPoolError, load_wallet_pool, pool_path
+
+    if not pool_path(operator_dir).exists() and not pool_path(operator_dir).is_symlink():
+        return None
+    try:
+        pool = load_wallet_pool(operator_dir, SimpleNamespace(
+            source_account_index=value.get("source_account_index"),
+            receiver_account_index=value.get("receiver_account_index")))
+    except WalletPoolError as exc:
+        return f"Пул кошельков: файл некорректен ({exc}); цикл не начнётся."
+    paused = f", на паузе {len(pool.paused)}" if pool.paused else ""
+    return f"Пул кошельков: активных {len(pool.active)}{paused}."
+
+
 def _print_simple_summary(
     value: Mapping[str, Any],
     config_path: Path,
@@ -861,7 +882,12 @@ def _print_simple_summary(
     credential_route = "сохранённый Keychain" if use_keychain else "скрытый локальный ввод ключей"
     print(f"\n══ НОВЫЙ ЦИКЛ · {symbol} · Robinhood Chain Mainnet ══")
     print(f"Один реальный Robinhood Chain Mainnet цикл: {symbol}; первый счёт и сторона лимитки случайны.")
-    print(f"Счета: {source} и {receiver}; каждый может первым выставить BUY или SELL (четыре равновероятных варианта).")
+    pool_line = _pool_summary_line(value, operator_dir)
+    if pool_line is None:
+        print(f"Счета: {source} и {receiver}; каждый может первым выставить BUY или SELL (четыре равновероятных варианта).")
+    else:
+        print(f"{pool_line} Два разных кошелька выбираются случайно из готовых (баланс хватает, позиции нет); "
+              "затем первый счёт и сторона — четыре равновероятных варианта.")
     print(f"Улучшение цены: {value.get('price_improvement_ticks', '1 (старое правило)')} тиков.")
     if value.get("receiver_admission") == "ack":
         print("Режим ACK: MARKET без ожидания WS лимитки; LIMIT может отсутствовать или уже исполниться. Проверка стакана сохранена.")
@@ -1440,15 +1466,20 @@ def _persist_prejournal_launch_failure(cycle_dir: Path, exc: BaseException) -> s
     """Persist only an allowlisted cause; never copy an exception or key text."""
     if (cycle_dir / 'cycle.jsonl').exists():
         return None
-    from .operator_recovery import HistoryBoundExceeded
+    from .operator_recovery import HistoryBoundExceeded, WalletKeyMissing
+    from .wallet_pool import WalletPoolError, WalletsUnavailable
     if isinstance(exc, PreflightBlocked) and 'leverage setting is unresolved' in str(exc):
         code = 'PRIOR_LEVERAGE_UNRESOLVED'
     elif isinstance(exc, PreflightBlocked) and 'previous order is unresolved' in str(exc):
         code = 'PRIOR_ORDER_UNRESOLVED'
-    elif isinstance(exc, KeychainError):
+    elif isinstance(exc, (KeychainError, WalletKeyMissing)):
         code = 'CREDENTIAL_UNAVAILABLE'
     elif isinstance(exc, HistoryBoundExceeded):
         code = 'HISTORY_LIMIT'
+    elif isinstance(exc, WalletsUnavailable):
+        code = 'WALLETS_UNAVAILABLE'
+    elif isinstance(exc, WalletPoolError):
+        code = 'WALLET_POOL'
     elif isinstance(exc, PreflightBlocked):
         code = 'PREFLIGHT_REFUSED'
     else:
@@ -1462,6 +1493,56 @@ def _persist_prejournal_launch_failure(cycle_dir: Path, exc: BaseException) -> s
         'cycle_journal_present': False,
     })
     return code
+
+
+class _NoSigningSecrets:
+    """Secret provider for the public wallet-selection reads: it never returns a key."""
+
+    def private_key(self, account_index: int, api_key_index: int) -> str:
+        raise KeychainError("wallet selection never reads a private key")
+
+    def close(self) -> None:
+        return None
+
+
+async def _select_pool_wallets(base_config: Any, evidence: Mapping[str, Any], pool: Any) -> dict[str, Any]:
+    """Read each active wallet publicly and draw one uniform eligible pair."""
+
+    from .telegram_accounts import missing_key
+    from .wallet_pool import select_wallet_pair
+
+    keys = _keychain_provider(base_config, tuple(pool.active), replace=False, prompt=missing_key)
+    reader = None
+    try:
+        reader = LighterSdkClient(
+            base_config,
+            source_account_index=base_config.source_account_index,
+            receiver_account_index=base_config.receiver_account_index,
+            secrets=_NoSigningSecrets(),
+            market_evidence=evidence,
+        )
+        return await select_wallet_pair(base_config, pool, reader, has_key=keys.has_stored_credential)
+    finally:
+        try:
+            if reader is not None:
+                await reader.aclose()
+        finally:
+            keys.close()
+
+
+def _pool_failure_text(exc: BaseException, selection: Mapping[str, Any] | None) -> str:
+    from .wallet_pool import SKIP_REASONS, WalletPoolError, WalletsUnavailable
+
+    if isinstance(exc, WalletsUnavailable) and isinstance(selection, Mapping):
+        skipped = ", ".join(f"{item.get('account_index')} — {SKIP_REASONS.get(item.get('reason'), '?')}"
+                            for item in selection.get("skipped", [])[:20])
+        return (f"готовых кошельков меньше двух ({len(selection.get('eligible', []))} из "
+                f"{selection.get('pool_size')})" + (f"; пропущены: {skipped}" if skipped else ""))
+    if isinstance(exc, WalletPoolError):
+        return f"файл пула кошельков некорректен: {exc}"
+    if isinstance(exc, KeychainError):
+        return "доступ к Keychain для проверки ключей не подтверждён"
+    return f"не удалось прочитать рынок или кошельки: {sanitize_exception(exc)}"
 
 
 async def _run_simple_confirmed(args, value, config_path, operator_dir) -> int:
@@ -1481,15 +1562,53 @@ async def _run_simple_confirmed(args, value, config_path, operator_dir) -> int:
         raise SystemExit("confirmed pilot uses the dedicated one-cycle command")
     _require_owner_opening_margin_reserve(base_config)
     _validate_simple_sdk()
-    route = select_random_route(base_config)
+    from .wallet_pool import WalletPoolError, WalletsUnavailable, load_wallet_pool
+    pool = selection = pool_failure = None
+    try:
+        pool = load_wallet_pool(operator_dir, base_config)
+    except WalletPoolError as exc:
+        pool_failure = exc
+    pooled = pool is not None and pool.from_file
+    if pooled and (args.keychain_replace or not args.keychain):
+        raise SystemExit("пул кошельков работает только с сохранёнными ключами (--keychain); "
+                         "ключ кошелька добавляется командой ./wallet add")
+    if pooled:
+        # Public balance/position reads of every active wallet; no key value is
+        # read and nothing is signed before the pair is drawn and the slot claimed.
+        try:
+            selection = await _select_pool_wallets(base_config, evidence, pool)
+        except Exception as exc:
+            pool_failure = exc
+    if pool_failure is not None:
+        route = None
+    elif pooled:
+        pair = selection["pair"]
+        route = None if pair is None else select_random_route(
+            replace(base_config, source_account_index=pair[0], receiver_account_index=pair[1]))
+        if pair is None:
+            pool_failure = WalletsUnavailable("fewer than two eligible wallets")
+    else:
+        route = select_random_route(base_config)
     try:
         cycle_dir, client_order_prefix = allocate_cycle_slot(
             operator_dir,
             client_order_prefix=base_config.client_order_prefix,
             random_route=route,
+            wallet_selection=selection,
         )
     except PreflightBlocked as exc:
         raise SystemExit(f"не удалось занять новый слот цикла: {exc}") from None
+    if pool_failure is not None:
+        try:
+            code = _persist_prejournal_launch_failure(cycle_dir, pool_failure)
+        except PreflightBlocked:
+            code = None
+        print(f"Цикл не начат: {_pool_failure_text(pool_failure, selection)}. "
+              f"Ордера не отправлялись; слот {cycle_dir} сохранён" + (f" с причиной {code}." if code else "."))
+        return 2
+    if pooled:
+        print(f"Кошельки: выбрана пара {route['source_account_index']} и {route['receiver_account_index']} "
+              f"из {len(selection['eligible'])} готовых (всего активных {selection['pool_size']}).")
     launch_value = _simple_config_value(value)
     launch_value.update(route)
     launch_value["cycle_dir"] = str(cycle_dir)
@@ -1513,7 +1632,13 @@ async def _run_simple_confirmed(args, value, config_path, operator_dir) -> int:
     emitted_keys: set[tuple[str, int | None, int | None]] = set()
     try:
         account_indices = (config.source_account_index, config.receiver_account_index)
-        if args.keychain or args.keychain_replace:
+        if pooled:
+            # Every pool wallet's key stays readable for exact history lookups;
+            # only the drawn pair is loaded now.  Keys are never prompted here.
+            from .telegram_accounts import missing_key
+            secrets = _keychain_provider(config, tuple(pool.all), replace=False, prompt=missing_key)
+            _prime_keychain(secrets, account_indices)
+        elif args.keychain or args.keychain_replace:
             secrets = _keychain_provider(config, account_indices, replace=args.keychain_replace)
             _prime_keychain(secrets, account_indices)
         else:
@@ -1526,7 +1651,11 @@ async def _run_simple_confirmed(args, value, config_path, operator_dir) -> int:
             market_evidence=evidence,
         )
         from .operator_recovery import resolve_prior
-        await resolve_prior(config, client, operator_dir)
+        if pooled:
+            client.read_account_indices = tuple(pool.all)
+            await resolve_prior(config, client, operator_dir, pool=pool)
+        else:
+            await resolve_prior(config, client, operator_dir)
         stop_progress = asyncio.Event()
         progress_task = None if getattr(args, 'no_progress', False) else asyncio.create_task(
             _stream_simple_progress(Path(config.journal_path), emitted_keys, stop_progress))
@@ -1600,7 +1729,11 @@ async def _run_close_positions(args):
     value = _load_json(config_path, "operator configuration")
     operator_dir = _simple_operator_dir(config_path)
     print("\n══ ЗАКРЫТИЕ ПОЗИЦИЙ ══")
-    print(f"Рынок {value.get('market_symbol', '?')}; счета {value.get('source_account_index')} и {value.get('receiver_account_index')}.")
+    pool_line = _pool_summary_line(value, operator_dir)
+    if pool_line is None:
+        print(f"Рынок {value.get('market_symbol', '?')}; счета {value.get('source_account_index')} и {value.get('receiver_account_index')}.")
+    else:
+        print(f"Рынок {value.get('market_symbol', '?')}; все кошельки пула, включая приостановленные. {pool_line}")
     print("Проверить позиции и закрыть имеющиеся ограниченными MARKET/IOC reduce-only ордерами.")
     print("Enter подтверждает реальную операцию; C/CANCEL — отмена.")
     if not _simple_confirmation():
@@ -1612,18 +1745,51 @@ async def _run_close_positions(args):
             defer_incremental_margin_calculation=args.defer_incremental_margin_calculation)
         _validate_simple_sdk()
         config = replace(config, operator_execution_opt_in=True, operator_plan_reviewed=True)
-        slot = allocate_close_slot(operator_dir)
+        from .operator_recovery import WalletKeyMissing, require_pool_credentials
+        from .wallet_pool import WalletPoolError, load_wallet_pool
+        try:
+            pool = load_wallet_pool(operator_dir, config)
+        except WalletPoolError as exc:
+            raise SystemExit(f"файл пула кошельков некорректен: {exc}") from None
         indices = (config.source_account_index, config.receiver_account_index)
+        pool_secrets = None
+        if pool.from_file:
+            if args.keychain_replace or not args.keychain:
+                raise SystemExit("пул кошельков работает только с сохранёнными ключами (--keychain)")
+            from .telegram_accounts import missing_key
+            pool_secrets = _keychain_provider(config, tuple(pool.all), replace=False, prompt=missing_key)
+            try:
+                require_pool_credentials(pool_secrets, pool)
+            except (WalletKeyMissing, KeychainError) as exc:
+                pool_secrets.close()
+                raise SystemExit(f"закрытие не начато: {exc}; ключ добавляется командой ./wallet add") from None
+        slot = allocate_close_slot(operator_dir)
         secrets = client = None
         try:
-            if args.keychain or args.keychain_replace:
+            if pool_secrets is not None:
+                secrets = pool_secrets
+            elif args.keychain or args.keychain_replace:
                 secrets = _keychain_provider(config, indices, replace=args.keychain_replace)
                 _prime_keychain(secrets, indices)
             else:
                 secrets = PromptSecretProvider(indices, config.api_key_index)
             client = LighterSdkClient(config, source_account_index=indices[0], receiver_account_index=indices[1],
                                       secrets=secrets, market_evidence=evidence)
-            result = await close_positions(config, client, operator_dir, slot)
+            if pool.from_file:
+                client.read_account_indices = tuple(pool.all)
+
+                def pair_client(pair_config):
+                    # Mutations stay bound to exactly the pair being closed.
+                    pair = LighterSdkClient(pair_config, source_account_index=pair_config.source_account_index,
+                                            receiver_account_index=pair_config.receiver_account_index,
+                                            secrets=secrets, market_evidence=evidence)
+                    pair.read_account_indices = tuple(pool.all)
+                    return pair
+
+                result = await close_positions(config, client, operator_dir, slot, pool=pool,
+                                               pair_client_factory=pair_client)
+            else:
+                result = await close_positions(config, client, operator_dir, slot)
         finally:
             try:
                 if client is not None:

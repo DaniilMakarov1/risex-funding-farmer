@@ -204,6 +204,10 @@ class MemoryKeychainBackend:
         self.calls.append(("delete", binding))
         return self.values.pop(binding, None) is not None
 
+    def contains(self, binding: KeychainBinding) -> bool:
+        self.calls.append(("contains", binding))
+        return binding in self.values
+
     # Friendly aliases keep the injected test backend useful to callers that
     # describe the operation as save/remove rather than put/delete.
     def save(self, binding: KeychainBinding, private_key: str, *, replace: bool = False) -> None:
@@ -400,6 +404,20 @@ class MacOSKeychainBackend:
         finally:
             if result:
                 native.release([result])
+            native.release(owned)
+
+    def contains(self, binding: KeychainBinding) -> bool:
+        """Presence only: the query requests no data and returns no credential."""
+        native, query, owned, keepalive = self._query(binding)
+        del keepalive
+        try:
+            status = int(native.security.SecItemCopyMatching(query, None))
+            if status == -25300:
+                return False
+            if status != 0:
+                raise native.status_error(status, "read")
+            return True
+        finally:
             native.release(owned)
 
     def put(self, binding: KeychainBinding, private_key: str, *, replace: bool = False) -> None:
@@ -666,6 +684,26 @@ class KeychainSecretProvider:
     def remove(self, account_index: int) -> bool:
         binding = self._check_request(account_index, self._api_key_index)
         return self._delete(binding)
+
+    def has_stored_credential(self, account_index: int) -> bool:
+        """Whether a credential is stored; never prompts and never caches a value."""
+        binding = self._check_request(account_index, self._api_key_index)
+        if account_index in self._values:
+            return True
+        contains = getattr(self._backend, "contains", None)
+        if callable(contains):
+            try:
+                return bool(contains(binding))
+            except Exception as exc:
+                raise self._backend_failure("read", exc) from None
+        return self._get(binding) is not None
+
+    def store(self, account_index: int, private_key: str, *, replace: bool = False) -> None:
+        """Store one credential the caller has already verified; never prompts."""
+        binding = self._check_request(account_index, self._api_key_index)
+        value = _validate_private_key(private_key)
+        self._put(binding, value, replace=replace)
+        self._values[account_index] = value
 
     def close(self) -> None:
         self._values.clear()
