@@ -1556,7 +1556,9 @@ def _cycle_terminal_reason(
 
     if remaining_source is not None and remaining_receiver is not None:
         if remaining_source == 0 and remaining_receiver == 0:
-            parts.append("final inventory confirmed flat")
+            inventory = _cycle_classifications(opening, closing, fallbacks, remaining_source, remaining_receiver)[1]
+            parts.append("final inventory confirmed flat" if inventory == "CONFIRMED_FLAT" else
+                         "latest position snapshots are zero; final inventory proof is incomplete")
         else:
             parts.append(
                 "final inventory known residual: "

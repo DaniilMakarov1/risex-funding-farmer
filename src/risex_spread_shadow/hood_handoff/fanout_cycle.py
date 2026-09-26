@@ -1059,16 +1059,19 @@ class FanoutCycleEngine(RandomCycleEngine):
         return self._classified(result, remaining)
 
     @staticmethod
-    def _residual_text(remaining: Mapping[int, Decimal | None], roles: Sequence[tuple[str, int]]) -> str | None:
+    def _residual_text(remaining: Mapping[int, Decimal | None], roles: Sequence[tuple[str, int]], *,
+                       confirmed_flat: bool) -> str | None:
         if not remaining or any(remaining.get(index) is None for _, index in roles):
             return None
         if all(remaining[index] == 0 for _, index in roles):
-            return "final inventory confirmed flat"
+            return ("final inventory confirmed flat" if confirmed_flat else
+                    "latest position snapshots are zero; final inventory proof is incomplete")
         return "final inventory known residual: " + ", ".join(f"{label}={remaining[index]}" for label, index in roles)
 
     def _terminal_reason(self, config, journal, opening, closing, fallbacks, seed, remaining) -> str | None:
         base = _cycle_terminal_reason(opening, closing, fallbacks, seed, recovery_reason=_recovery_stop_reason(journal))
-        residual = self._residual_text(remaining, self._roles(config))
+        inventory = fanout_cycle_classifications(opening, closing, fallbacks, remaining)[1]
+        residual = self._residual_text(remaining, self._roles(config), confirmed_flat=inventory == "CONFIRMED_FLAT")
         parts = [part for part in (base, residual) if part]
         return "; ".join(parts) if parts else None
 

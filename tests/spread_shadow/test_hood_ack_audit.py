@@ -272,3 +272,25 @@ async def test_real_btc_binding_closes_fanout_dust_without_top_up(tmp_path):
     assert result.inventory == "CONFIRMED_FLAT", result.reason
     assert ("MARKET", 33, "SELL", Decimal("0.05"), True) in venue.sends
     assert all(s[-1] for s in venue.sends[3:])  # Every recovery order remains reduce-only.
+
+
+@pytest.mark.parametrize("fanout", [False, True])
+async def test_zero_snapshots_after_history_timeout_do_not_claim_proved_flatness(tmp_path, fanout):
+    from test_hood_ticks_ack import AckClient
+    from test_hood_handoff_random_cycle import cycle_config
+
+    class LostClosingHistory(FanoutVenue if fanout else AckClient):
+        async def list_trades(self, *args, **kwargs):
+            if any(order.reduce_only for order in self.orders.values()):
+                raise TimeoutError("closing history unavailable")
+            return await super().list_trades(*args, **kwargs)
+
+    clock = AdvancingClock()
+    venue = LostClosingHistory(clock)
+    config = fanout_config(tmp_path / "cycle") if fanout else cycle_config(tmp_path / "cycle", receiver_admission="ack")
+    result = await run_random_cycle(config, venue, clock=clock,
+        rng=FixedRng(40, 20, 5) if fanout else FixedRng(20, 20))
+    assert result.outcome is Outcome.UNKNOWN and result.inventory == "UNKNOWN"
+    assert result.remaining_source_position == result.remaining_receiver_position == Decimal(0)
+    assert "final inventory confirmed flat" not in result.reason
+    assert "final inventory proof is incomplete" in result.reason

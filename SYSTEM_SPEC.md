@@ -12,6 +12,8 @@ Every exit from paired closing preparation releases unused nonce reservations be
 
 Timing now records the source-to-MARKET send boundary after the disk barrier, the ACK-to-MARKET send interval and the receiver intent durability wait. Missing send timing is unavailable, not zero. Cards prefer the actual send interval, falling back to the old intent interval only for old journals. An offline report resolves an intended-but-unsent MARKET only with a matching explicit pre-send refusal and complete zero-mutation receipts; it does not invent an exchange ACK for this case. Runtime implementation identity now covers fan-out, random-cycle and wallet selection code.
 
+Terminal reason text follows the inventory classification. Zero final account snapshots accompanied by incomplete execution/history evidence are described as zero snapshots with incomplete final inventory proof; they must not say "final inventory confirmed flat" while the inventory field is UNKNOWN. This applies to one-to-one and fan-out cycles and does not relax the stop or reconciliation rules.
+
 Correction of the historical dust statement below: the existing bound Robinhood BTC recovery already allows an exact, on-grid below-minimum position to be closed reduce-only. Fan-out uses that same rule; it does not add a top-up or permit oversized orders. Other bindings and unproved/invalid residuals still stop. This audit adds a regression for the actual BTC binding, without changing that policy.
 
 # One LIMIT filled by several MARKETs (fan-out) (2026-09-26)
