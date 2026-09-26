@@ -767,6 +767,10 @@ def _simple_evidence_path(value: Mapping[str, Any], operator_dir: Path, explicit
 
 def _simple_config_value(value: Mapping[str, Any]) -> dict[str, Any]:
     result = dict(value)
+    # Owner execution is ACK only. Preserve the bytes bound to controller
+    # state while accepting its legacy saved default at the local boundary.
+    if result.get("receiver_admission") == "ws_confirmed":
+        result["receiver_admission"] = "ack"
     for key in ("market_evidence", "market_evidence_path", "operator_dir"):
         result.pop(key, None)
     return result
@@ -842,8 +846,6 @@ def _validate_simple_local_inputs(
     except SystemExit as exc:
         detail = str(exc) or "неизвестная ошибка"
         raise SystemExit(f"Локальная ошибка конфигурации: {detail}") from None
-    if config.receiver_admission == "ws_confirmed":
-        raise SystemExit("Режим WS отключён; выберите --receiver-admission ack")
     if config.api_key_index is None:
         raise SystemExit("Локальная ошибка конфигурации: требуется api_key_index")
 
@@ -898,10 +900,8 @@ def _print_simple_summary(
         print(f"{pool_line} Два разных кошелька выбираются случайно из готовых (баланса хватает, позиции нет); "
               "затем первый счёт и сторона — четыре равновероятных варианта.")
     print(f"Улучшение цены: {value.get('price_improvement_ticks', '1 (старое правило)')} тиков.")
-    if value.get("receiver_admission") == "ack":
+    if _simple_config_value(value).get("receiver_admission") == "ack":
         print("Режим ACK: MARKET без ожидания WS лимитки; LIMIT может отсутствовать или уже исполниться. Проверка стакана сохранена.")
-    if value.get("receiver_admission") == "ws_confirmed":
-        print("Режим: MARKET после WS-подтверждения лимитки; приоритет перед чужими заявками не гарантирован.")
     print("Для запуска требуется резерв на каждом счёте: 0.10 при выборе объёма и плеча, 0.02 перед ордерами (валюта баланса).")
     print(f"После Enter будет использован {credential_route}; до Enter нет чтения рынка или доступа к ключам.")
     print(f"Конфигурация: {config_path}; каталог результатов: {operator_dir}.")

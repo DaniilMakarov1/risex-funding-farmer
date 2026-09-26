@@ -11,9 +11,27 @@ from types import SimpleNamespace
 import pytest
 
 from risex_spread_shadow.hood_handoff import Outcome, load_saved_cycle_report, run_random_cycle
-from test_hood_fanout import FanoutVenue, fanout_config
+from test_hood_fanout import FanoutVenue, fanout_config, fanout_launcher
 from test_hood_handoff_random_cycle import AdvancingClock, FixedRng
 from risex_spread_shadow.hood_handoff.journal import DurableJournal, EXECUTION_DIAGNOSTICS
+
+
+async def test_legacy_saved_ws_default_launches_ack_without_rewriting_bound_inputs(tmp_path, monkeypatch, capsys):
+    cli, args, operator, calls = fanout_launcher(tmp_path, monkeypatch, [11, 22, 33], admission=(),
+        draw=(0, 2, 0, 0), rng=FixedRng(40, 20, 5))
+    saved = json.loads(args.config.read_text())
+    saved["receiver_admission"] = "ws_confirmed"
+    args.config.write_text(json.dumps(saved))
+    before = args.config.read_bytes()
+    config, _ = cli._validate_simple_local_inputs(saved, config_path=args.config, operator_dir=operator,
+        evidence_path=args.market_evidence, defer_incremental_margin_calculation=None)
+    assert config.receiver_admission == "ack"  # The controller uses this same local entry point.
+    assert await cli._run(args) == 0
+    assert calls["configs"] and all(c.receiver_admission == "ack" for c in calls["configs"])
+    assert args.config.read_bytes() == before and saved["receiver_admission"] == "ws_confirmed"
+    assert "Режим ACK" in capsys.readouterr().out
+    with pytest.raises(SystemExit):
+        cli._parser().parse_args(["simple", "--receiver-admission", "ws_confirmed"])
 
 
 async def test_exhausted_closing_preparation_releases_all_nonces_before_recovery(tmp_path, monkeypatch):
