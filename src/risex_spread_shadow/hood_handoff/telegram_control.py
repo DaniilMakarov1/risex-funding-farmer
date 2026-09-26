@@ -27,7 +27,7 @@ import aiohttp
 from .keychain import MacOSKeychainBackend, read_hidden_secret
 from .offline_report import load_saved_cycle_report
 from .operator_view import amount, read_lifecycle, read_launch_failure
-from .telegram_cards import live_steps, positions_text
+from .telegram_cards import live_steps, positions_text, wallet_selection_text
 from .operator_control import exclusive_lock
 from . import telegram_messages as views
 
@@ -158,6 +158,14 @@ class TelegramFailure(RuntimeError):
         super().__init__('Telegram transport unavailable')
 
 
+def recovery_record(proof):
+    """Saved summary of the latest readiness proof (no account payloads)."""
+    record = {k: proof.get(k) for k in ('status', 'at', 'previous_intents')}
+    if isinstance(proof.get('accounts'), list):
+        record['wallet_count'] = len(proof['accounts'])
+    return record
+
+
 def admission_failure_category(exc):
     from .contracts import PreflightBlocked
     if isinstance(exc, BlockingIOError):
@@ -167,13 +175,33 @@ def admission_failure_category(exc):
     if isinstance(exc, aiohttp.ClientConnectionError):
         return 'READ_CONNECTION'
     if isinstance(exc, PreflightBlocked):
-        from .operator_recovery import HistoryBoundExceeded
+        from .operator_recovery import HistoryBoundExceeded, WalletKeyMissing
+        from .wallet_pool import WalletPoolError
         if isinstance(exc, HistoryBoundExceeded):
             return 'HISTORY_LIMIT'
+        if isinstance(exc, WalletKeyMissing):
+            return 'WALLET_KEY_MISSING'
+        if isinstance(exc, WalletPoolError):
+            return 'WALLET_POOL'
         if str(exc) == 'positions remain; use /close before /run':
             return 'POSITIONS_REMAIN'
         return 'PREFLIGHT_REFUSED'
     return 'CHECK_FAILED'
+
+
+def close_members(started):
+    """Accounts a close covered: its pool when recorded, else its configured pair."""
+    binding = started.get('binding') if isinstance(started, dict) else None
+    wallets = started.get('wallets') if isinstance(started, dict) else None
+    if isinstance(wallets, dict):
+        groups = (wallets.get('active'), wallets.get('paused', []))
+        if all(isinstance(group, list) and all(type(i) is int for i in group) for group in groups):
+            return set(groups[0]) | set(groups[1])
+        return set()
+    if not isinstance(binding, dict):
+        return set()
+    pair = (binding.get('source_account_index'), binding.get('receiver_account_index'))
+    return set(pair) if all(type(index) is int for index in pair) else set()
 
 
 class Telegram:
@@ -231,6 +259,12 @@ class Controller:
         self._notice_queue = asyncio.Queue(maxsize=64)
         self._notice_task = None
 
+    def pooled(self):
+        """Display only: whether a wallet-pool file is present next to the config."""
+        from .wallet_pool import POOL_FILE_NAME
+        path = self.operator / POOL_FILE_NAME
+        return path.exists() or path.is_symlink()
+
     def slots(self, action='run'):
         prefix = 'close' if action == 'close' else 'cycle'
         return sorted((p.name for p in self.operator.glob(f'{prefix}-*') if p.is_dir()
@@ -286,12 +320,13 @@ class Controller:
             if first is None or first['event'] != 'CLOSE_STARTED':
                 continue
             close_binding = first['payload'].get('binding')
+            members = close_members(first['payload'])
             if (not isinstance(close_binding, dict)
                     or close_binding.get('market_id') != binding.get('market_id')
                     or close_binding.get('market_symbol') != binding.get('market_symbol')
                     or type(close_binding.get('source_account_index')) is not int
                     or type(close_binding.get('receiver_account_index')) is not int
-                    or {close_binding['source_account_index'], close_binding['receiver_account_index']} != set(accounts)):
+                    or not set(accounts) <= members):
                 continue
             started = first['at']
             if started <= terminal or selected is not None and started <= selected[0]:
@@ -300,11 +335,11 @@ class Controller:
             flat = False
             if isinstance(result, dict) and result.get('status') == 'CONFIRMED_FLAT' and result.get('symbol') == binding.get('market_symbol'):
                 positions = result.get('positions')
-                if isinstance(positions, list) and len(positions) == 2:
+                if isinstance(positions, list) and len(positions) == len(members):
                     try:
                         values = {row['account_index']: Decimal(row['position']) for row in positions
                                   if isinstance(row, dict) and type(row.get('account_index')) is int}
-                        flat = set(values) == set(accounts) and len(values) == 2 and all(
+                        flat = set(values) == members and len(values) == len(members) and all(
                             value.is_finite() and value == 0 for value in values.values())
                     except (KeyError, TypeError, ValueError, InvalidOperation):
                         pass
@@ -426,7 +461,9 @@ class Controller:
         if active is not None and self.task is not None and not self.task.done() and not self._runner_finished:
             added = sorted(set(self.slots(active.get('action', 'run'))) - set(active['before']))
             if active.get('action') == 'close' or active.get('phase') == 'AUTO_CLOSE':
-                return prefix + '<b>⏳ Закрытие позиций выполняется</b>\nПроверяю и закрываю остатки на двух настроенных счетах. /status — состояние'
+                return prefix + ('<b>⏳ Закрытие позиций выполняется</b>\nПроверяю и закрываю остатки '
+                                 + ('на всех кошельках пула' if self.pooled() else 'на двух настроенных счетах')
+                                 + '. /status — состояние')
             progress = read_lifecycle(self.operator / added[0] / 'cycle.jsonl') if len(added) == 1 else None
             return prefix + views.running_message(added, progress)
         blocked = active is not None
@@ -447,7 +484,11 @@ class Controller:
         failure_code = (read_launch_failure(self.operator / last['cycle'])
                         if isinstance(last.get('cycle'), str) else None)
         if failure_code is not None:
-            return prefix + views.launch_failure_message(last['cycle'], failure_code, blocked=blocked)
+            detail = None
+            if failure_code == 'WALLETS_UNAVAILABLE':
+                from .wallet_pool import read_selection
+                detail = wallet_selection_text(read_selection(self.operator / last['cycle']))
+            return prefix + views.launch_failure_message(last['cycle'], failure_code, blocked=blocked, detail=detail)
         report = self.report(last.get('cycle'))
         if report is None:
             return prefix + views.unavailable_message(blocked, last.get('status') == 'NOT_LAUNCHED')
@@ -532,7 +573,11 @@ class Controller:
             slot = self.operator / name if isinstance(name, str) and re.fullmatch(r'cycle-[0-9]+', name) else None
             code = read_launch_failure(slot) if slot is not None else None
             if code is not None:
-                return views.launch_failure_message(name, code)
+                detail = None
+                if code == 'WALLETS_UNAVAILABLE':
+                    from .wallet_pool import read_selection
+                    detail = wallet_selection_text(read_selection(slot))
+                return views.launch_failure_message(name, code, detail=detail)
             return cycle_card(card, self.report(name), None if slot is None or slot.is_symlink() else slot)
         except Exception:
             return cycle_card(card, None)
@@ -666,8 +711,7 @@ class Controller:
                 raise RuntimeError('next cycle close is unavailable')
             active['phase'] = 'AUTO_CLOSE'
             active['auto_close_before'] = self.slots('close')
-            self.store.data['last_recovery'] = {
-                k: proof.get(k) for k in ('status', 'at', 'previous_intents')}
+            self.store.data['last_recovery'] = recovery_record(proof)
             self.store.save()
             return
         self.queue_notice(self.cycle_notice(f'позиций нет ({positions_text(proof)}); подтверждаю готовность…', '✓'))
@@ -676,17 +720,24 @@ class Controller:
                 or any(position != 0 for position in self._exact_recovery_positions(ready))):
             raise RuntimeError('next cycle flatness is unproved')
         self.queue_notice(self.cycle_notice('счета готовы — запускаю цикл', '✓'))
-        self.store.data['last_recovery'] = {
-            k: ready.get(k) for k in ('status', 'at', 'previous_intents')}
+        self.store.data['last_recovery'] = recovery_record(ready)
         self.store.save()
 
     @staticmethod
     def _exact_recovery_positions(proof):
-        """Require finite exact positions and the validated no-order account shape."""
+        """Require finite exact positions and the validated no-order account shape.
+
+        A wallet-pool proof carries one row per pool wallet ('accounts'); every
+        wallet must be present exactly once and on the same market.
+        """
+        pooled = isinstance(proof, dict) and 'accounts' in proof
+        rows = proof.get('accounts') if pooled else [
+            proof.get(role) if isinstance(proof, dict) else None for role in ('source', 'receiver')]
+        if not isinstance(rows, list) or len(rows) < 2:
+            raise RuntimeError('current account proof is incomplete')
         positions = []
         identities = []
-        for role in ('source', 'receiver'):
-            row = proof.get(role) if isinstance(proof, dict) else None
+        for row in rows:
             if (not isinstance(row, dict) or type(row.get('account_index')) is not int
                     or type(row.get('market_id')) is not int or row.get('active_orders') != []
                     or row.get('authorized') is not True or row.get('ready') is not True
@@ -700,8 +751,15 @@ class Controller:
                 raise RuntimeError('current position is invalid')
             positions.append(position)
             identities.append((row['account_index'], row['market_id']))
-        if identities[0][0] == identities[1][0] or identities[0][1] != identities[1][1]:
+        accounts = [index for index, _ in identities]
+        if len(set(accounts)) != len(accounts) or len({market for _, market in identities}) != 1:
             raise RuntimeError('current account identities conflict')
+        if pooled:
+            wallets = proof.get('wallets')
+            members = (wallets.get('active'), wallets.get('paused')) if isinstance(wallets, dict) else (None, None)
+            if (not all(isinstance(group, list) for group in members)
+                    or sorted(members[0] + members[1]) != sorted(accounts)):
+                raise RuntimeError('current account proof does not cover the wallet pool')
         return positions
 
     async def _close_before_run(self):
@@ -722,7 +780,7 @@ class Controller:
         if (not isinstance(proof, dict) or proof.get('status') != 'READY'
                 or any(position != 0 for position in self._exact_recovery_positions(proof))):
             raise RuntimeError('fresh post-close flatness is unproved')
-        self.store.data['last_recovery'] = {k: proof.get(k) for k in ('status', 'at', 'previous_intents')}
+        self.store.data['last_recovery'] = recovery_record(proof)
         active['phase'] = 'RUN'
         active['auto_close_slot'] = added[0]
         if 'series_precloses' in active and added[0] not in active['series_precloses']:
@@ -737,7 +795,7 @@ class Controller:
         expected = 'READY' if require_flat else 'CLOSE_READY'
         if not isinstance(proof, dict) or proof.get('status') != expected:
             raise RuntimeError('current readiness is unproved')
-        self.store.data['last_recovery'] = {k: proof.get(k) for k in ('status', 'at', 'previous_intents')}
+        self.store.data['last_recovery'] = recovery_record(proof)
         self.store.data['active'] = None
         self.store.save()
         return True
@@ -757,7 +815,8 @@ class Controller:
             if self.recovery is not None:
                 if action == 'run' and self.close is not None:
                     stage = 'CLOSE_READY'
-                    self.queue_notice(self.step_notice('проверяю позиции и старые ордера на обоих счетах…'))
+                    self.queue_notice(self.step_notice('проверяю позиции и старые ордера '
+                                                       + ('на всех кошельках пула…' if self.pooled() else 'на обоих счетах…')))
                     proof = await self.recovery(require_flat=False)
                     if not isinstance(proof, dict) or proof.get('status') != 'CLOSE_READY':
                         raise RuntimeError('pre-cycle close readiness is unproved')
@@ -772,8 +831,7 @@ class Controller:
                         self.queue_notice(self.step_notice(
                             f'есть позиции: {positions_text(proof)} — перед циклом закрою их reduce-only', '⚠️'))
                         auto_close_before = self.slots('close')
-                        self.store.data['last_recovery'] = {
-                            k: proof.get(k) for k in ('status', 'at', 'previous_intents')}
+                        self.store.data['last_recovery'] = recovery_record(proof)
                 else:
                     stage = 'READY' if action == 'run' else 'CLOSE_READY'
                     self.queue_notice(self.step_notice('проверяю счета…'))
@@ -966,7 +1024,7 @@ async def serve(args, store, lock_fd, token):
                 defer_incremental_margin_calculation=None)
         except SystemExit:
             raise RuntimeError('account configuration unavailable') from None
-        return await read_accounts(account_config)
+        return await read_accounts(account_config, operator=config.parent)
 
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=40)) as session:
         api = Telegram(session, token)

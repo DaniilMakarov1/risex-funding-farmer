@@ -1,3 +1,19 @@
+## Many wallets: a random pair every cycle (`./wallet`)
+
+By default the system trades the two accounts in `random-cycle.json`. To add more wallets, run in the project folder on the Mac (never in Telegram):
+
+```bash
+./wallet add 12345          # asks for wallet 12345's API private key (hidden input)
+./wallet list               # pool, paused wallets and whether each key is stored
+./wallet pause 12345        # stop choosing it; it is still checked and closed
+./wallet resume 12345
+./wallet add 12345 --replace-key
+```
+
+`add` checks the key with one read-only request before saving it to Keychain and refuses the wallet if it holds a BTC position or open BTC orders (close them yourself first) or if the key does not work. The key must be registered for API key index 4, the same as the current accounts. The first `add` creates `wallets.json` next to `random-cycle.json` with the two current accounts plus the new one. No controller restart is needed; the next check uses the new pool.
+
+Every cycle then draws two different ready wallets with equal probability and, as before, which one posts the limit and the direction. A wallet is skipped (and listed in Telegram) when its balance is below the minimum order at 4x plus fees and the 0.10 reserve, when it has a BTC position, when its key is missing or when it cannot be read; with fewer than two ready wallets the cycle does not start. `/run` checks, `/close` and `/accounts` cover every wallet in the pool, including paused ones, so do not trade pool wallets by hand. Each extra wallet adds two account reads to each readiness check and one to each cycle start.
+
 ## Telegram messages: one card per cycle
 
 A series produces one short acceptance, a brief message for every step (account checks and positions found, launch, selection, leverage, each LIMIT/MARKET attempt, hold end, residual closure, stops), one card after each cycle and one final summary. The card shows the result (✅ paired, 🟡 closed but pair incomplete, ⛔ needs checking), BTC size and two-account turnover in USD, whether each phase was filled between our own accounts (🤝), by external accounts (👥, with their IDs) or mixed (🔀), LIMIT→MARKET time, how long preparation/hold/closing took, PnL and fees, and the pause before the next cycle. Robinhood charges 0% (owner-confirmed) and its trade receipts carry no fee, so when every fill of a settled cycle has an empty fee the card shows fees 0 and PnL after fees equal to gross, marked "тариф биржи 0%". Any nonzero fee value keeps fees unknown. While a cycle runs, brief steps arrive in real time: start, "открываю" (LIMIT accepted), "открыто" (own or external fills and LIMIT→MARKET time), "закрываю", "закрыто", plus waiting for spread, HTTP 429 cooldown, size reduction and residual closure. Use `/status` for live progress and `/report` for details; both are unchanged. Messages are rendered by the controller in the background and add no work to order sending.

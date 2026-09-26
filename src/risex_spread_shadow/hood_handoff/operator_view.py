@@ -16,6 +16,7 @@ LAUNCH_FAILURE_CODES = frozenset({
     'PRIOR_LEVERAGE_UNRESOLVED', 'PRIOR_ORDER_UNRESOLVED',
     'CREDENTIAL_UNAVAILABLE', 'PREFLIGHT_REFUSED',
     'PREPARATION_UNAVAILABLE', 'HISTORY_LIMIT',
+    'WALLETS_UNAVAILABLE', 'WALLET_POOL',
 })
 
 
@@ -420,8 +421,19 @@ def close_result_lines(result):
     result = mapping(result)
     label = {'CONFIRMED_FLAT': '✅ Позиции закрыты', 'PARTIAL': '⚠️ Остался незакрытый объём'}.get(result.get('status'), '❔ Закрытие не подтверждено')
     lines = [label, f'Проверка: {timestamp(result.get("at"))}.']
-    for row in result.get('positions', [])[:2]:
-        lines.append(position_line(row.get('account_index'), row.get('position'), result.get('symbol', '')))
+    positions = [mapping(row) for row in result.get('positions', [])] if isinstance(result.get('positions'), list) else []
+    if len(positions) <= 2:
+        for row in positions:
+            lines.append(position_line(row.get('account_index'), row.get('position'), result.get('symbol', '')))
+    else:
+        # Wallet pool: every non-zero or unknown position, then the zero count.
+        shown = [row for row in positions if number(row.get('position')) != 0][:10]
+        for row in shown:
+            lines.append(position_line(row.get('account_index'), row.get('position'), result.get('symbol', '')))
+        zero = sum(number(row.get('position')) == 0 for row in positions)
+        hidden = len(positions) - len(shown) - zero
+        lines.append(f'Кошельков в пуле: {len(positions)}; с нулевой позицией: {zero}'
+                     + (f'; ещё не показано: {hidden}' if hidden else '') + '.')
     attempts = result.get('attempts', [])
     fees = [number(a.get('fee_total')) for a in attempts]
     count = str(sum(a.get('attempted') is True for a in attempts)) if 'attempts' in result else 'неизвестно'

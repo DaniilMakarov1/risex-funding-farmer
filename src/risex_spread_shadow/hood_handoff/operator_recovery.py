@@ -20,7 +20,7 @@ from .random_cycle import RandomCycleEngine, _account_payload, _fallback_order_m
 from .readiness import ReadOnlyLighterSdkClient
 from .sdk import PlainAioHttp, _leverage_next_nonce, _leverage_tx_diagnostic, _leverage_tx_hash, _order_snapshot_mapping, _require_success_code
 from .telegram_accounts import missing_key
-from .wallet_pool import WalletPoolError, load_wallet_pool
+from .wallet_pool import load_wallet_pool
 
 SLOT = re.compile(r'(?:cycle|close)-[0-9]{3,}')
 INTENTS = {'SOURCE_DISPATCH_INTENT', 'RECEIVER_DISPATCH_INTENT', 'FALLBACK_DISPATCH_INTENT'}

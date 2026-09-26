@@ -193,7 +193,14 @@ def reason(value, limit=160):
 
 
 def positions_text(proof):
-    """Both accounts' current positions and active orders from a readiness proof."""
+    """Both accounts' current positions and active orders from a readiness proof.
+
+    A wallet-pool proof lists every wallet with a position or orders, then how
+    many other wallets are at zero.
+    """
+    rows = mapping(proof).get('accounts')
+    if isinstance(rows, list):
+        return _pool_positions_text(rows)
     parts = []
     for role in ('source', 'receiver'):
         row = mapping(mapping(proof).get(role))
@@ -210,6 +217,63 @@ def positions_text(proof):
             state += f', активных ордеров {len(orders)}'
         parts.append(f'счёт {account}: {state}')
     return '; '.join(parts)
+
+
+def _pool_positions_text(rows):
+    parts, zero = [], 0
+    for row in map(mapping, rows):
+        quantity = number(row.get('signed_position'))
+        orders = row.get('active_orders')
+        busy = isinstance(orders, list) and bool(orders)
+        if quantity == 0 and not busy:
+            zero += 1
+            continue
+        if quantity is None:
+            state = 'позиция неизвестна'
+        elif not quantity:
+            state = '0'
+        else:
+            state = f'{"LONG" if quantity > 0 else "SHORT"} {text(amount(abs(quantity)), 24)} BTC'
+        if busy:
+            state += f', активных ордеров {len(orders)}'
+        parts.append(f'счёт {text(row.get("account_index", "?"), 24)}: {state}')
+    if not parts:
+        return f'все {len(rows)} кошельков: 0'
+    shown = '; '.join(parts[:8]) + (f'; ещё {len(parts) - 8} с позициями' if len(parts) > 8 else '')
+    return shown + (f'; остальные {zero} — 0' if zero else '')
+
+
+def wallet_selection_text(record):
+    """One line about the per-cycle wallet draw saved in launch.json; display only."""
+    from .wallet_pool import SKIP_REASONS
+
+    record = mapping(record)
+    eligible, skipped, pair = record.get('eligible'), record.get('skipped'), record.get('pair')
+    if not isinstance(eligible, list) or not isinstance(skipped, list):
+        return None
+    reasons = '; '.join(f'{text(mapping(item).get("account_index", "?"), 24)} — '
+                        f'{SKIP_REASONS.get(mapping(item).get("reason"), "не готов")}' for item in skipped[:12])
+    if len(skipped) > 12:
+        reasons += f'; ещё {len(skipped) - 12}'
+    total = record.get('pool_size')
+    if isinstance(pair, list) and len(pair) == 2:
+        line = (f'кошельки: выбраны {text(pair[0], 24)} и {text(pair[1], 24)} из {len(eligible)} готовых'
+                + (f' (всего активных {text(total, 8)})' if total is not None else ''))
+    else:
+        line = f'кошельки: готовых {len(eligible)} из {text(total, 8)} — нужно минимум два, цикл не начат'
+    return line + (f'; пропущены: {reasons}' if reasons else '')
+
+
+def wallet_steps(slot):
+    """The wallet draw as one live step (key, at, icon, text)."""
+    from .wallet_pool import read_selection
+
+    record = read_selection(slot)
+    line = wallet_selection_text(record) if record is not None else None
+    if line is None:
+        return []
+    pair = record.get('pair')
+    return [('wallets', record['at'], '👛' if isinstance(pair, list) else '⛔', line)]
 
 
 PHASES = {'opening': 'открытие', 'closing': 'закрытие', 'PAIRED_OPENING': 'открытие', 'PAIRED_CLOSING': 'закрытие'}
@@ -289,7 +353,7 @@ def cycle_steps(slot):
 
 def live_steps(slot, progress=None):
     """Cycle and phase steps in journal-time order; display only."""
-    return sorted(cycle_steps(slot) + phase_notices(slot, progress), key=lambda step: step[1])
+    return sorted(wallet_steps(slot) + cycle_steps(slot) + phase_notices(slot, progress), key=lambda step: step[1])
 
 
 def phase_row(report, phase):

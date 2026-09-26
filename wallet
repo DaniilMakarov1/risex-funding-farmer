@@ -1,0 +1,19 @@
+#!/bin/sh
+set -eu
+
+project_root=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+cd "$project_root"
+python_bin="$project_root/.venv-hood/bin/python"
+if [ ! -f "$python_bin" ] || [ ! -x "$python_bin" ]; then
+    printf '%s\n' "Ошибка запуска: не найден исполняемый интерпретатор $python_bin." >&2
+    printf '%s\n' 'Создайте окружение .venv-hood и установите зависимости проекта, затем повторите запуск.' >&2
+    exit 2
+fi
+export RISEX_SPREAD_SHADOW_ROOT="$project_root"
+if [ -n "${PYTHONPATH-}" ]; then
+    export PYTHONPATH="$project_root/src:$PYTHONPATH"
+else
+    export PYTHONPATH="$project_root/src"
+fi
+
+exec "$python_bin" -m risex_spread_shadow.hood_handoff.wallets "$@"

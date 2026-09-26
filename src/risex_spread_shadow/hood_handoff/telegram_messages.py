@@ -28,12 +28,14 @@ def help_message():
             '<b>Просмотр</b>\n'
             '/status — краткое состояние\n'
             '/report — последний результат и наблюдения\n'
-            '/accounts — балансы и позиции на счетах\n'
+            '/accounts — балансы и позиции на счетах (всех кошельках пула)\n'
             '/help — эта инструкция\n\n'
             '<b>Запуск реальной торговли</b>\n'
             '<code>/run</code> — проверить позиции, при остатке один раз закрыть его reduce-only, '
             'подтвердить ноль и затем начать один Mainnet-цикл. '
-            'Первый счёт и сторона лимитки выбираются случайно: четыре равновероятных варианта. Объём и время удержания — по текущей конфигурации.\n\n'
+            'Первый счёт и сторона лимитки выбираются случайно: четыре равновероятных варианта. Объём и время удержания — по текущей конфигурации. '
+            'Если на компьютере создан пул кошельков (<code>./wallet add НОМЕР</code>), каждый цикл сначала случайно берёт два разных готовых кошелька; '
+            'неготовые (мало баланса, есть позиция, нет ключа) пропускаются и перечисляются, при менее чем двух готовых цикл не начинается.\n\n'
             '<code>/run ws 5</code> — ждать WS, улучшение на 5 тиков.\n'
             '<code>/run ack 5</code> — MARKET по ACK без ожидания LIMIT; проверка стакана остаётся.\n'
             '<code>/run ack 1 20</code> — двадцать циклов подряд: ACK, улучшение на 1 тик.\n'
@@ -41,7 +43,7 @@ def help_message():
             'Число циклов — любое положительное целое; без него запускается один. Режим и улучшение на 1–5 тиков '
             'действуют для каждого цикла серии и его парного закрытия. Следующий цикл требует '
             'завершённого результата, нулевых позиций и новой проверки; ошибка останавливает серию. В конце — результат каждого цикла и общий PnL; /report повторяет итог.\n\n'
-            '<code>/close</code> — проверить оба счёта и закрыть текущие позиции настроенного рынка MARKET reduce-only.\n\n'
+            '<code>/close</code> — проверить оба счёта (с пулом — все кошельки) и закрыть текущие позиции настроенного рынка MARKET reduce-only.\n\n'
             '<i>Если закрытие или повторная проверка не подтверждены, цикл не начнётся. '
             'После ошибки новая /run заново проверяет счета и старые ордера. '
             'После ручного закрытия постоянной блокировки нет. '
@@ -67,7 +69,7 @@ def accepted_message(number, series_total=1, details=None):
 
 def close_accepted_message(number):
     return (f'<b>📨 Команда /close принята</b> · <code>{text(number, 24)}</code>\n'
-            'Проверю оба счёта и закрою подтверждённые остатки reduce-only. '
+            'Проверю счета (с пулом — все кошельки) и закрою подтверждённые остатки reduce-only. '
             'Открытие нового цикла этой командой не запрашивается. /status — состояние.')
 
 
@@ -101,8 +103,11 @@ def execution_message(notice):
 def recovery_checkpoint(proof):
     if not isinstance(proof, dict) or proof.get('status') != 'READY' or timestamp(proof.get('at')) == 'нет данных':
         return ''
+    count = proof.get('wallet_count')
+    scope = (f'Все {text(count, 8)} кошельков пула были' if type(count) is int and count > 2
+             else 'Оба счёта были')
     return (f'<b>Последняя сверка: {timestamp(proof["at"])}</b>\n'
-            'Оба счёта были без позиций и активных ордеров; старый запрет снят. '
+            f'{scope} без позиций и активных ордеров; старый запрет снят. '
             'Новая команда проверит состояние снова.\n\n')
 
 
@@ -138,7 +143,7 @@ def unavailable_message(blocked=False, not_launched=False):
             ('Следующая /run проверит текущую готовность; /close — закрыть остаток.' if blocked else '/status — состояние контроллера'))
 
 
-def launch_failure_message(name, code, *, blocked=False):
+def launch_failure_message(name, code, *, blocked=False, detail=None):
     reasons = {
         'PRIOR_LEVERAGE_UNRESOLVED': 'Прежняя настройка плеча ещё не сверена.',
         'PRIOR_ORDER_UNRESOLVED': 'Прежняя заявка ещё не сверена.',
@@ -146,10 +151,14 @@ def launch_failure_message(name, code, *, blocked=False):
         'PREFLIGHT_REFUSED': 'Проверка готовности отказала до начала цикла.',
         'PREPARATION_UNAVAILABLE': 'Подготовка запуска завершилась ошибкой.',
         'HISTORY_LIMIT': 'История журналов превысила предел проверки.',
+        'WALLETS_UNAVAILABLE': 'Готовых кошельков меньше двух — ордера не отправлялись.',
+        'WALLET_POOL': 'Файл пула кошельков некорректен; проверь его командой ./wallet list на компьютере.',
     }
     reason = reasons.get(code)
     if reason is None:
         return unavailable_message(blocked)
+    if detail:
+        reason += '\n' + text(detail, 700)
     return (f'<b>Цикл {text(name, 32)} не начался</b>\n{reason} '
             'Журнал цикла не создан; исполнение и текущие позиции этим слотом не доказаны. '
             'Автоматического повтора нет. /accounts — проверить текущие счета; '
@@ -178,11 +187,58 @@ def later_close_message(name, at, flat):
             '/accounts — проверить сейчас.')
 
 
+POOL_ACCOUNT_LINES = 40
+
+
+def _pool_accounts_message(result):
+    symbol = text(result['symbol'], 24)
+    wallets = mapping(result.get('wallets'))
+    paused = set(wallets.get('paused') or [])
+    rows = result['accounts']
+    lines, quiet = [], 0
+    # Wallets needing attention first; the message stays within Telegram's bound.
+    ordered = sorted(rows, key=lambda row: (row['snapshot'] is not None and not row['stale']
+                                            and row['snapshot'].signed_position == 0
+                                            and not row['snapshot'].active_orders and row['snapshot'].ready))
+    for row in ordered:
+        snapshot = row['snapshot']
+        mark = ' ⏸' if row['index'] in paused else ''
+        head = f'• <code>{text(row["index"], 24)}</code>{mark}'
+        if snapshot is None:
+            line = head + ' · ❔ нет данных'
+        else:
+            balance = snapshot.available_balance
+            position = snapshot.signed_position
+            line = (head + ' · ' + (text(format(balance, 'f'), 32) if balance is not None else 'баланс ?')
+                    + (' · позиция 0' if position == 0 else
+                       f' · {"LONG" if position > 0 else "SHORT"} {text(format(abs(position), "f"), 32)}'))
+            if snapshot.active_orders:
+                line += f' · ордеров {len(snapshot.active_orders)}'
+            if row['stale']:
+                line += ' · ⚠️ устарело'
+            if not snapshot.ready:
+                line += ' · ⚠️ не активен'
+        if len(lines) < POOL_ACCOUNT_LINES:
+            lines.append(line)
+        else:
+            quiet += 1
+    header = [f'<b>💼 Кошельки пула: {len(rows)}</b> · рынок <code>{symbol}</code>',
+              f'активных {len(rows) - len(paused)}' + (f', на паузе {len(paused)} (⏸)' if paused else '')
+              + ' · баланс — доступный, валюта котировки']
+    tail = [f'… и ещё {quiet} кошельков (без проблем в начале списка).'] if quiet else []
+    return '\n'.join(header + [''] + lines + tail + [
+        '', '<i>Доступный баланс не равен полной стоимости счёта. Снимки получены отдельно и могут измениться; '
+            'другие рынки не проверены. Проверка не снимает блокировку запуска.</i>',
+        '/accounts — обновить · /help — команды'])
+
+
 def accounts_message(result):
     if result is None:
         return ('<b>❔ Счета недоступны</b>\n'
                 'Не удалось получить данные. Проверь локальную конфигурацию, '
                 'сохранённые ключи и соединение. Повторить: /accounts')
+    if 'wallets' in result:
+        return _pool_accounts_message(result)
     symbol = text(result['symbol'], 24)
     lines = ['<b>💼 Балансы и позиции</b>',
              f'Рынок позиций и ордеров: <code>{symbol}</code>']
@@ -220,6 +276,9 @@ def admission_refusal_message(record):
                'READ_CONNECTION': 'Не удалось получить данные по соединению.',
                'PREFLIGHT_REFUSED': 'Проверка безопасности не подтвердила готовность.',
                'HISTORY_LIMIT': 'История журналов превысила предел проверки; нужна правка ограничения, повтор не поможет.',
+               'WALLET_KEY_MISSING': 'Для кошелька из пула нет сохранённого ключа. На компьютере: ./wallet list — проверить, '
+                                     './wallet add НОМЕР — добавить ключ.',
+               'WALLET_POOL': 'Файл пула кошельков некорректен. На компьютере: ./wallet list — проверить.',
                'CHECK_FAILED': 'Проверка не завершилась; требуется повторная сверка.'}
     stage = record.get('stage') if isinstance(record.get('stage'), str) else None
     category = record.get('category') if isinstance(record.get('category'), str) else 'CHECK_FAILED'

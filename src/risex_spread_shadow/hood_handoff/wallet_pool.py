@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
-from decimal import Decimal, InvalidOperation, ROUND_CEILING
+from decimal import Decimal, ROUND_CEILING
 import json
 import math
 import os
@@ -27,7 +27,7 @@ from pathlib import Path
 import random
 import stat
 import time
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any, Callable, Sequence
 import uuid
 
 from .contracts import ContractError, PreflightBlocked
@@ -257,16 +257,6 @@ def draw_pair(eligible: Sequence[int], rng: Any = None) -> tuple[int, int]:
     if second >= first:
         second += 1
     return ordered[first], ordered[second]
-
-
-def _decimal(value: Any, name: str) -> Decimal:
-    try:
-        result = Decimal(str(value))
-    except (InvalidOperation, ValueError, TypeError):
-        raise ContractError(f"{name} is not numeric") from None
-    if not result.is_finite():
-        raise ContractError(f"{name} is not finite")
-    return result
 
 
 async def select_wallet_pair(

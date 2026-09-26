@@ -176,7 +176,9 @@ async def test_serve_accounts_bound_configuration(tmp_path, monkeypatch, changed
         async def __aenter__(self): return self
         async def __aexit__(self, *a): pass
     inspected = await inspect()
-    async def read(c):
+    async def read(c, *, operator):
+        # The controller passes its operator directory so a wallet pool is read.
+        assert operator == path.parent
         reads.append(c)
         return inspected
     real = bot.Controller
