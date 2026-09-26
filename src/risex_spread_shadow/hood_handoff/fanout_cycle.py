@@ -135,6 +135,20 @@ def fanout_quantity_floor(receiver_count: int, part_minimum_tick: int) -> int:
     return _ceil(Decimal(receiver_count * part_minimum_tick) * FANOUT_SIZE_MARGIN)
 
 
+def select_fanout_route(source: int, receivers: Sequence[int], rng: Any = None) -> tuple[dict[str, Any], list[int]]:
+    """The drawn roles plus a uniform direction: (route for the slot, receivers 2..k).
+
+    ``direction`` names the receivers' exposure, as for a 1 -> 1 route.
+    """
+    import random
+
+    if len(receivers) < 2:
+        raise ContractError("fan-out route needs at least two receivers")
+    draw = _draw_integer(random.SystemRandom() if rng is None else rng, 0, 1, "fan-out direction")
+    return ({"source_account_index": source, "receiver_account_index": receivers[0],
+             "direction": "LONG" if draw == 0 else "SHORT"}, list(receivers[1:]))
+
+
 def _account_cap_tick(metadata: MarketMetadata, account: AccountSnapshot, *, label: str,
                       price: Decimal, worst_price: Decimal, side: str, reserve: Decimal,
                       step: Decimal, minimum_fraction: int) -> int:
@@ -901,6 +915,9 @@ class FanoutCycleEngine(RandomCycleEngine):
         parts = list(selection.receiver_part_ticks)
         if any(part < fresh.part_minimum_tick for part in parts):
             raise PreflightBlocked("a fan-out part no longer meets a fresh venue minimum")
+        # The owner's rule holds at dispatch too: the LIMIT keeps k fresh minimums plus 10 %.
+        if selection.quantity_tick < fresh.quantity.lower_tick:
+            raise PreflightBlocked("the LIMIT no longer holds every receiver's venue minimum plus 10 %")
         over_cap = (selection.quantity_tick > fresh.quantity.upper_tick
                     or any(part > cap for part, cap in zip(parts, fresh.receiver_cap_ticks)))
         if failures or over_cap:
@@ -929,7 +946,8 @@ class FanoutCycleEngine(RandomCycleEngine):
                     if cut > 0:
                         new_parts[index] -= cut
                         excess -= cut
-                if excess <= 0 and all(part >= fresh.part_minimum_tick for part in new_parts):
+                if (excess <= 0 and all(part >= fresh.part_minimum_tick for part in new_parts)
+                        and sum(new_parts) >= fresh.quantity.lower_tick):
                     total = sum(new_parts)
                     if total < selection.quantity_tick:
                         resized = replace(selection, quantity=total * step, quantity_tick=total,

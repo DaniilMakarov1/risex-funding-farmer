@@ -1,3 +1,13 @@
+## `/run`: one LIMIT filled by one or by several MARKETs
+
+After `/run` the bot first asks the mode with two buttons: "1 LIMIT → 1 MARKET" (the usual cycle) or "1 LIMIT → несколько MARKET". Then it asks the number of cycles as before; each question waits 5 minutes. The chosen mode applies to every cycle of that series (ACK, +1 tick). A number sent instead of pressing a mode button starts nothing; the bot asks for the button again. The typed forms `/run ack 1 20`, `/run ws 5 3` and `/run 20` stay 1 LIMIT → 1 MARKET and ask nothing.
+
+In "несколько MARKET" every cycle draws, among the ready pool wallets, one wallet for the LIMIT and from 2 up to "all ready wallets except that one" wallets for the MARKETs (at random, limited by what the LIMIT wallet can fund). The LIMIT holds at least one venue-minimum order per MARKET wallet plus 10 % (0.00044 BTC for two MARKET wallets at today's 0.0002 BTC minimum) and is split at random between the MARKET wallets, each part at least one minimum order. All MARKETs are sent at the same moment. If our own wallets matched only part of the LIMIT, everything is closed reduce-only at once, without the hold (🟡, as today). The mode needs `wallets.json` with at least three ready wallets; otherwise the cycle does not start and Telegram says why. Cards and steps list every wallet with its part, and the series and 24-hour totals include all of them ("Оборот всех счетов").
+
+Two limits to know: if the exchange's answer for one MARKET is unknown or that order cannot be proved (for example, it was rejected), the cycle stops without automatic closing, exactly as a 1 → 1 cycle does; use `/accounts` and `/close`. And because each part is close to the minimum order, a partial fill by outside traders can leave a remainder below the minimum on one wallet more often than before; the bot cannot close such a remainder with a reduce-only order and reports it (⛔, the next `/run` refuses until it is gone).
+
+From the terminal: `./start --receiver-admission ack --price-improvement-ticks 1 --fanout` (the mode works only with ACK or WS admission).
+
 ## Telegram menu: `/run` asks how many cycles, `/report` is the last 24 hours
 
 The buttons under the chat now follow what the bot is doing. When nothing runs you see `/run`, `/close`, `/report` and `/accounts`; while a check, cycle, series, pause, close or stop runs you see `/stop`, `/report` and `/accounts`. `/status` and `/help` are gone (the bot answers them like an unknown command and lists the commands).

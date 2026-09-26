@@ -113,11 +113,12 @@ def _safe_projection(item: Mapping[str, object], context: Mapping[str, object] |
 class StreamEvidenceJournal:
     """One nonblocking producer and one background durable writer."""
 
-    def __init__(self, path: Path, *, market_id: int, accounts: tuple[int, int],
+    def __init__(self, path: Path, *, market_id: int, accounts: tuple[int, ...],
                  max_records: int = 512, queue_size: int = 64) -> None:
+        # Two accounts for 1 -> 1; up to 17 for a fan-out cycle (source + 16 receivers).
         if (type(market_id) is not int or market_id <= 0
-                or type(accounts) is not tuple or len(accounts) != 2
-                or len(set(accounts)) != 2
+                or type(accounts) is not tuple or not 2 <= len(accounts) <= 17
+                or len(set(accounts)) != len(accounts)
                 or any(type(account) is not int or account <= 0 for account in accounts)
                 or type(max_records) is not int or not 1 <= max_records <= 512
                 or type(queue_size) is not int or not 1 <= queue_size <= 64):

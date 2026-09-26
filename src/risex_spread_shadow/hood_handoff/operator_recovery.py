@@ -24,6 +24,9 @@ from .wallet_pool import load_wallet_pool
 
 SLOT = re.compile(r'(?:cycle|close)-[0-9]{3,}')
 INTENTS = {'SOURCE_DISPATCH_INTENT', 'RECEIVER_DISPATCH_INTENT', 'FALLBACK_DISPATCH_INTENT'}
+# Fan-out receivers 2..16 (owner request 2026-09-26) are creation intents too.
+FANOUT_RECEIVER_INTENT = re.compile(r'RECEIVER_(?:[2-9]|1[0-6])_DISPATCH_INTENT')
+FANOUT_RECEIVER_LEGS = tuple(f'receiver_{position}' for position in range(2, 17))
 # Per-slot trading journals keep the original strict bound.  The shared
 # append-only recovery journal grows with every readiness check across all
 # series, so it has its own (still finite) bound; rows are streamed one line at
@@ -334,7 +337,7 @@ def prior_intents(operator, config, indices=None):
                             or payload.get('fraction_bps') != item['fraction_bps']):
                         raise PreflightBlocked('historical leverage setting result conflicts with intent')
                     item['resolved'] = True
-                elif event in INTENTS:
+                elif event in INTENTS or FANOUT_RECEIVER_INTENT.fullmatch(event):
                     plan = OrderPlan(**payload['plan'])
                     if plan.account_index not in indices or plan.market_id != config.market_id:
                         raise PreflightBlocked('historical intent account/market differs')
@@ -355,7 +358,7 @@ def prior_intents(operator, config, indices=None):
                 elif event in {'COMPLETE', 'FALLBACK_ATTEMPT_EVIDENCE'}:
                     receipt = payload.get('receipt') or {}
                     candidates = [payload.get('order')] if event == 'FALLBACK_ATTEMPT_EVIDENCE' else [
-                        (receipt.get(leg) or {}).get('order') for leg in ('source', 'receiver')]
+                        (receipt.get(leg) or {}).get('order') for leg in ('source', 'receiver', *FANOUT_RECEIVER_LEGS)]
                     for value in candidates:
                         if value is None:
                             continue

@@ -337,7 +337,7 @@ class Controller:
         self._stop_event = None
         self._pending_card = None
         self._send_lock = None
-        # Unanswered bare /run ({'update_id', 'at'}); never persisted.
+        # Unanswered bare /run ({'update_id', 'at', 'stage': 'mode'|'count', 'fanout'}); never persisted.
         self._count_prompt = None
         self.now = now
         self.started = now()
@@ -397,8 +397,10 @@ class Controller:
                 or not isinstance(terminal, (int, float)) or not math.isfinite(terminal)
                 or not isinstance(binding, dict)):
             return None
-        accounts = (binding.get('source_account_index'), binding.get('receiver_account_index'))
-        if not all(type(index) is int for index in accounts) or accounts[0] == accounts[1]:
+        extras = binding.get('extra_receiver_account_indices', [])
+        accounts = (binding.get('source_account_index'), binding.get('receiver_account_index'),
+                    *(extras if isinstance(extras, list) else [None]))
+        if not all(type(index) is int for index in accounts) or len(set(accounts)) != len(accounts):
             return None
         selected = None
         for name in self.slots('close'):
@@ -1221,7 +1223,7 @@ class Controller:
             return
         command = message.get('text')
         if isinstance(command, str) and not command.startswith('/'):
-            await self._answer_count(uid, command)
+            await self._answer_prompt(uid, command)
             return
         if isinstance(command, str) and command not in ('/report', '/accounts'):
             self._count_prompt = None  # Any other command cancels an unanswered /run question.
@@ -1252,36 +1254,52 @@ class Controller:
         elif explicit is not None:
             await self._start(uid, 'run', *explicit)
         elif command == '/run':
-            await self._ask_count(uid)
+            await self._ask_mode(uid)
         elif command == '/close':
             await self._start(uid, 'close', {}, 1)
         elif isinstance(command, str):
             await self.notify(views.unknown_message())
 
-    async def _ask_count(self, uid):
-        """Bare /run means ACK with one tick; the owner answers with the number of cycles."""
+    async def _ask_mode(self, uid):
+        """Bare /run means ACK with one tick; the owner picks the mode, then the number of cycles."""
         if (self.task is not None and not self.task.done()
                 or self.recovery is None and self.store.data['active'] is not None):
             await self.notify(views.blocked_message())
             return
-        self._count_prompt = {'update_id': uid, 'at': self.now()}
-        await self.notify(views.count_prompt_message(COUNT_PROMPT_SECONDS // 60), views.COUNT_PROMPT)
+        self._count_prompt = {'update_id': uid, 'at': self.now(), 'stage': 'mode'}
+        await self.notify(views.mode_prompt_message(COUNT_PROMPT_SECONDS // 60), views.MODE_PROMPT)
 
-    async def _answer_count(self, uid, text):
+    async def _answer_prompt(self, uid, text):
         """A plain owner message answers an open /run question; nothing else launches."""
         prompt, self._count_prompt = self._count_prompt, None
-        number = re.fullmatch(r'\s*([1-9][0-9]*)\s*', text) if len(text) <= 4096 else None
+        bounded = len(text) <= 4096
+        number = re.fullmatch(r'\s*([1-9][0-9]*)\s*', text) if bounded else None
+        mode = views.mode_answer(text) if bounded else None
         if prompt is None:
-            await self.notify(views.count_without_prompt_message() if number else views.unknown_message())
+            await self.notify(views.count_without_prompt_message() if number or mode is not None
+                              else views.unknown_message())
             return
         if not 0 <= self.now() - prompt['at'] <= COUNT_PROMPT_SECONDS:
             await self.notify(views.count_expired_message(COUNT_PROMPT_SECONDS // 60))
+            return
+        if prompt['stage'] == 'mode':
+            if mode is None:
+                self._count_prompt = prompt  # Still waiting for the mode.
+                await self.notify(views.mode_invalid_message(), views.MODE_PROMPT)
+                return
+            # The count question has its own full answer window.
+            self._count_prompt = {'update_id': prompt['update_id'], 'at': self.now(),
+                                  'stage': 'count', 'fanout': mode}
+            await self.notify(views.count_prompt_message(COUNT_PROMPT_SECONDS // 60, mode), views.COUNT_PROMPT)
             return
         if number is None:
             self._count_prompt = prompt  # Still waiting for a number.
             await self.notify(views.count_invalid_message(), views.COUNT_PROMPT)
             return
-        await self._start(uid, 'run', dict(ACK_ONE_TICK), int(number[1]))
+        options = dict(ACK_ONE_TICK)
+        if prompt['fanout']:
+            options['fanout'] = True
+        await self._start(uid, 'run', options, int(number[1]))
 
     async def _start(self, uid, action, launch_options, series_total):
         """Admit one owner /run or /close; the check and the operation run in a task."""
@@ -1316,6 +1334,9 @@ class Controller:
             details += f' · +{views.text(ticks, 8)} тик' if ticks is not None else ' · старое правило цены'
         except Exception:
             details = None
+        if action == 'run':
+            mode = views.mode_label(launch_options.get('fanout') is True)
+            details = f'{details} · {mode}' if details else mode
         await self.notify(views.accepted_message(uid, series_total, details)
                           if action == 'run' else views.close_accepted_message(uid))
 
@@ -1332,7 +1353,7 @@ async def serve(args, store, lock_fd, token):
     evidence = _simple_evidence_path(_load_json(config, "controller config"), config.parent, None)
     initial_evidence = evidence.read_bytes()
 
-    async def launch(action='simple', *, receiver_admission=None, price_improvement_ticks=None):
+    async def launch(action='simple', *, receiver_admission=None, price_improvement_ticks=None, fanout=False):
         if config.read_bytes() != initial_config or evidence.read_bytes() != initial_evidence:
             raise RuntimeError('configuration changed; restart controller after local review')
         # Fixed executable/arguments, no shell and no user-supplied command text.
@@ -1350,6 +1371,10 @@ async def serve(args, store, lock_fd, token):
             if type(price_improvement_ticks) is not int or not 1 <= price_improvement_ticks <= 5:
                 raise RuntimeError('invalid tick override')
             flags += ['--price-improvement-ticks', str(price_improvement_ticks)]
+        if fanout is not False:
+            if fanout is not True or action != 'simple':
+                raise RuntimeError('invalid fan-out override')
+            flags.append('--fanout')
         process = await asyncio.create_subprocess_exec(
             str(python), '-m', 'risex_spread_shadow.hood_handoff.cli', action,
             '--keychain', '--no-progress', '--config', str(config), *flags, cwd=str(root), env=env,

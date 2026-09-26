@@ -155,6 +155,8 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--receiver-admission", choices=("ws_confirmed", "ack"), help="simple: MARKET after exact WS or experimental positive ACK")
     parser.add_argument("--price-improvement-ticks", type=int, choices=range(1, 6), help="simple: exact improvement, skip when spread is too narrow")
+    parser.add_argument("--fanout", action="store_true",
+                        help="simple: one LIMIT filled by 2..(ready wallets - 1) MARKETs from the wallet pool")
     parser.add_argument("--config", type=Path, help="JSON operator configuration; all numerical bounds are required")
     parser.add_argument("--market-evidence", type=Path, help="JSON current orderBookDetails/fee/margin evidence")
     parser.add_argument("--source-account-index", type=int)
@@ -875,6 +877,7 @@ def _print_simple_summary(
     operator_dir: Path,
     *,
     use_keychain: bool,
+    fanout: bool = False,
 ) -> None:
     symbol = str(value.get("market_symbol", value.get("symbol", "?"))).upper()
     source = value.get("source_account_index", "?")
@@ -883,7 +886,11 @@ def _print_simple_summary(
     print(f"\n══ НОВЫЙ ЦИКЛ · {symbol} · Robinhood Chain Mainnet ══")
     print(f"Один реальный Robinhood Chain Mainnet цикл: {symbol}; первый счёт и сторона лимитки случайны.")
     pool_line = _pool_summary_line(value, operator_dir)
-    if pool_line is None:
+    if fanout:
+        print(f"{pool_line or 'Пул кошельков не настроен; режим недоступен.'} Режим 1 LIMIT → несколько MARKET: "
+              "источник лимитки и 2..(готовые − 1) получателей выбираются случайно; объём лимитки — не меньше "
+              "минимального ордера на каждого получателя +10%, делится между ними случайно.")
+    elif pool_line is None:
         print(f"Счета: {source} и {receiver}; каждый может первым выставить BUY или SELL (четыре равновероятных варианта).")
     else:
         print(f"{pool_line} Два разных кошелька выбираются случайно из готовых (баланса хватает, позиции нет); "
@@ -1453,6 +1460,7 @@ async def _run_simple(args: argparse.Namespace) -> int:
         config_path,
         operator_dir,
         use_keychain=args.keychain or args.keychain_replace,
+        fanout=getattr(args, "fanout", False),
     )
     if not _simple_confirmation():
         return 0
@@ -1505,8 +1513,9 @@ class _NoSigningSecrets:
         return None
 
 
-async def _select_pool_wallets(base_config: Any, evidence: Mapping[str, Any], pool: Any) -> dict[str, Any]:
-    """Read each active wallet publicly and draw one uniform eligible pair."""
+async def _select_pool_wallets(base_config: Any, evidence: Mapping[str, Any], pool: Any,
+                              *, fanout: bool = False) -> dict[str, Any]:
+    """Read each active wallet publicly and draw one uniform eligible pair (or a fan-out)."""
 
     from .telegram_accounts import missing_key
     from .wallet_pool import select_wallet_pair
@@ -1521,7 +1530,8 @@ async def _select_pool_wallets(base_config: Any, evidence: Mapping[str, Any], po
             secrets=_NoSigningSecrets(),
             market_evidence=evidence,
         )
-        return await select_wallet_pair(base_config, pool, reader, has_key=keys.has_stored_credential)
+        return await select_wallet_pair(base_config, pool, reader, has_key=keys.has_stored_credential,
+                                        **({"fanout": True} if fanout else {}))
     finally:
         try:
             if reader is not None:
@@ -1536,6 +1546,11 @@ def _pool_failure_text(exc: BaseException, selection: Mapping[str, Any] | None) 
     if isinstance(exc, WalletsUnavailable) and isinstance(selection, Mapping):
         skipped = ", ".join(f"{item.get('account_index')} — {SKIP_REASONS.get(item.get('reason'), '?')}"
                             for item in selection.get("skipped", [])[:20])
+        if selection.get("mode") == "fanout":
+            fanout = selection.get("fanout") if isinstance(selection.get("fanout"), Mapping) else {}
+            return (f"для режима «несколько MARKET» нужен источник с балансом на лимитку из двух минимальных "
+                    f"ордеров +10% и ещё минимум два готовых кошелька (готовы {len(fanout.get('receiver_ready', []))} "
+                    f"из {selection.get('pool_size')})" + (f"; пропущены: {skipped}" if skipped else ""))
         return (f"готовых кошельков меньше двух ({len(selection.get('eligible', []))} из "
                 f"{selection.get('pool_size')})" + (f"; пропущены: {skipped}" if skipped else ""))
     if isinstance(exc, WalletPoolError):
@@ -1566,6 +1581,10 @@ async def _run_simple_confirmed(args, value, config_path, operator_dir) -> int:
     )
     if base_config.confirmed_pilot:
         raise SystemExit("confirmed pilot uses the dedicated one-cycle command")
+    if getattr(args, "fanout", False) and base_config.receiver_admission not in ("ack", "ws_confirmed"):
+        # Checked before a slot is claimed: the fan-out cycle refuses any other admission.
+        raise SystemExit("режим «несколько MARKET» работает только с приёмом ACK или WS "
+                         "(--receiver-admission ack); слот не занят, ордера не отправлялись")
     _require_owner_opening_margin_reserve(base_config)
     _validate_simple_sdk()
     from .wallet_pool import WalletPoolError, WalletsUnavailable, load_wallet_pool
@@ -1575,6 +1594,9 @@ async def _run_simple_confirmed(args, value, config_path, operator_dir) -> int:
     except WalletPoolError as exc:
         pool_failure = exc
     pooled = pool is not None and pool.from_file
+    fanout = bool(getattr(args, "fanout", False))
+    if fanout and pool is not None and not pooled:
+        pool_failure = WalletPoolError("режим «несколько MARKET» требует файл пула кошельков wallets.json")
     if pooled and (args.keychain_replace or not args.keychain):
         raise SystemExit("пул кошельков работает только с сохранёнными ключами (--keychain); "
                          "ключ кошелька добавляется командой ./wallet add")
@@ -1582,11 +1604,20 @@ async def _run_simple_confirmed(args, value, config_path, operator_dir) -> int:
         # Public balance/position reads of every active wallet; no key value is
         # read and nothing is signed before the pair is drawn and the slot claimed.
         try:
-            selection = await _select_pool_wallets(base_config, evidence, pool)
+            selection = await _select_pool_wallets(base_config, evidence, pool, fanout=fanout)
         except Exception as exc:
             pool_failure = exc
+    extras: list[int] | None = None
     if pool_failure is not None:
         route = None
+    elif fanout:
+        from .fanout_cycle import select_fanout_route
+        drawn = selection["fanout"]
+        if drawn["source"] is None:
+            route = None
+            pool_failure = WalletsUnavailable("no fan-out source with two other ready wallets")
+        else:
+            route, extras = select_fanout_route(drawn["source"], drawn["receivers"])
     elif pooled:
         pair = selection["pair"]
         route = None if pair is None else select_random_route(
@@ -1601,6 +1632,7 @@ async def _run_simple_confirmed(args, value, config_path, operator_dir) -> int:
             client_order_prefix=base_config.client_order_prefix,
             random_route=route,
             wallet_selection=selection,
+            fanout_receivers=extras,
         )
     except PreflightBlocked as exc:
         raise SystemExit(f"не удалось занять новый слот цикла: {exc}") from None
@@ -1612,11 +1644,17 @@ async def _run_simple_confirmed(args, value, config_path, operator_dir) -> int:
         print(f"Цикл не начат: {_pool_failure_text(pool_failure, selection)}. "
               f"Ордера не отправлялись; слот {cycle_dir} сохранён" + (f" с причиной {code}." if code else "."))
         return 2
-    if pooled:
+    if extras is not None:
+        receivers = ", ".join(str(index) for index in (route["receiver_account_index"], *extras))
+        print(f"Кошельки: LIMIT — {route['source_account_index']}, MARKET — {receivers} "
+              f"из {len(selection['eligible'])} готовых (всего активных {selection['pool_size']}).")
+    elif pooled:
         print(f"Кошельки: выбрана пара {route['source_account_index']} и {route['receiver_account_index']} "
               f"из {len(selection['eligible'])} готовых (всего активных {selection['pool_size']}).")
     launch_value = _simple_config_value(value)
     launch_value.update(route)
+    # Fan-out receivers are drawn per cycle; a 1 -> 1 cycle never inherits them.
+    launch_value["extra_receiver_account_indices"] = extras or []
     launch_value["cycle_dir"] = str(cycle_dir)
     launch_value.pop("journal_path", None)
     launch_value["client_order_prefix"] = client_order_prefix
@@ -1631,13 +1669,18 @@ async def _run_simple_confirmed(args, value, config_path, operator_dir) -> int:
         f"Новый слот создан и зарезервирован: {cycle_dir}; "
         f"уникальный префикс сохранён в {cycle_dir / 'launch.json'}."
     )
-    print(f"Выбрано: первый счёт {config.source_account_index}, лимитный {config.direction.source_side}; "
-          f"второй счёт {config.receiver_account_index}, {config.direction.receiver_side}. Выбор сохранён в launch.json.")
+    if config.extra_receiver_account_indices:
+        print(f"Выбрано: счёт {config.source_account_index} — LIMIT {config.direction.source_side}; счета "
+              f"{', '.join(str(index) for index in config.receiver_account_indices)} — MARKET "
+              f"{config.direction.receiver_side}. Выбор сохранён в launch.json.")
+    else:
+        print(f"Выбрано: первый счёт {config.source_account_index}, лимитный {config.direction.source_side}; "
+              f"второй счёт {config.receiver_account_index}, {config.direction.receiver_side}. Выбор сохранён в launch.json.")
     secrets: Any | None = None
     client: LighterSdkClient | None = None
     emitted_keys: set[tuple[str, int | None, int | None]] = set()
     try:
-        account_indices = (config.source_account_index, config.receiver_account_index)
+        account_indices = (config.source_account_index, *config.receiver_account_indices)
         if pooled:
             # Every pool wallet's key stays readable for exact history lookups;
             # only the drawn pair is loaded now.  Keys are never prompted here.
@@ -1655,6 +1698,9 @@ async def _run_simple_confirmed(args, value, config_path, operator_dir) -> int:
             receiver_account_index=config.receiver_account_index,
             secrets=secrets,
             market_evidence=evidence,
+            # Only a fan-out cycle signs for receivers 2..k; 1 -> 1 construction is unchanged.
+            **({"extra_receiver_account_indices": config.extra_receiver_account_indices}
+               if config.extra_receiver_account_indices else {}),
         )
         from .operator_recovery import resolve_prior
         if pooled:
@@ -2124,6 +2170,8 @@ async def _run_readiness(args: argparse.Namespace) -> int:
 async def _run(args: argparse.Namespace) -> int:
     if args.run != "simple" and any(getattr(args, name, None) is not None for name in ("receiver_admission", "price_improvement_ticks")):
         raise SystemExit("admission/tick overrides are supported only by simple")
+    if args.run != "simple" and getattr(args, "fanout", False):
+        raise SystemExit("--fanout is supported only by simple")
     if args.run in {"report", "offline-report"}:
         return await _run_offline_report(args)
     if args.run == "simple":

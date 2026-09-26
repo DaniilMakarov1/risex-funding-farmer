@@ -187,6 +187,7 @@ def allocate_cycle_slot(
     client_order_prefix: str = "hood-cycle",
     random_route: Mapping[str, Any] | None = None,
     wallet_selection: Mapping[str, Any] | None = None,
+    fanout_receivers: Sequence[int] | None = None,
 ) -> tuple[Path, str]:
     """Atomically reserve the next owner-only cycle directory and prefix.
 
@@ -196,9 +197,16 @@ def allocate_cycle_slot(
     metadata persistence fails so a caller cannot accidentally reuse a
     partially claimed slot.  A wallet-pool draw is stored inside the same
     immutable reservation (display/audit only; the route stays authoritative).
+    A fan-out cycle also reserves its receivers 2..k (``fanout_receivers``).
     """
 
     route = None if random_route is None else _validate_random_route(random_route)
+    extras = None if fanout_receivers is None else list(fanout_receivers)
+    if extras is not None and (
+            route is None or not 1 <= len(extras) <= 15
+            or any(isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in extras)
+            or len({route["source_account_index"], route["receiver_account_index"], *extras}) != len(extras) + 2):
+        raise PreflightBlocked("invalid reserved fan-out receivers")
     if wallet_selection is not None and not isinstance(wallet_selection, Mapping):
         raise PreflightBlocked("invalid wallet selection record")
     parent = Path(operator_dir)
@@ -222,6 +230,7 @@ def allocate_cycle_slot(
                 {
                     "schema": "hcr-19-simple-launch-v1",
                     **({"random_route": route} if route is not None else {}),
+                    **({"fanout_receivers": extras} if extras is not None else {}),
                     **({"wallet_selection": dict(wallet_selection)} if wallet_selection is not None else {}),
                     "claimed_at": time.time(),
                     "cycle_dir": str(candidate),
@@ -1451,7 +1460,7 @@ def _validate_account(
 ) -> None:
     # A fan-out cycle has several receivers; 1 -> 1 keeps exactly one.
     allowed = ((config.source_account_index,) if label == "source"
-               else config.receiver_account_indices)
+               else (config.receiver_account_index, *config.extra_receiver_account_indices))
     if snapshot.account_index not in allowed or snapshot.market_id != config.market_id:
         raise PreflightBlocked(f"{label} account identity/market does not match cycle binding")
     if not snapshot.authorized or not snapshot.ready:

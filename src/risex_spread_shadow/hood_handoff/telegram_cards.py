@@ -14,7 +14,7 @@ import math
 from pathlib import Path
 import re
 
-from .operator_view import (MSK, amount, nominal_usd, number, opening_margin_refusal, position_line,
+from .operator_view import (MSK, amount, cycle_roles, nominal_usd, number, opening_margin_refusal, position_line,
                             recovery_reason_text, ws_admission_notice)
 from .telegram_messages import mapping, text
 
@@ -80,34 +80,46 @@ def accepted_text(phase, attempt, plan):
     source, receiver = mapping(plan.get('source')), mapping(plan.get('receiver'))
     verb = 'открываю' if phase == 'opening' else 'закрываю'
     retry = f' (попытка {attempt})' if attempt > 1 else ''
+    extra = [mapping(plan.get(f'receiver_{n}')) for n in range(2, 17) if f'receiver_{n}' in plan]
+    if extra:
+        # One LIMIT filled by several MARKETs: every receiver with its part.
+        market = ', '.join(f'{text(leg.get("account_index", "?"), 24)} {text(btc(leg.get("quantity")), 24)}'
+                           for leg in (receiver, *extra))
+    else:
+        market = text(receiver.get("account_index", "?"), 24)
     return (f'{verb}{retry}: LIMIT {text(source.get("account_index", "?"), 24)} {text(source.get("side", "?"), 8)} '
             f'{text(btc(source.get("quantity")), 24)} BTC по {text(amount(source.get("price")), 32)} → '
-            f'MARKET {text(receiver.get("account_index", "?"), 24)}')
+            f'MARKET {market}')
 
 
 def execution_text(phase, attempt, receipt, progress=None):
     """(icon, text) for one completed paired attempt from its own validated receipts."""
-    from .operator_view import execution_legs
+    from .operator_view import execution_legs, own_quantities
     receipt = mapping(receipt)
     legs, matched, plans = execution_legs(receipt)
+    # 1 -> 1 keeps its single matched quantity; a fan-out sums each receiver's own match.
+    own = own_quantities(legs, plans) if len(legs) > 2 else {role: matched for role in legs}
     parts, filled, uncertain, foreign = [], False, False, False
     if matched:
         parts.append(f'🤝 свои счета {text(amount(matched), 24)} BTC')
-    for role, label in (('source', 'LIMIT взяли чужие'), ('receiver', 'MARKET исполнился о чужие')):
+    receiver_ids = {mapping(plans.get(role)).get('account_index') for role in list(legs)[1:]}
+    source_id = mapping(plans.get('source')).get('account_index')
+    for role in legs:
+        label = 'LIMIT взяли чужие' if role == 'source' else 'MARKET исполнился о чужие'
         leg = legs.get(role)
         if leg is None:
             uncertain = True
             continue
         filled = filled or bool(leg.trades)
-        peer = mapping(plans.get('receiver' if role == 'source' else 'source')).get('account_index')
+        peers = receiver_ids if role == 'source' else {source_id}
         outside = [t for t in leg.trades if t.counterparty_account_index is not None
-                   and peer is not None and t.counterparty_account_index != peer]
+                   and None not in peers and t.counterparty_account_index not in peers]
         external = sum((t.quantity for t in outside), Decimal(0))
         if external:
             foreign = True
             ids = sorted({str(t.counterparty_account_index) for t in outside})[:3]
             parts.append(f'{label} {text(amount(external), 24)} (счёт {text(", ".join(ids), 60)})')
-        unproved = max(Decimal(0), leg.filled_quantity - external - matched)
+        unproved = max(Decimal(0), leg.filled_quantity - external - own[role])
         if unproved:
             uncertain = True
             parts.append(f'контрагент не доказан {text(amount(unproved), 24)}')
@@ -254,7 +266,18 @@ def wallet_selection_text(record):
     if len(skipped) > 12:
         reasons += f'; ещё {len(skipped) - 12}'
     total = record.get('pool_size')
-    if isinstance(pair, list) and len(pair) == 2:
+    fanout = mapping(record.get('fanout'))
+    receivers = fanout.get('receivers')
+    if record.get('mode') == 'fanout' and isinstance(receivers, list) and fanout.get('source') is not None:
+        line = (f'кошельки: LIMIT — {text(fanout["source"], 24)}, MARKET — '
+                f'{", ".join(text(index, 24) for index in receivers[:16])} из {len(eligible)} готовых'
+                + (f' (всего активных {text(total, 8)})' if total is not None else ''))
+    elif record.get('mode') == 'fanout':
+        ready = fanout.get('receiver_ready')
+        line = (f'кошельки: для режима «несколько MARKET» готовых {len(ready) if isinstance(ready, list) else "?"} '
+                f'из {text(total, 8)} — нужен источник с балансом на лимитку из двух минимальных ордеров +10% '
+                'и ещё минимум два готовых кошелька, цикл не начат')
+    elif isinstance(pair, list) and len(pair) == 2:
         line = (f'кошельки: выбраны {text(pair[0], 24)} и {text(pair[1], 24)} из {len(eligible)} готовых'
                 + (f' (всего активных {text(total, 8)})' if total is not None else ''))
     else:
@@ -270,8 +293,8 @@ def wallet_steps(slot):
     line = wallet_selection_text(record) if record is not None else None
     if line is None:
         return []
-    pair = record.get('pair')
-    return [('wallets', record['at'], '👛' if isinstance(pair, list) else '⛔', line)]
+    drawn = isinstance(record.get('pair'), list) or mapping(record.get('fanout')).get('source') is not None
+    return [('wallets', record['at'], '👛' if drawn else '⛔', line)]
 
 
 # Must equal random_cycle.OWNER_STOP_REASON (tested); kept here so views stay light.
@@ -297,12 +320,23 @@ def cycle_steps(slot):
                 selection = mapping(payload.get('selection'))
                 sides = {'LONG': ('SELL', 'BUY'), 'SHORT': ('BUY', 'SELL')}.get(binding.get('direction'), ('?', '?'))
                 hold = seconds(selection.get('hold_seconds'))
+                fanout = mapping(selection.get('fanout'))
+                accounts, parts = fanout.get('receiver_account_indices'), fanout.get('receiver_parts')
+                if isinstance(accounts, list) and isinstance(parts, list) and len(accounts) == len(parts) >= 2:
+                    # One LIMIT filled by several MARKETs: each receiver with its random part.
+                    receivers = ', '.join(f'{text(account, 24)} {text(btc(part), 24)}'
+                                          for account, part in list(zip(accounts, parts))[:16])
+                    steps.append((key, at, '🎲', f'выбрано: LIMIT {text(binding.get("source_account_index", "?"), 24)} '
+                                  f'{sides[0]} {text(btc(selection.get("quantity")), 24)} BTC → '
+                                  f'{len(accounts)} MARKET {sides[1]}: {receivers}'
+                                  + (f' · удержание {hold}' if hold else '')))
+                    continue
                 steps.append((key, at, '🎲', f'выбрано: LIMIT {text(binding.get("source_account_index", "?"), 24)} {sides[0]} → '
                               f'MARKET {text(binding.get("receiver_account_index", "?"), 24)} {sides[1]} · '
                               f'{text(btc(selection.get("quantity")), 24)} BTC' + (f' · удержание {hold}' if hold else '')))
             elif event == 'LEVERAGE_PLAN':
                 target, observed = mapping(payload.get('target_fraction_bps')), mapping(payload.get('observed_fraction_bps'))
-                parts = ', '.join(f'{text(account, 24)} {leverage(bps)}' for account, bps in list(target.items())[:2])
+                parts = ', '.join(f'{text(account, 24)} {leverage(bps)}' for account, bps in list(target.items())[:17])
                 changed = any(observed.get(account) != bps for account, bps in target.items())
                 steps.append((key, at, '⚙️', ('ставлю плечо: ' if changed else 'плечо уже подходит: ') + parts))
             elif event == 'LEVERAGE_UPDATE_CONFIRMED':
@@ -425,7 +459,7 @@ def residual_details(report):
     if not fills:
         return 'остаток: исполнение не подтверждено' if actions else None
     binding = mapping(report.get('binding'))
-    accounts = {binding.get('source_account_index'), binding.get('receiver_account_index')}
+    accounts = {account for _, account in cycle_roles(binding)}
     labels = set()
     for fill in fills:
         peer = fill.get('counterparty_account_index')
@@ -446,6 +480,18 @@ def planned_quantity(report):
         return None
     last = max(plans, key=lambda a: a.get('attempt') if type(a.get('attempt')) is int else 0)
     return number(mapping(last.get('plan')).get('quantity'))
+
+
+def planned_parts(report):
+    """[(account, quantity)] of the last planned fan-out opening receivers, in leg order."""
+    plans = [mapping(a) for a in report.get('planned_actions', [])
+             if mapping(a).get('phase') == 'opening' and str(mapping(a).get('leg', '')).startswith('receiver')]
+    if not plans:
+        return []
+    last = max(a.get('attempt') if type(a.get('attempt')) is int else 0 for a in plans)
+    rows = [a for a in plans if (a.get('attempt') if type(a.get('attempt')) is int else 0) == last]
+    rows.sort(key=lambda a: int(a['leg'].rsplit('_', 1)[1]) if a['leg'].rsplit('_', 1)[-1].isdigit() else 1)
+    return [(mapping(a.get('plan')).get('account_index'), number(mapping(a.get('plan')).get('quantity'))) for a in rows]
 
 
 def attempts(report, phase):
@@ -601,7 +647,13 @@ def cycle_card(card, report, slot=None):
         lines.append(' · '.join(size))
     source, receiver = binding.get('source_account_index'), binding.get('receiver_account_index')
     sides = {'LONG': ('SELL', 'BUY'), 'SHORT': ('BUY', 'SELL')}.get(binding.get('direction'))
-    if type(source) is int and type(receiver) is int and sides:
+    roles = cycle_roles(binding)
+    if len(roles) > 2 and all(type(account) is int for _, account in roles) and sides:
+        parts = dict((account, quantity) for account, quantity in planned_parts(report))
+        receivers = ' + '.join(f'{account}' + (f' {text(btc(parts[account]), 24)}' if parts.get(account) else '')
+                               for _, account in roles[1:])
+        lines.append(f'LIMIT {source} {sides[0]} → MARKET {receivers} {sides[1]}')
+    elif type(source) is int and type(receiver) is int and sides:
         lines.append(f'LIMIT {source} {sides[0]} → MARKET {receiver} {sides[1]}')
     gaps = phase_gaps(slot)
     for phase, label in (('opening', 'Открытие'), ('closing', 'Закрытие')):
@@ -646,8 +698,8 @@ def cycle_card(card, report, slot=None):
         inventory = mapping(report.get('inventory'))
         if cycle.get('recovery_stop_reason'):
             lines.append('Закрытие остатка: ' + text(recovery_reason_text(cycle.get('recovery_stop_reason')), 300))
-        for role in ('source', 'receiver'):
-            lines.append(text(position_line(binding.get(f'{role}_account_index', role), inventory.get(role),
+        for role, account in cycle_roles(binding):
+            lines.append(text(position_line(role if account is None else account, inventory.get(role),
                                             binding.get('market_symbol', '')), 120))
         lines.append('/accounts — проверить счета · /close — закрыть остаток')
     pause = card.get('pause')

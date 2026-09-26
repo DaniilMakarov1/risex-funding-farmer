@@ -1,4 +1,4 @@
-"""Owner menu 2026-09-26: state keyboards, the /run count question and the 24-hour /report."""
+"""Owner menu 2026-09-26: state keyboards, the /run mode and count questions and the 24-hour /report."""
 import asyncio
 import json
 import re
@@ -31,6 +31,12 @@ def message(number, text, date=1000):
     value = update(number, text)
     value['message']['date'] = date
     return value
+
+
+async def ask(c, first=1, mode=views.MODE_ONE):
+    """Bare /run, then the mode button; the count question is open afterwards."""
+    await c.handle(update(first, '/run'))
+    await c.handle(update(first + 1, mode))
 
 
 def series(tmp_path, *, block=None):
@@ -119,6 +125,7 @@ def test_no_view_mentions_removed_commands():
         'later_close_message': ('close-001', 1000, True), 'accounts_message': (None,),
         'admission_refusal_message': ({'status': 'REFUSED'},), 'stop_accepted_message': (),
         'stop_result_message': ({},), 'count_prompt_message': (5,), 'count_expired_message': (5,),
+        'mode_prompt_message': (5,),
     }
     keywords = {'stop_accepted_message': {'running': True}}
     rendered = [getattr(views, name)(*samples.get(name, ()), **keywords.get(name, {})) for name in names]
@@ -129,7 +136,7 @@ def test_no_view_mentions_removed_commands():
         assert not {'/status', '/help'} & set(buttons(markup))
 
 
-# ---- the /run count question ----------------------------------------------
+# ---- the /run mode and count questions -------------------------------------
 
 @pytest.mark.parametrize('answer,count', [('3', 3), (' 2 ', 2), ('1', 1)])
 async def test_run_asks_then_a_number_runs_ack_one_tick_series(tmp_path, answer, count):
@@ -137,12 +144,17 @@ async def test_run_asks_then_a_number_runs_ack_one_tick_series(tmp_path, answer,
     await c.handle(update(1, '/run'))
     assert c.task is None and c.store.data['active'] is None and calls == []
     assert c.store.data['offset'] == 2  # The question command is consumed like any other.
+    assert c.transport.markups[-1] == views.MODE_PROMPT
+    assert 'Какой режим' in said(c)[-1] and 'ACK · +1 тик' in said(c)[-1]
+    await c.handle(update(2, views.MODE_ONE))
+    assert c.task is None and calls == []
     assert c.transport.markups[-1] == views.COUNT_PROMPT
-    assert 'Сколько циклов' in said(c)[-1] and 'ACK · +1 тик' in said(c)[-1]
+    assert 'Сколько циклов' in said(c)[-1] and 'ACK · +1 тик · 1 LIMIT → 1 MARKET' in said(c)[-1]
     assert 'count' not in c.store.path.read_text() and 'prompt' not in c.store.path.read_text()
-    await c.handle(update(2, answer))
+    await c.handle(update(3, answer))
     accepted = said(c)[-1]
     assert ('один цикл' if count == 1 else f'серия из {count} циклов') in accepted
+    assert '1 LIMIT → 1 MARKET' in accepted
     await c.task
     assert calls == [ACK_ONE] * count
     last = c.store.data['last']
@@ -155,12 +167,12 @@ async def test_run_asks_then_a_number_runs_ack_one_tick_series(tmp_path, answer,
 @pytest.mark.parametrize('answer', ['0', '-1', '1.5', '05', '+3', '10 циклов', 'abc', '١٢', '３', '9' * 4097])
 async def test_invalid_answer_launches_nothing_and_keeps_question(tmp_path, answer):
     c, calls = series(tmp_path)
-    await c.handle(update(1, '/run'))
-    await c.handle(update(2, answer))
+    await ask(c)
+    await c.handle(update(3, answer))
     assert c.task is None and calls == [] and c.store.data['active'] is None
     assert c._count_prompt is not None
     assert 'целое число больше нуля' in said(c)[-1] and c.transport.markups[-1] == views.COUNT_PROMPT
-    await c.handle(update(3, '2'))
+    await c.handle(update(4, '2'))
     await c.task
     assert calls == [ACK_ONE] * 2
 
@@ -171,15 +183,16 @@ async def test_answer_after_five_minutes_launches_nothing(tmp_path, delay, launc
     clock = [1000]
     c.now = lambda: clock[0]
     await c.handle(message(1, '/run', 1000))
+    await c.handle(message(2, views.MODE_ONE, 1000))
     clock[0] = 1000 + delay
-    await c.handle(message(2, '2', 1000 + delay))
+    await c.handle(message(3, '2', 1000 + delay))
     if launched:
         await c.task
         assert calls == [ACK_ONE] * 2
         return
     assert c.task is None and calls == [] and c._count_prompt is None
     assert 'опоздал' in said(c)[-1] and 'Ничего не запущено' in said(c)[-1]
-    await c.handle(message(3, '2', 1000 + delay))
+    await c.handle(message(4, '2', 1000 + delay))
     assert c.task is None and calls == [] and 'только в ответ на /run' in said(c)[-1]
 
 
@@ -209,11 +222,11 @@ async def test_other_commands_cancel_the_question(tmp_path, command):
 @pytest.mark.parametrize('command', ['/accounts', '/report'])
 async def test_read_only_commands_keep_the_question(tmp_path, command):
     c, calls = series(tmp_path)
-    await c.handle(update(1, '/run'))
-    await c.handle(update(2, command))
+    await ask(c)
+    await c.handle(update(3, command))
     if c._notice_task is not None:
         await c._notice_task
-    await c.handle(update(3, '2'))
+    await c.handle(update(4, '2'))
     await c.task
     assert calls == [ACK_ONE] * 2
 
@@ -223,10 +236,12 @@ async def test_second_run_renews_the_question(tmp_path):
     clock = [1000]
     c.now = lambda: clock[0]
     await c.handle(message(1, '/run', 1000))
+    await c.handle(message(2, views.MODE_ONE, 1000))
     clock[0] = 1200
-    await c.handle(message(2, '/run', 1200))
+    await c.handle(message(3, '/run', 1200))
+    await c.handle(message(4, views.MODE_ONE, 1200))
     clock[0] = 1450  # 450 s after the first question, 250 s after the renewed one.
-    await c.handle(message(3, '2', 1450))
+    await c.handle(message(5, '2', 1450))
     await c.task
     assert calls == [ACK_ONE] * 2
 
@@ -234,8 +249,8 @@ async def test_second_run_renews_the_question(tmp_path):
 @pytest.mark.parametrize('change', ['foreign_sender', 'foreign_chat', 'group', 'bot', 'forward', 'edited', 'stale', 'future'])
 async def test_untrusted_answer_never_launches_and_owner_can_still_answer(tmp_path, change):
     c, calls = series(tmp_path)
-    await c.handle(update(1, '/run'))
-    u = update(2, '3')
+    await ask(c)
+    u = update(3, '3')
     if change == 'foreign_sender': u['message']['from']['id'] = 43
     if change == 'foreign_chat': u['message']['chat']['id'] = 43
     if change == 'group': u['message']['chat']['type'] = 'group'
@@ -247,26 +262,26 @@ async def test_untrusted_answer_never_launches_and_owner_can_still_answer(tmp_pa
     await c.handle(u)
     await asyncio.sleep(0)
     assert c.task is None and calls == [] and c.store.data['active'] is None
-    await c.handle(update(3, '1'))
+    await c.handle(update(4, '1'))
     await c.task
     assert calls == [ACK_ONE]
 
 
 async def test_duplicate_answer_and_restart_never_replay(tmp_path):
     c, calls = series(tmp_path)
-    await c.handle(update(1, '/run'))
-    answer = update(2, '2')
+    await ask(c)
+    answer = update(3, '2')
     await c.handle(answer)
     await c.handle(answer)  # Redelivered update: already consumed.
     await c.task
     await c.handle(answer)
-    await c.handle(update(3, '2'))  # The question was answered once.
+    await c.handle(update(4, '2'))  # The question was answered once.
     assert calls == [ACK_ONE] * 2
     # A question is never saved: after a restart a number launches nothing.
-    await c.handle(update(4, '/run'))
+    await ask(c, 5)
     restarted = setup(tmp_path, c.launch)
     restarted.recovery, restarted.close = c.recovery, c.close
-    await restarted.handle(update(5, '2'))
+    await restarted.handle(update(7, '2'))
     assert restarted.task is None and calls == [ACK_ONE] * 2
     assert 'только в ответ на /run' in said(restarted)[-1]
 
@@ -311,8 +326,8 @@ async def test_answer_goes_through_admission_refusal(tmp_path):
     async def refuse(*, require_flat):
         raise PreflightBlocked('source has active cycle-market orders')
     c.recovery = refuse
-    await c.handle(update(1, '/run'))
-    await c.handle(update(2, '3'))
+    await ask(c)
+    await c.handle(update(3, '3'))
     await c.task
     assert calls == [] and c.store.data['active'] is None
     assert c.store.data['last_admission']['status'] == 'REFUSED'
@@ -345,6 +360,125 @@ async def test_refusal_with_pending_stop_keeps_stop_menu(tmp_path):
     await c.task
     await c._notice_task
     assert calls == [] and 'Остановлено' in said(c)[-1] and buttons(c.transport.markups[-1]) == IDLE
+
+
+# ---- the fan-out mode (owner request 2026-09-26) ---------------------------
+
+FANOUT = {**ACK_ONE, 'fanout': True}
+
+
+@pytest.mark.parametrize('button', [views.MODE_MANY, ' 1 limit -> НЕСКОЛЬКО market '])
+async def test_many_markets_mode_launches_fanout_series(tmp_path, button):
+    c, calls = series(tmp_path)
+    await c.handle(update(1, '/run'))
+    await c.handle(update(2, button))
+    assert c.task is None and calls == []
+    assert c.transport.markups[-1] == views.COUNT_PROMPT
+    assert 'ACK · +1 тик · 1 LIMIT → несколько MARKET' in said(c)[-1]
+    await c.handle(update(3, '2'))
+    accepted = said(c)[-1]
+    assert 'серия из 2 циклов' in accepted and '1 LIMIT → несколько MARKET' in accepted
+    await c.task
+    assert calls == [FANOUT] * 2
+    assert c.store.data['last']['series_completed'] == 2 and c._count_prompt is None
+
+
+@pytest.mark.parametrize('answer', ['2', '1', 'несколько', '1 LIMIT → 2 MARKET', '/run 2 x', ''])
+async def test_mode_question_accepts_only_the_two_buttons(tmp_path, answer):
+    c, calls = series(tmp_path)
+    await c.handle(update(1, '/run'))
+    await c.handle(update(2, answer))
+    if answer.startswith('/'):
+        # Any other command cancels the question, as for the count question.
+        assert c._count_prompt is None
+        return
+    assert c.task is None and calls == [] and c.store.data['active'] is None
+    assert c._count_prompt['stage'] == 'mode'  # A number here is never a cycle count.
+    assert 'выбрать режим кнопкой' in said(c)[-1] and c.transport.markups[-1] == views.MODE_PROMPT
+    await c.handle(update(3, views.MODE_MANY))
+    await c.handle(update(4, '1'))
+    await c.task
+    assert calls == [FANOUT]
+
+
+@pytest.mark.parametrize('answered,launched', [(1290, True), (1301, False)])
+async def test_mode_answer_opens_a_new_count_window(tmp_path, answered, launched):
+    c, calls = series(tmp_path)
+    clock = [1000]
+    c.now = lambda: clock[0]
+    await c.handle(message(1, '/run', 1000))
+    clock[0] = answered
+    await c.handle(message(2, views.MODE_MANY, answered))
+    if not launched:
+        assert 'опоздал' in said(c)[-1] and c._count_prompt is None
+        return
+    clock[0] = 1500  # 500 s after /run, 210 s after the mode answer.
+    await c.handle(message(3, '1', 1500))
+    await c.task
+    assert calls == [FANOUT]
+
+
+async def test_mode_button_without_question_launches_nothing(tmp_path):
+    c, calls = series(tmp_path)
+    await c.handle(update(1, views.MODE_MANY))
+    assert 'только в ответ на /run' in said(c)[-1]
+    assert c.task is None and calls == [] and c.store.data['active'] is None
+
+
+async def test_controller_launches_the_fanout_child_flag(tmp_path, monkeypatch):
+    from pathlib import Path
+    from types import SimpleNamespace
+    from risex_spread_shadow.hood_handoff import cli, operator_recovery
+    tmp_path.chmod(0o700)
+    config = tmp_path / 'random-cycle.json'
+    config.write_text(json.dumps({'market_id': 1, 'market_symbol': 'BTC',
+                                  'source_account_index': 11, 'receiver_account_index': 22,
+                                  'cycle_dir': str(tmp_path / 'cycle'), 'api_key_index': 4}))
+    (tmp_path / 'market-contract.json').write_text('{}')
+    store = bot.Store(tmp_path / '.telegram-control', 'binding')
+    calls = []
+    class Stop(BaseException): pass
+    class API:
+        def __init__(self, *args): self.reads = 0
+        async def send(self, *args): pass
+        async def call(self, method, **payload):
+            self.reads += 1
+            if self.reads == 1:
+                return []
+            if self.reads == 2:
+                return [update(10, '/run'), update(11, views.MODE_MANY), update(12, '1')]
+            for _ in range(100):
+                if store.data['active'] is None and calls:
+                    raise Stop()
+                await asyncio.sleep(0.01)
+            pytest.fail('run did not terminate')
+    class Session:
+        def __init__(self, **kwargs): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *args): pass
+    class Process:
+        async def communicate(self, data):
+            cycle_slot(tmp_path, len(calls))
+    async def create(*args, **kwargs):
+        calls.append(args)
+        return Process()
+    async def recover(*args, require_flat=True):
+        return proof('READY' if require_flat else 'CLOSE_READY')
+    monkeypatch.setattr(cli, '_validate_simple_local_inputs', lambda *a, **k: (object(), {}))
+    monkeypatch.setattr(operator_recovery, 'check_recovery', recover)
+    monkeypatch.setattr(bot, 'Telegram', API)
+    monkeypatch.setattr(bot.aiohttp, 'ClientSession', Session)
+    monkeypatch.setattr(bot.asyncio, 'create_subprocess_exec', create)
+    real = bot.Controller
+    monkeypatch.setattr(bot, 'Controller', lambda *a, **k: real(*a, **k, now=lambda: 1000))
+    original_is_file = Path.is_file
+    monkeypatch.setattr(Path, 'is_file',
+                        lambda p: True if str(p).endswith('.venv-hood/bin/python') else original_is_file(p))
+    with pytest.raises(Stop):
+        await bot.serve(SimpleNamespace(config=config, owner_id=42), store, 99, 'unused')
+    [argv] = calls
+    assert argv[1:5] == ('-m', 'risex_spread_shadow.hood_handoff.cli', 'simple', '--keychain')
+    assert argv[-5:] == ('--receiver-admission', 'ack', '--price-improvement-ticks', '1', '--fanout')
 
 
 # ---- the 24-hour /report ---------------------------------------------------

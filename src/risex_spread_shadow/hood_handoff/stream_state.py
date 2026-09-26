@@ -10,12 +10,16 @@ import asyncio
 from dataclasses import dataclass, field
 import json
 import math
+import re
 import time
 
 from .stream_reads import StreamReads
 from .offline_observer import ObserverLimits
 from .stream_evidence import StreamEvidenceJournal
 from .stream_measurement import StreamIdentity, StreamProjection, WS_URL, _auth_tokens
+
+# Fan-out receivers 2..16 carry the legs "receiver_2" ... "receiver_16".
+_ORDER_ROLE = re.compile(r"source|receiver(?:_(?:[2-9]|1[0-6]))?")
 
 
 @dataclass(frozen=True, slots=True)
@@ -101,7 +105,7 @@ class ReadStreamState:
                 or type(client) is not int or client < 0
                 or not isinstance(run_id, str) or not run_id.isascii() or len(run_id) > 64
                 or phase not in {"PAIRED_OPENING", "PAIRED_CLOSING"}
-                or role not in {"source", "receiver"}
+                or not _ORDER_ROLE.fullmatch(role if isinstance(role, str) else "")
                 or (attempt_index is not None and (type(attempt_index) is not int
                                                    or not 0 <= attempt_index <= 100000))):
             raise ValueError("read-stream order context is invalid")

@@ -29,7 +29,7 @@ def amount(value: Any, *, positive: bool = False) -> Decimal:
 
 
 class StreamReads:
-    def __init__(self, market: int, symbol: str, accounts: tuple[int, int]) -> None:
+    def __init__(self, market: int, symbol: str, accounts: tuple[int, ...]) -> None:
         self.market, self.symbol, self.accounts = market, symbol, accounts
         self.clear()
 

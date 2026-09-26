@@ -14,6 +14,10 @@ reserve).  Ineligible wallets are skipped and recorded; with fewer than two
 eligible wallets no cycle starts.  Paused wallets are never drawn but remain
 covered by readiness checks and position closing.  Roles and direction are
 then drawn exactly as before by ``select_random_route``.
+
+A fan-out draw (owner request 2026-09-26: one LIMIT filled by several
+MARKETs) instead picks one source and 2..(eligible - 1) receivers; see
+``draw_fanout``.
 """
 from __future__ import annotations
 
@@ -27,7 +31,7 @@ from pathlib import Path
 import random
 import stat
 import time
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Mapping, Sequence
 import uuid
 
 from .contracts import ContractError, PreflightBlocked
@@ -54,7 +58,7 @@ class WalletPoolError(PreflightBlocked):
 
 
 class WalletsUnavailable(PreflightBlocked):
-    """Fewer than two wallets are eligible for the next cycle."""
+    """Fewer than two wallets (three for a fan-out cycle) are eligible for the next cycle."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -205,8 +209,13 @@ def updated_pool(pool: WalletPool, *, add: int | None = None, pause: int | None 
 REQUIREMENT_SAFETY = Decimal("1.05")
 
 
-def wallet_requirement(metadata: Any, book: Any, config: Any) -> Decimal:
+def wallet_requirement(metadata: Any, book: Any, config: Any, *,
+                       fanout_parts: int | None = None) -> Decimal:
     """Conservative quote balance for one venue-minimum order in either role.
+
+    With ``fanout_parts`` the order is instead the fan-out LIMIT floor for that
+    many receivers (``ceil(parts x minimum x 1.10)``): ``1`` is one receiver's
+    minimum part plus the margin, ``k`` is the source LIMIT for ``k`` receivers.
 
     The cycle prices both legs inside the spread, so the best ask bounds the
     notional/fee price and the best bid bounds the venue quote minimum.  Uses
@@ -227,7 +236,13 @@ def wallet_requirement(metadata: Any, book: Any, config: Any) -> Decimal:
     step = Decimal(1).scaleb(-int(metadata.size_decimals))
     lower_base = int((Decimal(metadata.minimum_base_amount) / step).to_integral_value(rounding=ROUND_CEILING))
     lower_quote = int((Decimal(metadata.minimum_quote_amount) / low / step).to_integral_value(rounding=ROUND_CEILING))
-    quantity = max(lower_base, lower_quote, 1) * step
+    minimum_tick = max(lower_base, lower_quote, 1)
+    if fanout_parts is not None:
+        from .fanout_cycle import fanout_quantity_floor
+        if isinstance(fanout_parts, bool) or not isinstance(fanout_parts, int) or fanout_parts < 1:
+            raise ContractError("fan-out part count must be a positive integer")
+        minimum_tick = fanout_quantity_floor(fanout_parts, minimum_tick)
+    quantity = minimum_tick * step
     fraction = max(2500, int(getattr(metadata, "minimum_initial_margin_fraction", None) or 2500))
     rates = [ROBINHOOD_MAKER_FEE_CAP, ROBINHOOD_TAKER_FEE_CAP]
     for name in ("source_fee_rate", "receiver_fee_rate"):
@@ -257,6 +272,61 @@ def draw_pair(eligible: Sequence[int], rng: Any = None) -> tuple[int, int]:
     if second >= first:
         second += 1
     return ordered[first], ordered[second]
+
+
+def draw_fanout(receiver_ready: Sequence[int], capacity: Mapping[int, int],
+                rng: Any = None) -> tuple[int, tuple[int, ...]] | None:
+    """Uniform fan-out draw: one source and ``k`` distinct receivers (owner request 2026-09-26).
+
+    ``receiver_ready`` are the eligible wallets that fund one receiver part (a
+    venue minimum plus the 10 % margin); ``capacity[w]`` is the largest
+    receiver count whose LIMIT wallet ``w`` funds as the source.  The source is
+    uniform among wallets with capacity >= 2 and at least two other ready
+    wallets; ``k`` is uniform in [2, min(other ready wallets, capacity, 16)];
+    the receivers are uniform without replacement, in drawn order.  None when
+    no such source exists.
+    """
+
+    from .fanout_handoff import MAX_FANOUT_RECEIVERS
+    from .random_cycle import _draw_integer
+
+    ordered = sorted(set(receiver_ready))
+    sources = [index for index in ordered if int(capacity.get(index, 0)) >= 2]
+    if len(ordered) < 3 or not sources:
+        return None
+    draw = random.SystemRandom() if rng is None else rng
+    source = sources[_draw_integer(draw, 0, len(sources) - 1, "fan-out source")]
+    top = min(len(ordered) - 1, int(capacity[source]), MAX_FANOUT_RECEIVERS)
+    count = _draw_integer(draw, 2, top, "fan-out receiver count")
+    candidates = [index for index in ordered if index != source]
+    receivers = tuple(candidates.pop(_draw_integer(draw, 0, len(candidates) - 1, "fan-out receiver"))
+                      for _ in range(count))
+    return source, receivers
+
+
+def _fanout_selection(eligible: Sequence[int], available: Mapping[int, Decimal],
+                      metadata: Any, book: Any, config: Any, rng: Any) -> dict[str, Any]:
+    """The fan-out part of the durable selection record (display/audit; the route stays authoritative)."""
+
+    from .fanout_handoff import MAX_FANOUT_RECEIVERS
+
+    receiver_requirement = wallet_requirement(metadata, book, config, fanout_parts=1)
+    ready = [index for index in eligible if available[index] >= receiver_requirement]
+    # The source LIMIT for k receivers; the requirement grows with k.
+    source_requirements = {count: wallet_requirement(metadata, book, config, fanout_parts=count)
+                           for count in range(2, min(len(ready) - 1, MAX_FANOUT_RECEIVERS) + 1)}
+    capacity = {index: max((count for count, need in source_requirements.items() if available[index] >= need),
+                           default=0)
+                for index in ready}
+    drawn = draw_fanout(ready, capacity, rng)
+    return {
+        "receiver_ready": ready,
+        "receiver_requirement_quote": format(receiver_requirement, "f"),
+        "source_requirement_quote": {str(count): format(need, "f") for count, need in source_requirements.items()},
+        "source_capacity": {str(index): capacity[index] for index in ready},
+        "source": None if drawn is None else drawn[0],
+        "receivers": None if drawn is None else list(drawn[1]),
+    }
 
 
 async def _rate_limited_read(read: Callable[[], Any], config: Any, sleep: Callable[[float], Any]) -> Any:
@@ -292,12 +362,15 @@ async def select_wallet_pair(
     rng: Any = None,
     clock: Callable[[], float] = time.time,
     sleep: Callable[[float], Any] = asyncio.sleep,
+    fanout: bool = False,
 ) -> dict[str, Any]:
     """Read public state for each active wallet and draw one eligible pair.
 
     Returns the durable selection record; ``pair`` is None when fewer than two
     wallets are eligible.  Market reads failing propagate (no cycle starts).
     A typed HTTP 429 on any read is retried with the engine's bounded cooldown.
+    With ``fanout`` the record instead carries ``mode: "fanout"`` and a
+    ``fanout`` draw (source and receivers, None when infeasible); ``pair`` is None.
     """
 
     from .random_cycle import _as_book, _as_market
@@ -325,6 +398,7 @@ async def select_wallet_pair(
     eligible: list[int] = []
     skipped: list[dict[str, Any]] = []
     balances: dict[str, str] = {}
+    available: dict[int, Decimal] = {}
     for index, observed in zip(pool.active, states):
         reason = None
         if observed is None or not observed.ready:
@@ -344,8 +418,23 @@ async def select_wallet_pair(
             balances[str(index)] = format(observed.available_balance, "f")
         if reason is None:
             eligible.append(index)
+            available[index] = observed.available_balance
         else:
             skipped.append({"account_index": index, "reason": reason})
+    if fanout:
+        return {
+            "schema": SELECTION_SCHEMA,
+            "at": clock(),
+            "mode": "fanout",
+            "pool_size": len(pool.active),
+            "paused": list(pool.paused),
+            "eligible": eligible,
+            "skipped": skipped,
+            "available_balances": balances,
+            "requirement_quote": format(requirement, "f"),
+            "pair": None,
+            "fanout": _fanout_selection(eligible, available, metadata, book, config, rng),
+        }
     pair = list(draw_pair(eligible, rng)) if len(eligible) >= 2 else None
     return {
         "schema": SELECTION_SCHEMA,
@@ -387,6 +476,7 @@ __all__ = [
     "WalletPoolError",
     "WalletState",
     "WalletsUnavailable",
+    "draw_fanout",
     "draw_pair",
     "load_wallet_pool",
     "pool_path",

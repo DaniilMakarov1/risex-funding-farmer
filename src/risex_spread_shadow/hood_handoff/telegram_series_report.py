@@ -15,9 +15,10 @@ def add_exact(left, right):
 
 
 def executed_turnover(report, seen_receipts):
-    """Both-account turnover: each validated account receipt contributes once."""
+    """All-account turnover (both, or every fan-out account): each validated account receipt contributes once."""
+    from .telegram_cards import cycle_roles
     binding = mapping(report.get('binding'))
-    accounts = {binding.get('source_account_index'), binding.get('receiver_account_index')}
+    accounts = {account for _, account in cycle_roles(binding)}
     fills = report.get('confirmed_fills')
     if not isinstance(fills, list):
         return None
@@ -59,9 +60,10 @@ class Totals:
     """Aggregate of saved cycle reports under one rule set; unknown stays unknown.
 
     A cycle is summed only when settled, flat and in the nominal-USD Robinhood
-    BTC denomination, validated against its own two accounts: a wallet pool
-    draws a new pair every cycle, so the first cycle's pair is never required.
-    Each account receipt (account, trade) is counted once across all cycles.
+    BTC denomination, validated against its own accounts (two, or the source
+    and every receiver of a fan-out): a wallet pool draws new accounts every
+    cycle, so the first cycle's pair is never required.  Each account receipt
+    (account, trade) is counted once across all cycles.
     """
 
     def __init__(self):
@@ -71,15 +73,17 @@ class Totals:
         self.gross_count = self.net_count = self.turnover_count = self.tariff_count = 0
         self.starts, self.terminals = [], []
         self.receipts = set()
+        self.fanout = False  # A cycle with more than two accounts was counted.
 
     def add(self, report):
         """Count one cycle; return (valid, gross, net) for its own line."""
-        from .telegram_cards import cycle_times, outcome, zero_tariff
+        from .telegram_cards import cycle_roles, cycle_times, outcome, zero_tariff
         report = mapping(report)
         self.cycles += 1
         binding = mapping(report.get('binding'))
-        accounts = (binding.get('source_account_index'), binding.get('receiver_account_index'))
-        pair = all(type(a) is int for a in accounts) and accounts[0] != accounts[1]
+        accounts = [account for _, account in cycle_roles(binding)]
+        pair = all(type(a) is int for a in accounts) and len(set(accounts)) == len(accounts)
+        self.fanout = self.fanout or (pair and len(accounts) > 2)
         order = mapping(report.get('order_state'))
         resolved = (report.get('status') == 'COMPLETE' and pair and nominal_usd(binding)
                     and order.get('unresolved_intents') == [] and order.get('unresolved_observed_orders') == [])
@@ -107,9 +111,11 @@ class Totals:
             self.terminals.append(terminal)
         return valid, g, n
 
-    def lines(self, complete, *, turnover_label='Оборот обоих счетов'):
+    def lines(self, complete, *, turnover_label=None):
         """Turnover, PnL and fee lines; a total is shown only when every cycle is known."""
         from .telegram_cards import usd
+        if turnover_label is None:
+            turnover_label = 'Оборот всех счетов' if self.fanout else 'Оборот обоих счетов'
         count = self.cycles
         gross_known = complete and self.gross_count == count
         net_known = complete and self.net_count == count

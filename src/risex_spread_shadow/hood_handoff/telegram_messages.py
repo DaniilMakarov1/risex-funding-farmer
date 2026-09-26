@@ -13,6 +13,12 @@ RUNNING_MENU = {'keyboard': [[{'text': '/stop'}], [{'text': '/report'}, {'text':
                 'resize_keyboard': True, 'is_persistent': True}
 # The /run question: Telegram opens a reply to it; the keyboard stays available.
 COUNT_PROMPT = {'force_reply': True, 'input_field_placeholder': 'Число циклов, например 10'}
+# The first /run question: the mode, answered with one of these two buttons.
+MODE_ONE = '1 LIMIT → 1 MARKET'
+MODE_MANY = '1 LIMIT → несколько MARKET'
+MODE_PROMPT = {'keyboard': [[{'text': MODE_ONE}], [{'text': MODE_MANY}]],
+               'resize_keyboard': True, 'one_time_keyboard': True,
+               'input_field_placeholder': 'Выбери режим кнопкой'}
 
 
 def text(value, limit=80):
@@ -29,7 +35,7 @@ def mapping(value):
 
 
 def commands_text():
-    return ('/run — запустить циклы: ACK, +1 тик, число циклов спрошу\n'
+    return ('/run — запустить циклы: ACK, +1 тик; спрошу режим и число циклов\n'
             '/close — проверить и закрыть открытые позиции\n'
             '/stop — остановить циклы и закрыть позиции\n'
             '/report — итог за последние 24 часа\n'
@@ -47,8 +53,33 @@ def commands_message():
     return '<b>Команды</b>\n' + commands_text()
 
 
-def count_prompt_message(minutes):
+def mode_answer(value):
+    """True for one LIMIT filled by several MARKETs, False for 1 -> 1, None otherwise."""
+    normalized = ' '.join(str(value).replace('->', '→').split()).casefold()
+    return {MODE_ONE.casefold(): False, MODE_MANY.casefold(): True}.get(normalized)
+
+
+def mode_label(fanout):
+    return MODE_MANY if fanout else MODE_ONE
+
+
+def mode_prompt_message(minutes):
     return ('▶️ <b>Запуск: ACK · +1 тик</b>\n'
+            'Какой режим?\n'
+            f'• <b>{MODE_ONE}</b> — лимитку одного кошелька заполняет MARKET другого;\n'
+            f'• <b>{MODE_MANY}</b> — лимитку одного кошелька заполняют MARKET от 2 до «все готовые, '
+            'кроме источника»; объём — минимальный ордер на каждый MARKET +10% или больше, делится случайно.\n'
+            f'<i>Выбери кнопкой. Жду ответ {text(minutes, 8)} мин; /close или /stop отменяют запуск.</i>')
+
+
+def mode_invalid_message():
+    return (f'<b>Нужно выбрать режим кнопкой</b>: «{MODE_ONE}» или «{MODE_MANY}».\n'
+            'Или выбери другую команду.')
+
+
+def count_prompt_message(minutes, fanout=None):
+    mode = '' if fanout is None else f' · {mode_label(fanout)}'
+    return (f'▶️ <b>Запуск: ACK · +1 тик{mode}</b>\n'
             'Сколько циклов сделать? Отправь число сообщением, например <code>10</code>.\n'
             f'<i>Жду ответ {text(minutes, 8)} мин. /close или /stop отменяют запуск.</i>')
 
@@ -59,7 +90,7 @@ def count_invalid_message():
 
 
 def count_expired_message(minutes):
-    return (f'<b>Ответ на /run опоздал</b>: число принимается {text(minutes, 8)} мин после вопроса. '
+    return (f'<b>Ответ на /run опоздал</b>: ответ принимается {text(minutes, 8)} мин после вопроса. '
             'Ничего не запущено. Нажми /run ещё раз.')
 
 
@@ -70,7 +101,7 @@ def day_report_unavailable_message():
 
 def count_without_prompt_message():
     return ('<b>Ничего не запущено</b>\n'
-            'Число циклов принимается только в ответ на /run. Нажми /run, затем отправь число.')
+            'Режим и число циклов принимаются только в ответ на /run. Нажми /run, выбери режим, затем отправь число.')
 
 
 def accepted_message(number, series_total=1, details=None):

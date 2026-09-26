@@ -51,7 +51,7 @@ def _amount(value: object) -> str | None:
 @dataclass(frozen=True, slots=True)
 class StreamIdentity:
     market_id: int
-    accounts: tuple[int, int]
+    accounts: tuple[int, ...]
     api_key_index: int
     api_base_url: str
     chain_id: int
@@ -65,14 +65,16 @@ class StreamIdentity:
         market, source, receiver, key = (value[name] for name in
                                          ("market_id", "source_account_index",
                                           "receiver_account_index", "api_key_index"))
-        if (not all(_integer(x) for x in (market, source, receiver, key))
-                or source == receiver or key < 4 or key > 254
+        extras = tuple(value.get("extra_receiver_account_indices") or ())
+        accounts = (source, receiver, *extras)
+        if (not all(_integer(x) for x in (market, source, receiver, key, *extras))
+                or len(set(accounts)) != len(accounts) or len(accounts) > 17 or key < 4 or key > 254
                 or market != 1 or value["market_symbol"] != "BTC"
                 or value["api_base_url"].rstrip("/") != OFFICIAL_ROBINHOOD_API_URL
                 or value["chain_id"] != OFFICIAL_ROBINHOOD_CHAIN_ID
                 or value["environment"] != "robinhood"):
             raise ValueError("configuration is outside the Robinhood BTC read-only gate")
-        return cls(market, (source, receiver), key, OFFICIAL_ROBINHOOD_API_URL,
+        return cls(market, accounts, key, OFFICIAL_ROBINHOOD_API_URL,
                    OFFICIAL_ROBINHOOD_CHAIN_ID, "robinhood", "BTC")
 
 

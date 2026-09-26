@@ -130,6 +130,16 @@ def hold_line(value):
             f'плановое начало закрытия — {timestamp(value.get("planned_closing_at"))}.')
 
 
+def cycle_roles(binding):
+    """[(role, account)] of one cycle: source, receiver, then receiver_2.. of a fan-out."""
+    binding = mapping(binding)
+    roles = [('source', binding.get('source_account_index')), ('receiver', binding.get('receiver_account_index'))]
+    extras = binding.get('extra_receiver_account_indices')
+    if isinstance(extras, list):
+        roles += [(f'receiver_{position}', account) for position, account in enumerate(extras[:16], 2)]
+    return roles
+
+
 def position_line(account, position, symbol):
     q = number(position)
     if q is None:
@@ -264,9 +274,17 @@ def execution_legs(result):
 
     result = mapping(result)
     plans = mapping(result.get('plan'))
+    fanout = mapping(plans.get('fanout'))
+    befores = fanout.get('receiver_positions_before')
+    befores = befores if isinstance(befores, list) else []
+    # A fan-out receipt adds receiver_2.. (owner request 2026-09-26).
+    roles = ['source', 'receiver'] + [f'receiver_{n}' for n in range(2, 17) if f'receiver_{n}' in plans]
     legs = {}
-    for role in ('source', 'receiver'):
+    for role in roles:
         value = mapping(result.get(role))
+        position = int(role.rsplit('_', 1)[1]) if role.startswith('receiver_') else None
+        expected_before = (plans.get(f'{role}_position_before') if position is None
+                           else befores[position - 1] if position - 1 < len(befores) else None)
         try:
             plan = OrderPlan(**plans[role])
             trades = tuple(TradeReceipt.from_mapping(t) for t in value['trades'])
@@ -276,7 +294,7 @@ def execution_legs(result):
             if (value.get('history_complete') is not True or value.get('unknown_reasons') != []
                     or type(value.get('dispatched')) is not bool or before is None or after is None
                     or value.get('account_index') != plan.account_index
-                    or before != number(plans.get(f'{role}_position_before'))
+                    or before != number(expected_before)
                     or qty != number(value.get('filled_quantity'))
                     or after != before + qty * (1 if plan.side == 'BUY' else -1)
                     or len({t.trade_id for t in trades}) != len(trades)):
@@ -297,23 +315,45 @@ def execution_legs(result):
                 trades, before, after, order, True, dispatched=value['dispatched'])
         except (KeyError, ValueError, TypeError, AttributeError):
             legs[role] = None
-    matched = Decimal(0)
-    if (all(legs.values()) and legs['source'].account_index != legs['receiver'].account_index
-            and mapping(plans.get('source')).get('market_id') == mapping(plans.get('receiver')).get('market_id')
-            and mapping(plans.get('source')).get('side') != mapping(plans.get('receiver')).get('side')):
-        _, matched, _ = _joint_trade_match(legs['source'], legs['receiver'], number(plans.get('quantity')) or Decimal(0))
-    return legs, matched, plans
+    return legs, own_quantities(legs, plans)['source'], plans
+
+
+def own_quantities(legs, plans):
+    """Own matched quantity per role: each receiver against the source; the source's is their sum."""
+    from .engine import _joint_trade_match
+
+    roles = list(legs)
+    own = {role: Decimal(0) for role in roles}
+    receivers = roles[1:]
+    source_plan = mapping(plans.get('source'))
+    if (not receivers or not all(legs.values())
+            or len({legs[role].account_index for role in roles}) != len(roles)
+            or any(mapping(plans.get(role)).get('market_id') != source_plan.get('market_id')
+                   or mapping(plans.get(role)).get('side') == source_plan.get('side') for role in receivers)):
+        return own
+    for role in receivers:
+        quantity = (number(plans.get('quantity')) if len(receivers) == 1
+                    else number(mapping(plans.get(role)).get('quantity')))
+        _, matched, _ = _joint_trade_match(legs['source'], legs[role], quantity or Decimal(0))
+        own[role] = matched
+        own['source'] += matched
+    return own
 
 
 def execution_lines(result, *, phase, attempt=1):
     """Describe exact terminal legs; never infer own matching from positions."""
     result = mapping(result)
     legs, matched, plans = execution_legs(result)
+    # 1 -> 1 keeps its single matched quantity; a fan-out sums each receiver's own match.
+    own = own_quantities(legs, plans) if len(legs) > 2 else {role: matched for role in legs}
     label = 'Открытие' if phase == 'opening' else 'Закрытие'
     lines = [f'{label} · попытка {clean(attempt, 8)}']
-    for role, kind in (('source', 'LIMIT'), ('receiver', 'MARKET')):
-        leg = legs[role]
-        peer = mapping(plans.get('receiver' if role == 'source' else 'source')).get('account_index')
+    receiver_ids = {mapping(plans.get(role)).get('account_index') for role in list(legs)[1:]}
+    source_id = mapping(plans.get('source')).get('account_index')
+    for role in legs:
+        kind = 'LIMIT' if role == 'source' else 'MARKET'
+        leg, matched = legs[role], own[role]
+        peers = receiver_ids if role == 'source' else {source_id}
         account = mapping(plans.get(role)).get('account_index', '?')
         prefix = f'{kind} · счёт {clean(account, 24)}: '
         if leg is None:
@@ -324,15 +364,15 @@ def execution_lines(result, *, phase, attempt=1):
             status = clean(leg.order.status, 48) if leg.order is not None else 'неизвестен'
             lines.append(prefix + f'исполнений нет; статус заявки: {status}.')
         else:
-            external = sum((t.quantity for t in leg.trades if t.counterparty_account_index is not None
-                            and peer is not None and t.counterparty_account_index != peer), Decimal(0))
+            outside = [t for t in leg.trades if t.counterparty_account_index is not None
+                       and None not in peers and t.counterparty_account_index not in peers]
+            external = sum((t.quantity for t in outside), Decimal(0))
             unproved = max(Decimal(0), leg.filled_quantity - external - matched)
             pieces = []
             if matched:
                 pieces.append(f'наш парный счёт — {amount(matched)}')
             if external:
-                ids = sorted({t.counterparty_account_index for t in leg.trades
-                              if t.counterparty_account_index is not None and t.counterparty_account_index != peer})
+                ids = sorted({t.counterparty_account_index for t in outside})
                 pieces.append(f'внешние счета {", ".join(str(i) for i in ids[:3])} — {amount(external)}')
             if unproved:
                 pieces.append(f'контрагент не доказан — {amount(unproved)}')
@@ -464,7 +504,12 @@ def result_lines(report, *, detailed=False):
     refusal = opening_margin_refusal(mapping(report.get('cycle')).get('preflight_reason'))
     if refusal:
         lines.append(refusal)
-    if binding.get('source_account_index') is not None:
+    roles = cycle_roles(binding)
+    if binding.get('source_account_index') is not None and len(roles) > 2:
+        side = {'LONG': 'SELL', 'SHORT': 'BUY'}.get(binding.get('direction'), '?')
+        lines.append(f'Источник: {clean(binding.get("source_account_index"), 24)} · лимитный {side} (A); '
+                     f'получатели MARKET: {", ".join(clean(account, 24) for _, account in roles[1:])} (B).')
+    elif binding.get('source_account_index') is not None:
         side = {'LONG': 'SELL', 'SHORT': 'BUY'}.get(binding.get('direction'), '?')
         lines.append(f'Первый счёт: {clean(binding.get("source_account_index"), 24)} · лимитный {side} (A); '
                      f'Второй счёт: {clean(binding.get("receiver_account_index"), 24)} (B).')
@@ -524,9 +569,9 @@ def result_lines(report, *, detailed=False):
             lines.append('Закрытие остатка остановлено: ' + recovery_reason_text(recovery_reason))
         lines.append('Последние сохранённые позиции:')
         times = mapping(inventory.get('observed_at'))
-        for role in ('source', 'receiver'):
-            lines.append(position_line(binding.get(f'{role}_account_index', role), inventory.get(role), binding.get('market_symbol', ''))
-                         + ' ' + timestamp(times.get(role)))
+        for role, account in roles:
+            lines.append(position_line(role if account is None else account, inventory.get(role),
+                                       binding.get('market_symbol', '')) + ' ' + timestamp(times.get(role)))
     if detailed:
         actions = report.get('dispatched_actions', [])
         if report.get('status') == 'COMPLETE' and pair.get('status') != 'SUCCESS':
@@ -539,7 +584,7 @@ def result_lines(report, *, detailed=False):
                     lines.append(f'Приёмник {label}: {state}.')
             if any(a.get('phase') == 'fallback' for a in actions):
                 lines.append('Парная операция не завершена; восстановление продолжено через fallback (закрытие остатка).')
-        for row in pnl.get('per_account', [])[:2]:
+        for row in pnl.get('per_account', [])[:len(roles)]:
             lines.append(f'Счёт {clean(row.get("account_index"), 24)}: PnL до комиссий {amount(row.get("gross"))}, '
                          f'комиссии {amount(row.get("fees"))}, после {amount(row.get("net"))}.')
         orders = mapping(report.get('order_state'))

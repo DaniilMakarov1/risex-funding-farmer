@@ -196,6 +196,18 @@ _PROJECTED_KEYS = _PROJECTED_KEYS | frozenset({
     "book_request_started_at", "book_request_finished_at", "book_continuity",
 })
 
+# Fan-out (owner request 2026-09-26): receiver legs 2..16 and their summaries.
+_FANOUT_RECEIVER_LEGS = tuple(f"receiver_{position}" for position in range(2, 17))
+_PROJECTED_KEYS = _PROJECTED_KEYS | frozenset({
+    *_FANOUT_RECEIVER_LEGS,
+    "fanout", "fanout_receivers", "fanout_receiver_count", "receiver_count", "receivers", "leg",
+    "receiver_account_indices", "extra_receiver_account_indices", "receiver_quantities",
+    "receiver_positions_before", "receiver_identities", "receiver_filled_quantities", "receiver_positions",
+    "receiver_parts", "receiver_part_ticks", "part_minimum_tick", "receiver_cap_ticks", "size_margin",
+    "receiver_available_balances", "receiver_order_ids", "receivers_observed_at", "receiver_position",
+    "match_status", "matched_quantity", "expected_position", "receiver_accounts", "receiver_position_before",
+})
+
 _OMIT_BULKY_KEYS = frozenset(
     {
         "dispatch_evidence",
@@ -661,8 +673,37 @@ def _reason_values(payload: Mapping[str, Any]) -> list[str]:
     return values
 
 
+_RECEIVER_LEG = re.compile(r"receiver(?:_([2-9]|1[0-6]))?")
+_RECEIVER_DISPATCH = re.compile(r"RECEIVER(?:_([2-9]|1[0-6]))?_DISPATCH")
+
+
+def _is_receiver_leg(value: Any) -> bool:
+    return isinstance(value, str) and _RECEIVER_LEG.fullmatch(value) is not None
+
+
+def _receiver_position(leg: str) -> int:
+    match = _RECEIVER_LEG.fullmatch(leg)
+    return 1 if match is None or match.group(1) is None else int(match.group(1))
+
+
+def _receipt_legs(value: Mapping[str, Any]) -> list[str]:
+    """``source``, ``receiver`` and every fan-out receiver leg present, in order."""
+    return ["source", "receiver",
+            *(leg for leg in _FANOUT_RECEIVER_LEGS if isinstance(value.get(leg), Mapping))]
+
+
+def _binding_role_accounts(binding: Mapping[str, Any]) -> dict[str, Any]:
+    """Role -> account of one cycle: source, receiver and receiver_2.. for a fan-out."""
+    roles = {"source": binding.get("source_account_index"), "receiver": binding.get("receiver_account_index")}
+    extras = binding.get("extra_receiver_account_indices")
+    if isinstance(extras, list):
+        for position, account in enumerate(extras, 2):
+            roles[f"receiver_{position}"] = account
+    return roles
+
+
 def _plan_legs(plan: Mapping[str, Any]) -> Iterable[tuple[str, Mapping[str, Any]]]:
-    for leg in ("source", "receiver"):
+    for leg in _receipt_legs(plan):
         value = plan.get(leg)
         if isinstance(value, Mapping):
             yield leg, value
@@ -762,10 +803,13 @@ def _intent_actions(files: Sequence[_FileData]) -> list[dict[str, Any]]:
             if event.endswith("_DISPATCH_INTENT"):
                 prefix = event.removesuffix("_INTENT")
                 leg = prefix_map.get(prefix)
+                receiver_match = _RECEIVER_DISPATCH.fullmatch(prefix)
+                if leg is None and receiver_match is not None:
+                    leg = f"receiver_{receiver_match.group(1)}"
                 if leg is None:
                     continue
                 payload = record.payload
-                if leg in {"source", "receiver"} and (
+                if (leg == "source" or _is_receiver_leg(leg)) and (
                     not isinstance(payload.get("plan"), Mapping) or not payload["plan"]
                 ):
                     data.issue("INVALID_EVIDENCE_TYPE", "dispatch intent requires a non-empty order plan object",
@@ -798,6 +842,9 @@ def _intent_actions(files: Sequence[_FileData]) -> list[dict[str, Any]]:
             if matching_prefix is None:
                 continue
             leg = prefix_map.get(matching_prefix)
+            receiver_match = _RECEIVER_DISPATCH.fullmatch(matching_prefix)
+            if leg is None and receiver_match is not None:
+                leg = f"receiver_{receiver_match.group(1)}"
             if leg is None:
                 continue
             payload = record.payload
@@ -919,12 +966,17 @@ def _execution_evidence(
             fail("UNBOUND_EXECUTION", "receipt account does not match its order plan")
         if any(binding.get(k) is None for k in ("source_account_index", "receiver_account_index", "market_id")) or binding.get("source_account_index") == binding.get("receiver_account_index"):
             fail("UNBOUND_EXECUTION", "parent cycle account/market identity is incomplete")
-        expected_account = binding.get(f"{leg}_account_index")
+        roles = _binding_role_accounts(binding)
+        if not fallback and not _is_receiver_leg(leg) and leg != "source":
+            fail("UNBOUND_EXECUTION", "child leg is not a cycle role")
+        if not fallback and leg not in roles:
+            fail("UNBOUND_EXECUTION", "child leg is not a role of the parent cycle")
+        expected_account = roles.get(leg)
         if not fallback and expected_account is not None and str(account) != str(expected_account):
             fail("UNBOUND_EXECUTION", "child account does not match the parent cycle role")
         if binding.get("market_id") is not None and str(plan.get("market_id")) != str(binding["market_id"]):
             fail("UNBOUND_EXECUTION", "child market does not match the parent cycle")
-        if fallback and binding.get("source_account_index") is not None and account not in (binding.get("source_account_index"), binding.get("receiver_account_index")):
+        if fallback and binding.get("source_account_index") is not None and account not in roles.values():
             fail("UNBOUND_EXECUTION", "fallback account is outside the cycle")
         expected_quantity = _decimal_value(plan.get("quantity"))
         price_bound = _decimal_value(plan.get("price"))
@@ -1054,7 +1106,8 @@ def _execution_evidence(
                     issues.append(_issue("CONFLICTING_TERMINAL", "receipt outcome contradicts terminal envelope", data=data, record=record))
                 if receipt.get("run_id") is not None and receipt["run_id"] != data.run_id:
                     issues.append(_issue("CONFLICTING_RUN_ID", "receipt run identity differs from its journal", data=data, record=record))
-                for leg in ("source", "receiver"):
+                legs = [leg for leg, _ in _plan_legs(plan)] or ["source", "receiver"]
+                for leg in dict.fromkeys(["source", "receiver", *legs, *_receipt_legs(receipt)]):
                     value = receipt.get(leg)
                     if not isinstance(value, Mapping):
                         issues.append(_issue("INCOMPLETE_EXECUTION", "terminal receipt is missing a required leg", data=data, record=record))
@@ -1127,7 +1180,7 @@ def _terminal_order_records(files: Sequence[_FileData]) -> list[dict[str, Any]]:
                 if not isinstance(receipt, Mapping):
                     continue
                 attempt = _attempt_from(record.payload, receipt.get("attempt_index"))
-                for leg in ("source", "receiver"):
+                for leg in _receipt_legs(receipt):
                     value = receipt.get(leg)
                     if not isinstance(value, Mapping) or not isinstance(value.get("order"), Mapping):
                         continue
@@ -1261,7 +1314,7 @@ def _semantic_issues(files: Sequence[_FileData]) -> list[dict[str, Any]]:
             elif record.event == "COMPLETE":
                 receipt = _receipt_from_complete(record)
                 if isinstance(receipt, Mapping):
-                    for leg in ("source", "receiver"):
+                    for leg in _receipt_legs(receipt):
                         value = receipt.get(leg)
                         if isinstance(value, Mapping) and isinstance(value.get("order"), Mapping):
                             inspect_order(data, record, value["order"])
@@ -1687,7 +1740,11 @@ def _positions_from_cycle(
     executions: Sequence[Mapping[str, Any]],
     issues: Sequence[Mapping[str, Any]],
 ) -> tuple[dict[str, Any], list[str]]:
-    """Classify inventory only after terminal child and causal position proof."""
+    """Classify inventory only after terminal child and causal position proof.
+
+    Every account role of the cycle is required: ``source`` and ``receiver``,
+    plus ``receiver_2`` .. for a fan-out cycle.
+    """
 
     notes: list[str] = []
     if cycle is None:
@@ -1707,39 +1764,28 @@ def _positions_from_cycle(
         positions = {}
     if not isinstance(observed, Mapping):
         observed = {}
-    source = positions.get("source")
-    receiver = positions.get("receiver")
-    source_at = observed.get("source")
-    receiver_at = observed.get("receiver")
-    source_decimal = _decimal_value(source)
-    receiver_decimal = _decimal_value(receiver)
-    source_time = _finite_number(source_at)
-    receiver_time = _finite_number(receiver_at)
 
     account_roles: dict[str, str] = {}
-    binding = payload.get("binding") if isinstance(payload.get("binding"), Mapping) else {}
-    for role in ("source", "receiver"):
-        value = binding.get(f"{role}_account_index")
-        if value is not None:
-            account_roles[str(value)] = role
-    for record in cycle.records:
-        candidate = record.payload.get("binding")
+    roles = ["source", "receiver"]
+    bindings = [payload.get("binding")] + [record.payload.get("binding") for record in cycle.records]
+    for candidate in bindings:
         if not isinstance(candidate, Mapping):
             continue
-        for role in ("source", "receiver"):
-            value = candidate.get(f"{role}_account_index")
+        for role, value in _binding_role_accounts(candidate).items():
             if value is not None:
                 account_roles[str(value)] = role
+                if role not in roles:
+                    roles.append(role)
     for candidate in (payload.get("opening"), payload.get("closing")):
         if not isinstance(candidate, Mapping):
             continue
         plan = candidate.get("plan") if isinstance(candidate.get("plan"), Mapping) else {}
-        for role in ("source", "receiver"):
-            leg = plan.get(role)
-            if isinstance(leg, Mapping) and leg.get("account_index") is not None:
+        for role, leg in _plan_legs(plan):
+            if leg.get("account_index") is not None:
                 account_roles[str(leg["account_index"])] = role
+    roles.sort(key=lambda role: (role != "source", _receiver_position(role) if role != "source" else 0))
 
-    observations: dict[str, list[tuple[float, Decimal]]] = {"source": [], "receiver": []}
+    observations: dict[str, list[tuple[float, Decimal]]] = {role: [] for role in roles}
     for execution in executions:
         at = _finite_number(execution.get("observed_at"))
         if at is None:
@@ -1775,11 +1821,6 @@ def _positions_from_cycle(
     # account roles.  A fallback's account payload is already role-labelled.
     child_terminal_missing = any(issue.get("code") in {"CHILD_TERMINAL_MISSING", "REFERENCED_CHILD_MISSING"} for issue in issues)
     structural_uncertainty = bool(issues)
-    child_has_intent = any(
-        data.kind in {"opening", "closing"}
-        and any(record.event.endswith("_DISPATCH_INTENT") for record in data.records)
-        for data in files
-    )
     fallback_has_intent = any(
         data.kind == "cycle" and any(record.event == "FALLBACK_DISPATCH_INTENT" for record in data.records)
         for data in files
@@ -1787,17 +1828,20 @@ def _positions_from_cycle(
     child_resolution = all(bool(execution.get("resolved")) for execution in executions)
     if fallback_has_intent and not any(bool(execution.get("fallback")) for execution in executions):
         child_resolution = False
-    execution_evidence_present = all(bool(observations[role]) for role in ("source", "receiver"))
+    decimals = {role: _decimal_value(positions.get(role)) for role in roles}
+    times = {role: _finite_number(observed.get(role)) for role in roles}
+    execution_evidence_present = all(bool(observations[role]) for role in roles)
     observed_agrees = True
-    for role, expected in (("source", source_decimal), ("receiver", receiver_decimal)):
+    for role in roles:
+        expected = decimals[role]
         if expected is None:
             observed_agrees = False
             continue
         latest = max(observations[role], key=lambda item: item[0]) if observations[role] else None
-        if latest is None or latest[1] != expected or _finite_number(observed.get(role)) is None or _finite_number(observed[role]) < latest[0] or _finite_number(observed[role]) > complete["at"]:
+        if latest is None or latest[1] != expected or times[role] is None or times[role] < latest[0] or times[role] > complete["at"]:
             observed_agrees = False
-    exact_zero = source_decimal == Decimal(0) and receiver_decimal == Decimal(0)
-    valid_times = source_time is not None and receiver_time is not None and source_time >= 0 and receiver_time >= 0
+    exact_zero = all(decimals[role] == Decimal(0) for role in roles)
+    valid_times = all(times[role] is not None and times[role] >= 0 for role in roles)
     parent_unknown = str(payload.get("outcome", "")).upper() == "UNKNOWN"
     terminal_proof = complete is not None and isinstance(payload.get("remaining_positions"), Mapping)
     causal_latest = {
@@ -1806,10 +1850,10 @@ def _positions_from_cycle(
             if observations[role]
             else None
         )
-        for role in ("source", "receiver")
+        for role in roles
     }
 
-    if source_decimal is None or receiver_decimal is None:
+    if any(decimals[role] is None for role in roles):
         status = "UNKNOWN"
         notes.append("inventory quantities are not finite Decimal values")
     elif not terminal_proof or not valid_times:
@@ -1826,24 +1870,25 @@ def _positions_from_cycle(
     else:
         status = "OPEN_INVENTORY"
 
-    return {
-        "status": status,
-        "source": source,
-        "receiver": receiver,
-        "observed_at": {"source": source_at, "receiver": receiver_at},
-        "proof": {
-            "event": "CYCLE_COMPLETE" if terminal_proof else None,
-            "source_position_present": source is not None,
-            "receiver_position_present": receiver is not None,
-            "observation_times_present": valid_times,
-            "exact_decimal_zero": exact_zero,
-            "terminal_child_resolution": child_resolution,
-            "causal_position_observations_present": execution_evidence_present,
-            "causal_position_observations_agree": observed_agrees,
-            "causal_latest": causal_latest,
-            "parent_outcome": payload.get("outcome"),
-        },
-    }, notes
+    value: dict[str, Any] = {"status": status}
+    for role in roles:
+        value[role] = positions.get(role)
+    value["observed_at"] = {role: observed.get(role) for role in roles}
+    value["proof"] = {
+        "event": "CYCLE_COMPLETE" if terminal_proof else None,
+        "source_position_present": positions.get("source") is not None,
+        "receiver_position_present": positions.get("receiver") is not None,
+        **({"fanout_positions_present": {role: positions.get(role) is not None for role in roles[2:]}}
+           if len(roles) > 2 else {}),
+        "observation_times_present": valid_times,
+        "exact_decimal_zero": exact_zero,
+        "terminal_child_resolution": child_resolution,
+        "causal_position_observations_present": execution_evidence_present,
+        "causal_position_observations_agree": observed_agrees,
+        "causal_latest": causal_latest,
+        "parent_outcome": payload.get("outcome"),
+    }
+    return value, notes
 
 
 def _closed_execution_pnl(
@@ -1932,6 +1977,123 @@ def _economics(
     }
 
 
+def _fanout_phase(
+    phase: str,
+    legs: Sequence[Mapping[str, Any]],
+    actions: Sequence[Mapping[str, Any]],
+    parent_complete: bool,
+    evidence_issues: Sequence[Mapping[str, Any]],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """One fan-out phase: the source against every receiver, with the 1 -> 1 row shape.
+
+    Receiver quantities are summed over every receiver leg; a receiver trade
+    counts as own only when it names the source and the source's receipt of
+    the same trade names that receiver (reciprocal order identities).
+    """
+    def external_account(value: Any, peer_ids: set[Any]) -> bool:
+        return type(value) is int and value >= 0 and value not in peer_ids
+
+    attempts = sorted({e.get("attempt") for e in legs if isinstance(e.get("attempt"), int)})
+    if attempts:
+        latest = attempts[-1]
+        # The retried attempts before the last one proved zero mutation; the
+        # last attempt carries the exposure of this phase.
+        exposure = [e for e in legs if e.get("attempt") == latest]
+    else:
+        exposure = list(legs)
+    source = [e for e in exposure if e.get("leg") == "source"]
+    receivers = [e for e in exposure if _is_receiver_leg(e.get("leg"))]
+    resolved = bool(legs) and all(e.get("resolved") for e in legs)
+    quantity: Decimal | None = None
+    valid = resolved and len(source) == 1 and len(receivers) >= 2
+    if valid:
+        a = source[0]
+        quantity = _decimal_value(a.get("filled_quantity"))
+        planned = _decimal_value(a["plan"].get("quantity"))
+        filled = [_decimal_value(b.get("filled_quantity")) for b in receivers]
+        valid = (
+            quantity is not None and quantity > 0 and quantity == planned
+            and all(value is not None for value in filled)
+            and sum(filled) == quantity
+            and all(value == _decimal_value(b["plan"].get("quantity")) for value, b in zip(filled, receivers))
+            and len({e.get("account_index") for e in (a, *receivers)}) == len(receivers) + 1
+            and all(b.get("market_id") == a.get("market_id") for b in receivers)
+            and all(b["plan"].get("side") != a["plan"].get("side") for b in receivers)
+            and all(e.get("outcome") in {"SUCCESS", "PARTIAL"} for e in (a, *receivers))
+        )
+    proof = {"phase": phase, "status": "PROVEN" if valid else "NOT_PROVEN", "quantity": str(quantity) if valid else None,
+             "reason": ("complete planned exposure with terminal orders and exact position deltas" if valid
+                        else "every complete planned leg is required"),
+             "receiver_count": len(receivers)}
+    matched_quantity = Decimal(0)
+    mutual = "UNKNOWN"
+    source_ids = {a.get("account_index") for a in source}
+    receiver_ids = {b.get("account_index") for b in receivers}
+    if resolved and len(source) == 1 and receivers:
+        a = source[0]
+        by_trade = {str(t["trade_id"]): (b, t) for b in receivers for t in b["trades"]}
+        matched = True
+        for t in a["trades"]:
+            peer = by_trade.get(str(t["trade_id"]))
+            if peer is None:
+                matched = False
+                continue
+            b, other = peer
+            compatible = (
+                type(t.get("counterparty_account_index")) is int
+                and t.get("counterparty_account_index") == b["account_index"]
+                and other.get("counterparty_account_index") == a["account_index"]
+                and t.get("counterparty_order_id") == other["order_id"]
+                and other.get("counterparty_order_id") == t["order_id"]
+                and t["order_id"] != other["order_id"]
+                and t["side"] != other["side"]
+                and _decimal_value(t["quantity"]) == _decimal_value(other["quantity"])
+                and _decimal_value(t["price"]) == _decimal_value(other["price"])
+                and (t.get("counterparty_client_order_index") is None or str(t["counterparty_client_order_index"]) == str(other["client_order_index"]))
+                and (other.get("counterparty_client_order_index") is None or str(other["counterparty_client_order_index"]) == str(t["client_order_index"]))
+            )
+            matched = matched and compatible
+            if compatible:
+                matched_quantity += _decimal_value(t["quantity"]) or Decimal(0)
+        foreign = any(external_account(t.get("counterparty_account_index"), receiver_ids) for t in a["trades"]) or any(
+            external_account(t.get("counterparty_account_index"), source_ids) for b in receivers for t in b["trades"])
+        mutual = ("MATCHED" if valid and matched and matched_quantity == quantity
+                  else "NOT_MATCHED" if foreign else "PARTIAL" if matched_quantity > 0 else "UNKNOWN")
+    quantities: dict[str, Any] = {"matched_quantity": str(matched_quantity)}
+    for label, own_legs, peer_ids in (("source", [e for e in exposure if e.get("leg") == "source"], receiver_ids),
+                                      ("receiver", receivers, source_ids)):
+        external = unproved = None
+        if own_legs and peer_ids and None not in peer_ids:
+            external = sum((_decimal_value(t.get("quantity")) or Decimal(0) for e in own_legs for t in e.get("trades", [])
+                            if external_account(t.get("counterparty_account_index"), peer_ids)), Decimal(0))
+            filled = sum((_decimal_value(e.get("filled_quantity")) or Decimal(0) for e in own_legs), Decimal(0))
+            unproved = max(Decimal(0), filled - external - matched_quantity)
+        quantities[f"external_{label}_quantity"] = None if external is None else str(external)
+        quantities[f"unproved_{label}_quantity"] = None if unproved is None else str(unproved)
+        quantities[f"external_{label}_accounts"] = sorted({
+            t["counterparty_account_index"] for e in own_legs for t in e.get("trades", [])
+            if external is not None and external_account(t.get("counterparty_account_index"), peer_ids)
+        })
+        quantities[f"{label}_state"] = (
+            "UNKNOWN" if not own_legs or any(not e.get("resolved") for e in own_legs)
+            else "UNSENT" if not any(e.get("dispatched") for e in own_legs)
+            else "FILLED" if any((_decimal_value(e.get("filled_quantity")) or Decimal(0)) > 0 for e in own_legs)
+            else "NO_FILL"
+        )
+    positive = [e for e in exposure if (_decimal_value(e.get("filled_quantity")) or Decimal(0)) > 0]
+    if any((_decimal_value(quantities.get(f"external_{leg}_quantity")) or Decimal(0)) > 0 for leg in ("source", "receiver")):
+        mutual = "NOT_MATCHED"
+    elif resolved and not positive:
+        mutual = "NO_FILL"
+    elif not legs and parent_complete and not evidence_issues and not any(a.get("phase") == phase for a in actions):
+        mutual = "NOT_ATTEMPTED"
+    quantities["receivers"] = [
+        {"leg": b.get("leg"), "account_index": b.get("account_index"), "filled_quantity": b.get("filled_quantity")}
+        for b in receivers
+    ]
+    return proof, {"phase": phase, "status": mutual, **quantities}
+
+
 def _paired_execution(
     actions: Sequence[Mapping[str, Any]],
     fills: Sequence[Mapping[str, Any]],
@@ -1944,10 +2106,10 @@ def _paired_execution(
     """Require full mutual execution while preserving exposure as a separate fact."""
     parent_payload = parent_payload or {}
     explicit = parent_payload.get("paired_execution")
-    receiver_actions = [a for a in actions if a.get("leg") == "receiver"]
+    receiver_actions = [a for a in actions if _is_receiver_leg(a.get("leg"))]
     receiver_dispatched = any(a.get("dispatched") is True for a in receiver_actions)
     source_fills = [f for f in fills if f.get("leg") == "source"]
-    receiver_fills = [f for f in fills if f.get("leg") == "receiver"]
+    receiver_fills = [f for f in fills if _is_receiver_leg(f.get("leg"))]
 
     def external_account(value: Any, peer_ids: set[Any]) -> bool:
         return type(value) is int and value >= 0 and value not in peer_ids
@@ -1956,6 +2118,11 @@ def _paired_execution(
     mutual_results: list[dict[str, Any]] = []
     for phase in ("opening", "closing"):
         legs = [e for e in executions if e.get("phase") == phase]
+        if any(_is_receiver_leg(e.get("leg")) and e.get("leg") != "receiver" for e in legs):
+            proof, mutual = _fanout_phase(phase, legs, actions, parent_complete, evidence_issues)
+            phase_results.append(proof)
+            mutual_results.append(mutual)
+            continue
         positive = [e for e in legs if (_decimal_value(e.get("filled_quantity")) or Decimal(0)) > 0]
         source = [e for e in positive if e.get("leg") == "source"]
         receiver = [e for e in positive if e.get("leg") == "receiver"]
@@ -2117,7 +2284,7 @@ def _regression_signals(files: Sequence[_FileData], issues: Sequence[Mapping[str
             if record.event == "COMPLETE":
                 receipt = _receipt_from_complete(record)
                 if isinstance(receipt, Mapping):
-                    for leg in ("source", "receiver"):
+                    for leg in _receipt_legs(receipt):
                         value = receipt.get(leg)
                         if isinstance(value, Mapping):
                             filled = _decimal_value(value.get("filled_quantity"))
@@ -2130,7 +2297,7 @@ def _regression_signals(files: Sequence[_FileData], issues: Sequence[Mapping[str
             if record.event in {"LEG_RECONCILED", "COMPLETE"}:
                 receipt = _receipt_from_complete(record) if record.event == "COMPLETE" else None
                 if isinstance(receipt, Mapping):
-                    for leg in ("source", "receiver"):
+                    for leg in _receipt_legs(receipt):
                         value = receipt.get(leg)
                         if isinstance(value, Mapping) and isinstance(value.get("order"), Mapping):
                             typed_orders.append((record.event, value["order"]))

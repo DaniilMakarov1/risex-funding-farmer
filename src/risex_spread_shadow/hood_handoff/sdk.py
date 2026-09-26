@@ -21,7 +21,7 @@ import math
 import re
 import time
 from pathlib import Path
-from typing import Any, Callable, Mapping, Protocol
+from typing import Any, Callable, Mapping, Protocol, Sequence
 
 from .read_errors import ReadRateLimited, retry_after_delay
 from .contracts import (
@@ -569,6 +569,7 @@ class LighterSdkClient:
         receiver_account_index: int,
         secrets: SecretProvider,
         market_evidence: Mapping[str, Any],
+        extra_receiver_account_indices: Sequence[int] = (),
         signer_factory: Callable[..., Any] | None = None,
         api_factory: Callable[..., Any] | None = None,
         http_factory: Callable[..., Any] | None = None,
@@ -580,9 +581,16 @@ class LighterSdkClient:
             raise ContractError("api_key_index is required for the explicit live adapter")
         if source_account_index == receiver_account_index:
             raise ContractError("source and receiver accounts must differ")
+        extras = tuple(extra_receiver_account_indices)
+        if (any(isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in extras)
+                or len(set(extras)) != len(extras)
+                or {source_account_index, receiver_account_index} & set(extras)):
+            raise ContractError("fan-out receiver accounts must all differ")
         self.config = config
         self.source_account_index = source_account_index
         self.receiver_account_index = receiver_account_index
+        # Fan-out receivers 2..k (owner request 2026-09-26); empty for 1 -> 1.
+        self.extra_receiver_account_indices = extras
         self.secrets = secrets
         self.market_evidence = dict(market_evidence)
         self._signer_factory = signer_factory
@@ -619,6 +627,12 @@ class LighterSdkClient:
         self.sdk_version = REQUIRED_LIGHTER_SDK_VERSION
         self._http = (http_factory or PlainAioHttp)(config.api_base_url, timeout_seconds=config.request_timeout_seconds)
 
+    @property
+    def _mutation_accounts(self) -> frozenset[int]:
+        """Accounts this client may sign for: the cycle's source and receivers."""
+        return frozenset((self.source_account_index, self.receiver_account_index,
+                          *getattr(self, "extra_receiver_account_indices", ())))
+
     def set_mutation_deadline(self, deadline: float) -> None:
         """Bind the next cancellation attempt to the engine's evidence barrier."""
 
@@ -645,6 +659,7 @@ class LighterSdkClient:
                 "market_symbol": self.config.market_symbol,
                 "source_account_index": self.source_account_index,
                 "receiver_account_index": self.receiver_account_index,
+                "extra_receiver_account_indices": list(self.extra_receiver_account_indices),
                 "api_key_index": self.config.api_key_index,
                 "environment": self.config.environment,
                 "api_base_url": self.config.api_base_url,
@@ -818,7 +833,7 @@ class LighterSdkClient:
     def bind_read_stream_cancel(self, account: int, market: int,
                                 client: int, order_id: str) -> None:
         if (self._read_stream_state is not None and type(account) is int
-                and account in {self.source_account_index, self.receiver_account_index}
+                and account in self._mutation_accounts
                 and type(market) is int and market == self.config.market_id
                 and type(client) is int and client >= 0
                 and isinstance(order_id, str) and order_id.isascii()
@@ -1714,7 +1729,7 @@ class LighterSdkClient:
         """Acquire and reserve before price selection, without signing or sending."""
 
         key = self.config.api_key_index
-        if key is None or isinstance(account_index, bool) or not isinstance(account_index, int) or account_index not in {self.source_account_index, self.receiver_account_index}:
+        if key is None or isinstance(account_index, bool) or not isinstance(account_index, int) or account_index not in self._mutation_accounts:
             raise ContractError("nonce reservation account/key is not configured")
         if isinstance(deadline, bool) or not math.isfinite(deadline) or deadline <= time.monotonic():
             raise ContractError("nonce reservation deadline is invalid or expired")
@@ -1945,7 +1960,7 @@ class LighterSdkClient:
     ) -> MutationReceipt:
         """Send one exact cross-margin setting transaction; never retry a send."""
         key_index = self.config.api_key_index
-        if (key_index is None or account_index not in {self.source_account_index, self.receiver_account_index}
+        if (key_index is None or account_index not in self._mutation_accounts
                 or market_id != self.config.market_id or margin_mode != 0
                 or isinstance(fraction, bool) or not isinstance(fraction, int)
                 or not 2500 <= fraction <= 10000):
@@ -2033,8 +2048,7 @@ class LighterSdkClient:
 
     async def read_leverage_next_nonce(self, account_index: int, api_key_index: int) -> int:
         # Read-only: a pool wallet's earlier setting may be proved by any cycle client.
-        readable = {self.source_account_index, self.receiver_account_index,
-                    *getattr(self, "read_account_indices", ())}
+        readable = {*self._mutation_accounts, *getattr(self, "read_account_indices", ())}
         if (account_index not in readable
                 or api_key_index != self.config.api_key_index):
             raise ContractError("nextNonce identity is invalid")
@@ -2152,7 +2166,7 @@ class LighterSdkClient:
         """
         key = self.config.api_key_index
         if (key is None or type(account_index) is not int
-                or account_index not in {self.source_account_index, self.receiver_account_index}
+                or account_index not in self._mutation_accounts
                 or type(market_id) is not int or market_id != self.config.market_id
                 or not isinstance(order_id, str) or not order_id.isascii()
                 or not order_id.isdecimal() or len(order_id) > 20):
