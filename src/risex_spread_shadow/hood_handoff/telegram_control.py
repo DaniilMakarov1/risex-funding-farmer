@@ -73,6 +73,74 @@ def stop_reason(exc):
     return 'ошибка ' + admission_failure_category(exc)
 
 
+# Between cycles of a run (series steps and the fresh READY after a pre-cycle
+# close) a read-only check that failed only because a read did not complete
+# is repeated: 3 attempts in total, 10 s and 20 s apart; a larger typed
+# Retry-After is honoured up to 60 s.  A refusal proved by a completed check
+# stops at once, and nothing launches without a fresh complete proof.
+SERIES_CHECK_ATTEMPTS = 3
+SERIES_CHECK_RETRY_DELAYS = (10, 20)
+SERIES_CHECK_MAX_RETRY_DELAY = 60
+
+# Stages of a run named in the saved stop record and the stop notice.
+STOP_STAGES = {
+    'SERIES_CLAIM': 'сохранение следующего шага серии',
+    'SERIES_PAUSE': 'пауза между циклами',
+    'SERIES_CLOSE_READY': 'проверка позиций и старых ордеров перед циклом',
+    'SERIES_READY': 'подтверждение готовности перед циклом',
+    'PRE_CYCLE_CLOSE': 'закрытие старого остатка',
+    'POST_CLOSE_READY': 'проверка после закрытия остатка',
+    'LAUNCH': 'выполнение цикла',
+    'CLOSE': 'закрытие позиций',
+    'FINISH': 'сохранение итога',
+}
+
+
+def _explicit_causes(exc, limit=8):
+    """The exception and its explicit ``raise ... from`` causes (bounded)."""
+    chain = []
+    while exc is not None and len(chain) < limit:
+        chain.append(exc)
+        exc = exc.__cause__
+    return chain
+
+
+def transient_check_failure(exc):
+    """Fixed reason when a check failed only because a read did not complete.
+
+    None for every refusal proved by a completed check (any PreflightBlocked
+    except the engine's retryable read failure), for invalid proofs and for
+    local failures such as configuration, credentials, locks or files.
+    """
+    from .contracts import PreflightBlocked
+    from .random_cycle import _RateLimitedAccount, _RetryablePreparationFailure
+    from .read_errors import read_rate_limit_delay
+    if isinstance(exc, PreflightBlocked) and not isinstance(exc, _RetryablePreparationFailure):
+        return None
+    for item in _explicit_causes(exc):
+        if isinstance(item, _RateLimitedAccount) or read_rate_limit_delay(item) is not None:
+            return 'биржа ограничила частоту запросов (HTTP 429)'
+        if isinstance(item, TimeoutError):
+            return 'истекло время чтения'
+        if isinstance(item, (ConnectionError, aiohttp.ClientConnectionError, aiohttp.ClientPayloadError)):
+            return 'сбой соединения'
+    if isinstance(exc, _RetryablePreparationFailure):
+        return 'чтение временно недоступно'
+    return None
+
+
+def check_retry_delay(exc, attempt):
+    """Whole seconds before the next check; typed Retry-After is honoured, bounded."""
+    from .random_cycle import _RateLimitedAccount
+    from .read_errors import read_rate_limit_delay
+    delay = SERIES_CHECK_RETRY_DELAYS[min(attempt, len(SERIES_CHECK_RETRY_DELAYS)) - 1]
+    for item in _explicit_causes(exc):
+        value = item.retry_after if isinstance(item, _RateLimitedAccount) else read_rate_limit_delay(item)
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value):
+            delay = max(delay, min(math.ceil(value), SERIES_CHECK_MAX_RETRY_DELAY))
+    return delay
+
+
 class Store:
     def __init__(self, directory: Path, binding: str):
         directory.mkdir(mode=0o700, exist_ok=True)
@@ -250,6 +318,9 @@ class Controller:
         self._series_sleep = series_sleep or asyncio.sleep
         self._series_delay = series_delay or (lambda: random.SystemRandom().randint(5, 30))
         self._series_pause = None
+        self._stage = None
+        self._stage_started = None
+        self._check_attempts = 0
         self._pending_card = None
         self._send_lock = None
         self.now = now
@@ -622,6 +693,7 @@ class Controller:
         total = (self.store.data.get('active') or {}).get('series_total', 1)
         carded = False
         self._pending_card = None
+        self._stage, self._stage_started, self._check_attempts = None, None, 0
         try:
             for step in range(1, total + 1):
                 carded = False
@@ -636,7 +708,9 @@ class Controller:
                         self.queue_notice('<b>Закрытие</b> · Проверяю остатки; ордера только reduce-only.')
                     elif step == 1:
                         self.queue_notice(self.cycle_notice('начинаю: плечо, цена и объём по свежим данным.', '▶️'))
+                    self._enter_stage('CLOSE' if action == 'close' else 'LAUNCH')
                     await (self.close() if action == 'close' else self.launch(**options))
+                    self._enter_stage('FINISH')
                     before = set((self.store.data.get('active') or {}).get('before', []))
                     safe = self.finish(retain_active=step < total)
                     name = (self.store.data.get('last') or {}).get('cycle')
@@ -655,9 +729,12 @@ class Controller:
                 if step < total and not safe:
                     break
         except Exception as exc:
+            stop = self._stop_record(exc)
+            print('Telegram run stopped: ' + json.dumps(stop, sort_keys=True), file=sys.stderr, flush=True)
             self._flush_card()
             self.queue_notice(self.step_notice(
-                f'остановлено: {stop_reason(exc)}. Серия не продолжается; /status — состояние.', '⛔'))
+                f'остановлено{self._stop_where(stop)}: {stop_reason(exc)}. '
+                'Серия не продолжается; /status — состояние.', '⛔'))
             active = self.store.data.get('active') or {}
             close_before = active.get('auto_close_before') if active.get('phase') == 'AUTO_CLOSE' else None
             close_added = (sorted(set(self.slots('close')) - set(close_before))
@@ -674,14 +751,63 @@ class Controller:
                 self.store.data['last'].update({'series_total': active['series_total'],
                                                 'series_completed': active['series_index'] - 1,
                                                 **self._series_membership(active)})
+            self.store.data['last']['stop'] = stop
             self.store.save()  # Keep durable active intent; never automatically retry.
         self._flush_card()
         self._runner_finished = True
         if not self.queue_series_report() and not carded:
             self.queue_notice(self.summary_after_task())
 
+    def _enter_stage(self, stage):
+        self._stage, self._stage_started, self._check_attempts = stage, self.now(), 0
+
+    async def _checked_recovery(self, *, require_flat):
+        """One read-only check between cycles of a run.
+
+        A check that failed only because a read did not complete is repeated
+        (bounded); every attempt is the complete check.  A refusal proved by a
+        completed check, a local failure or cancellation is never repeated.
+        """
+        for attempt in range(1, SERIES_CHECK_ATTEMPTS + 1):
+            self._check_attempts = attempt
+            try:
+                return await self.recovery(require_flat=require_flat)
+            except Exception as exc:
+                reason = transient_check_failure(exc)
+                if reason is None or attempt >= SERIES_CHECK_ATTEMPTS:
+                    raise
+                delay = check_retry_delay(exc, attempt)
+                print('Telegram run check retry: ' + json.dumps({
+                    'stage': self._stage, 'attempt': attempt, 'category': admission_failure_category(exc),
+                    'error': type(exc).__name__[:64], 'delay_seconds': delay}, sort_keys=True),
+                    file=sys.stderr, flush=True)
+                self.queue_notice(self.cycle_notice(
+                    f'проверка счетов не завершилась: {reason}. Новый цикл не начат; повторю проверку через '
+                    f'{delay} сек (попытка {attempt + 1} из {SERIES_CHECK_ATTEMPTS}).', '⏳'))
+                await self._series_sleep(delay)
+
+    def _stop_record(self, exc):
+        """Credential-free stop context: fixed stage and category, a class name only."""
+        record = {'stage': self._stage if self._stage in STOP_STAGES else None,
+                  'category': admission_failure_category(exc),
+                  'error': type(exc).__name__[:64], 'at': self.now()}
+        if self._stage_started is not None:
+            record['elapsed_seconds'] = round(max(0.0, self.now() - self._stage_started), 3)
+        if self._check_attempts:
+            record['attempts'] = self._check_attempts
+        return record
+
+    @staticmethod
+    def _stop_where(stop):
+        stage = STOP_STAGES.get(stop.get('stage'))
+        if stage is None:
+            return ''
+        attempts = stop.get('attempts')
+        return f' ({stage}' + (f', попыток: {attempts}' if integer(attempts) and attempts > 1 else '') + ')'
+
     async def _prepare_next_series_step(self):
         """Durably claim the next step, then require fresh proof before its child."""
+        self._enter_stage('SERIES_CLAIM')
         active = self.store.data['active']
         active['series_index'] += 1
         active['before'] = self.slots('run')
@@ -691,6 +817,7 @@ class Controller:
         delay = self._series_delay()
         if not integer(delay) or not 5 <= delay <= 30:
             raise RuntimeError('invalid inter-cycle delay')
+        self._enter_stage('SERIES_PAUSE')
         self._series_pause = delay
         self._flush_card(pause=delay)
         try:
@@ -699,8 +826,9 @@ class Controller:
             self._series_pause = None
         if self.recovery is None:
             raise RuntimeError('series recovery is unavailable')
+        self._enter_stage('SERIES_CLOSE_READY')
         self.queue_notice(self.cycle_notice('начинаю: проверяю позиции и старые ордера…', '▶️'))
-        proof = await self.recovery(require_flat=False)
+        proof = await self._checked_recovery(require_flat=False)
         if not isinstance(proof, dict) or proof.get('status') != 'CLOSE_READY':
             raise RuntimeError('next cycle close readiness is unproved')
         positions = self._exact_recovery_positions(proof)
@@ -715,7 +843,8 @@ class Controller:
             self.store.save()
             return
         self.queue_notice(self.cycle_notice(f'позиций нет ({positions_text(proof)}); подтверждаю готовность…', '✓'))
-        ready = await self.recovery(require_flat=True)
+        self._enter_stage('SERIES_READY')
+        ready = await self._checked_recovery(require_flat=True)
         if (not isinstance(ready, dict) or ready.get('status') != 'READY'
                 or any(position != 0 for position in self._exact_recovery_positions(ready))):
             raise RuntimeError('next cycle flatness is unproved')
@@ -764,6 +893,7 @@ class Controller:
 
     async def _close_before_run(self):
         """One saved /run may close once; never advance on a missing terminal or read."""
+        self._enter_stage('PRE_CYCLE_CLOSE')
         active = self.store.data['active']
         before = set(active['auto_close_before'])
         self.queue_notice(self.cycle_notice('перед открытием закрываю старый остаток reduce-only.', '🛠'))
@@ -776,7 +906,8 @@ class Controller:
             self.queue_notice(self.cycle_notice('старый остаток не удалось подтвердить закрытым — цикл не начинаю', '⛔'))
             raise RuntimeError('pre-cycle close is not confirmed flat')
         self.queue_notice(self.cycle_notice('старый остаток закрыт; подтверждаю нулевые позиции…', '✓'))
-        proof = await self.recovery(require_flat=True)
+        self._enter_stage('POST_CLOSE_READY')
+        proof = await self._checked_recovery(require_flat=True)
         if (not isinstance(proof, dict) or proof.get('status') != 'READY'
                 or any(position != 0 for position in self._exact_recovery_positions(proof))):
             raise RuntimeError('fresh post-close flatness is unproved')

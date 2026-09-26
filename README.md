@@ -1,3 +1,9 @@
+## Why the 30-cycle series stopped after 11 cycles on 2026-09-26, and what changed
+
+Before each cycle the system checks every old order that its own journal never proved finished. Five such orders (cycles 003, 121, 126, 158 and 193) were looked up again at every check: first an exact read, then a search through the exchange's inactive-order history, typically 7–8 seconds and up to 14 seconds of a 20-second limit, and slower as history grows. Before cycle 12 the check ran out of time (Telegram: `ошибка READ_TIMEOUT`); no order was sent, and one failed read ended the whole series.
+
+Now, once an old order is proved finished it is recorded in `recovery-intents.jsonl` next to `random-cycle.json`, and later checks use that record instead of searching again, only while the original journal is byte-for-byte unchanged. Between cycles, a check that failed only because a read timed out, lost the connection or hit HTTP 429 is repeated up to 3 times (after 10 and 20 seconds; Telegram shows "проверка счетов не завершилась … повторю"). A real refusal (positions, open or unresolved orders, keys, configuration) still stops at once, and the next cycle still needs a complete fresh check. If a run does stop, the Telegram line names the stage and attempts, and the controller log and saved state keep the stage, category, error type and duration. The first check of a new `/run` is unchanged: if it fails, send `/run` again.
+
 ## Many wallets: a random pair every cycle (`./wallet`)
 
 By default the system trades the two accounts in `random-cycle.json`. To add more wallets, run in the project folder on the Mac (never in Telegram):

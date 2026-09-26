@@ -16,7 +16,7 @@ from .journal import DurableJournal, sanitize_exception
 from .keychain import KeychainSecretProvider
 from .operator_control import exclusive_lock
 from .provenance import capture_provenance
-from .random_cycle import RandomCycleEngine, _account_payload, _fallback_order_mismatch_map, _observed_leverage_fraction, _recovery_stop_reason
+from .random_cycle import RandomCycleEngine, _account_payload, _fallback_order_mismatch_map, _observed_leverage_fraction, _order_payload, _recovery_stop_reason
 from .readiness import ReadOnlyLighterSdkClient
 from .sdk import PlainAioHttp, _leverage_next_nonce, _leverage_tx_diagnostic, _leverage_tx_hash, _order_snapshot_mapping, _require_success_code
 from .telegram_accounts import missing_key
@@ -31,6 +31,14 @@ INTENTS = {'SOURCE_DISPATCH_INTENT', 'RECEIVER_DISPATCH_INTENT', 'FALLBACK_DISPA
 HISTORICAL_JOURNAL_MAX_BYTES = 32 * 1024 * 1024
 SHARED_RECOVERY_JOURNAL_MAX_BYTES = 512 * 1024 * 1024
 HISTORICAL_JOURNAL_MAX_FILES = 10000
+# Exact terminal proofs of old creation intents live in their own shared
+# journal: code that predates it never reads the file, so a rollback cannot
+# be blocked by an event it does not know.
+INTENT_CHECKPOINT_JOURNAL = 'recovery-intents.jsonl'
+SHARED_JOURNAL_EVENTS = {
+    'recovery-checks.jsonl': frozenset({'CURRENT_STATE_VERIFIED', 'LEVERAGE_RESOLUTION_CHECKPOINT'}),
+    INTENT_CHECKPOINT_JOURNAL: frozenset({'INTENT_RESOLUTION_CHECKPOINT'}),
+}
 
 
 # Concurrent authenticated account reads when a wallet pool is checked.
@@ -224,7 +232,7 @@ def journal_rows(path, *, shared_recovery=False):
     """Bounded strict reads, never follow links or repair historical inputs."""
     if path.is_symlink():
         raise PreflightBlocked('historical journal is unsafe')
-    if shared_recovery and path.name != 'recovery-checks.jsonl':
+    if shared_recovery and path.name not in SHARED_JOURNAL_EVENTS:
         raise PreflightBlocked('shared recovery journal path is invalid')
     limit = SHARED_RECOVERY_JOURNAL_MAX_BYTES if shared_recovery else HISTORICAL_JOURNAL_MAX_BYTES
     if path.stat().st_size > limit:
@@ -247,9 +255,7 @@ def journal_rows(path, *, shared_recovery=False):
             if (not isinstance(row_run, str) or not row_run
                     or (not shared_recovery and row_run != run_id)):
                 raise PreflightBlocked('historical journal run identity conflicts')
-            if shared_recovery and row.get('event') not in {
-                'CURRENT_STATE_VERIFIED', 'LEVERAGE_RESOLUTION_CHECKPOINT',
-            }:
+            if shared_recovery and row.get('event') not in SHARED_JOURNAL_EVENTS[path.name]:
                 raise PreflightBlocked('shared recovery journal event is invalid')
             prior = at
             yield row
@@ -280,7 +286,8 @@ def prior_intents(operator, config, indices=None):
             with path.open('rb') as stream:
                 for chunk in iter(lambda: stream.read(65536), b''):
                     digest.update(chunk)
-            files.append({'path': str(path), 'sha256': digest.hexdigest()})
+            sha256 = digest.hexdigest()
+            files.append({'path': str(path), 'sha256': sha256})
             # WS observations are diagnostic projections, not DurableJournal
             # mutation intents. Retain their hash, but never use them as proof
             # of execution or require a trading-journal envelope from them.
@@ -300,7 +307,7 @@ def prior_intents(operator, config, indices=None):
                     item = {'account_index': index, 'fraction_bps': fraction, 'resolved': False,
                             'source_identity': payload.get('source_identity'),
                             'prepared_identity': None, 'journal_path': str(path),
-                            'journal_sha256': digest.hexdigest(), 'intent_at': row['at']}
+                            'journal_sha256': sha256, 'intent_at': row['at']}
                     local_leverage[index] = item
                     unresolved_leverage.append(item)
                 elif event == 'LEVERAGE_TX_PREPARED':
@@ -334,7 +341,9 @@ def prior_intents(operator, config, indices=None):
                     key = (plan.account_index, plan.client_order_index)
                     if key in intents:
                         raise PreflightBlocked('historical client identity reused')
-                    item = {'plan': plan, 'resolved': False, 'at': row['at'], 'order': None}
+                    item = {'plan': plan, 'resolved': False, 'at': row['at'], 'order': None,
+                            'plan_payload': payload['plan'], 'journal_path': str(path),
+                            'journal_sha256': sha256}
                     intents[key] = item
                     local[event.split('_DISPATCH_')[0]] = item
                 elif event.endswith('_DISPATCH_RESULT'):
@@ -434,6 +443,78 @@ def _checkpoint_matches(item, checkpoints, config=None):
     return True
 
 
+def _intent_checkpoints(operator):
+    """Saved terminal proofs of old creation intents, by (account, client index).
+
+    Rows of another proof version are ignored, so an older reader never
+    accepts a proof format it does not know.
+    """
+    path = Path(operator) / INTENT_CHECKPOINT_JOURNAL
+    if not path.exists() and not path.is_symlink():
+        return {}
+    if path.is_symlink() or not path.is_file():
+        raise PreflightBlocked('unsafe intent checkpoint journal')
+    checkpoints = {}
+    for row in journal_rows(path, shared_recovery=True):
+        payload = row['payload']
+        if type(payload.get('proof_version')) is not int or payload['proof_version'] != 1:
+            continue
+        plan = payload.get('plan')
+        if (not isinstance(plan, dict) or type(plan.get('account_index')) is not int
+                or type(plan.get('client_order_index')) is not int):
+            raise PreflightBlocked('intent checkpoint is invalid')
+        checkpoints.setdefault((plan['account_index'], plan['client_order_index']), []).append(
+            (row['at'], payload))
+    return checkpoints
+
+
+def _checkpointed_order(item, checkpoints):
+    """The saved terminal order that exactly proves this intent, else None.
+
+    Only a proof about the identical journal bytes is considered.  Such a
+    proof must still pass the live rules (plan, expected order ID, terminal
+    status, LIMIT price, observed after the intent and not after the proof
+    was saved); anything else conflicts with immutable history and blocks.
+    """
+    plan = item['plan']
+    for saved_at, payload in checkpoints.get((plan.account_index, plan.client_order_index), ()):
+        if (payload.get('original_path') != item['journal_path']
+                or payload.get('original_sha256') != item['journal_sha256']):
+            continue
+        try:
+            order = OrderSnapshot.from_mapping(payload.get('order'))
+        except (ContractError, TypeError, ValueError, AttributeError) as exc:
+            raise PreflightBlocked('intent checkpoint conflicts with immutable history') from exc
+        if (payload.get('plan') != item['plan_payload'] or payload.get('order_id') != item.get('order_id')
+                or payload.get('intent_at') != item['at'] or not terminal_matches(order, item)
+                or not item['at'] <= order.observed_at <= saved_at):
+            raise PreflightBlocked('intent checkpoint conflicts with immutable history')
+        return order
+    return None
+
+
+def _append_intent_checkpoints(operator, clock, proved):
+    """Durably keep fresh exact terminal proofs; history files stay untouched."""
+    journal = DurableJournal(Path(operator) / INTENT_CHECKPOINT_JOURNAL, clock=clock)
+    journal.acquire_attempt()
+    try:
+        for item, order in proved:
+            journal.append('INTENT_RESOLUTION_CHECKPOINT', {
+                'proof_version': 1, 'original_path': item['journal_path'],
+                'original_sha256': item['journal_sha256'], 'intent_at': item['at'],
+                'plan': item['plan_payload'], 'order_id': item.get('order_id'),
+                'order': _order_payload(order),
+            })
+    finally:
+        journal.release_attempt()
+
+
+def _resolution_row(order):
+    return {'account_index': order.account_index, 'order_id': order.order_id,
+            'client_order_index': order.client_order_index, 'status': order.status,
+            'observed_at': order.observed_at}
+
+
 async def resolve_prior(config, client, operator, *, clock=None, require_leverage_resolved=True, pool=None):
     """Resolve outstanding creations before admitting a new operation."""
     engine = RandomCycleEngine(client, clock=clock)
@@ -522,9 +603,23 @@ async def resolve_prior(config, client, operator, *, clock=None, require_leverag
                 checkpoint.release_attempt()
         pending_leverage = []
     unresolved = [item for item in intents if not item['resolved']]
+    checkpointed = []
+    if unresolved:
+        # A terminal order never becomes executable again: an exact saved
+        # proof replaces a new lookup through deep inactive-order history.
+        saved = await asyncio.to_thread(_intent_checkpoints, operator)
+        remaining = []
+        for item in unresolved:
+            order = _checkpointed_order(item, saved)
+            if order is None:
+                remaining.append(item)
+            else:
+                checkpointed.append(_resolution_row(order))
+        unresolved = remaining
     if len(unresolved) > config.max_poll_count:
         raise PreflightBlocked('too many unresolved historical intents for a bounded check')
     checked = []
+    proved = []
     async def resolve():
         for item in unresolved:
             plan = item['plan']
@@ -535,12 +630,23 @@ async def resolve_prior(config, client, operator, *, clock=None, require_leverag
                     or not 0 <= now - order.observed_at <= config.freshness_seconds
                     or order.observed_at < item['at']):
                 raise PreflightBlocked('previous order is unresolved or still executable')
-            checked.append({'account_index': order.account_index, 'order_id': order.order_id,
-                            'client_order_index': order.client_order_index, 'status': order.status,
-                            'observed_at': order.observed_at})
-    await asyncio.wait_for(resolve(), timeout=config.reconcile_timeout_seconds)
+            proved.append((item, order))
+            checked.append(_resolution_row(order))
+    try:
+        await asyncio.wait_for(resolve(), timeout=config.reconcile_timeout_seconds)
+    except BaseException:
+        # Proofs completed before a later lookup failed stay valid; keep
+        # them, but never let saving them replace the original failure.
+        if proved:
+            try:
+                _append_intent_checkpoints(operator, engine.clock.now, proved)
+            except Exception:
+                pass
+        raise
+    if proved:
+        _append_intent_checkpoints(operator, engine.clock.now, proved)
     return {'previous_intents': len(intents), 'unresolved_leverage_settings': len(pending_leverage),
-            'resolved_now': checked, 'inputs': files}
+            'resolved_now': checked, 'resolved_by_checkpoint': checkpointed, 'inputs': files}
 
 
 def _validate_wallet_fresh(config, snapshot, index, now):
